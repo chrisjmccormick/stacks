@@ -3,6 +3,16 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# custom tokenizer / vocab
+token_bytes.pt # custom tokenizer / vocab
+tokenizer.pkl # custom tokenizer / vocab
+
+# custom fineweb-edu dataset
+modded/data/fineweb_edu_32k_8_370/
+
+# custom eval bundle
+modded/data/eval_bundle/
+
 # C extensions
 *.so
 
