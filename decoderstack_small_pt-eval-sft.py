@@ -983,48 +983,6 @@ class CausalSelfAttention(nn.Module):
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
 
-    def forward_inference(self, x: Tensor, qkvo_w: Tensor, yarn: "Yarn", ve: Tensor, 
-                          ve_gate_w: Tensor, attn_gate_w: Tensor, sa_lambdas: Tensor, 
-                          window_size: int, kv_cache, layer_idx: int):
-        """Inference forward pass using flash_attn_with_kvcache."""
-        B, T = x.size(0), x.size(1)
-        
-        # Compute Q, K, V projections
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k)  # QK norm
-        
-        # Apply rotary embeddings with position offset from KV cache
-        rotary_offset = kv_cache.get_pos()
-        q = yarn.rotary(q, offset=rotary_offset)
-        k = yarn.rotary(k, offset=rotary_offset)
-        
-        # Value embeddings
-        if ve is not None:
-            ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
-            v = v + ve_gate_out * ve.view_as(v)
-        
-        # Flash Attention with KV cache
-        k_cache, v_cache = kv_cache.get_layer_cache(layer_idx)
-        y = flash_attn_interface.flash_attn_with_kvcache(
-            q, k_cache, v_cache,
-            k=k, v=v,
-            cache_seqlens=kv_cache.cache_seqlens,
-            causal=True,
-            softmax_scale=yarn.attn_scale,
-            window_size=(window_size, 0),
-        )
-        
-        # Advance cache position after last layer
-        if layer_idx == kv_cache.n_layers - 1:
-            kv_cache.advance(T)
-        
-        # Attention gate - sparse gated attention for context-based no-op
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
-        
-        # Output projection
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))
-        return y
 
 class MLP(nn.Module):
     def __init__(self):
@@ -1036,13 +994,6 @@ class MLP(nn.Module):
         # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
         return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
-
-    def forward_inference(self, x: Tensor, c_fc: Tensor, c_proj: Tensor):
-        """Inference forward without fused triton kernel (more portable)."""
-        x = F.linear(x, c_fc)
-        x = F.relu(x).square()
-        x = F.linear(x, c_proj)
-        return x
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool):
@@ -1058,19 +1009,6 @@ class Block(nn.Module):
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
             x = x + self.mlp(norm(x), c_fc, c_proj)
-        return x
-
-    def forward_inference(self, x: Tensor, qkvo_w: Tensor, c_fc: Tensor, c_proj: Tensor,
-                          yarn: "Yarn", ve: Tensor, ve_gate_w: Tensor, attn_gate_w: Tensor,
-                          sa_lambdas: Tensor, window_size: int, kv_cache, layer_idx: int):
-        """Inference forward pass with KV cache."""
-        if self.attn is not None:
-            x = x + self.attn.forward_inference(
-                norm(x), qkvo_w, yarn, ve, ve_gate_w, attn_gate_w, sa_lambdas, 
-                window_size, kv_cache, layer_idx
-            )
-        if self.mlp is not None:
-            x = x + self.mlp.forward_inference(norm(x), c_fc, c_proj)
         return x
 
 # -----------------------------------------------------------------------------
@@ -1208,15 +1146,7 @@ class GPT(nn.Module):
         )
         self.scalars.label = 'scalars'
 
-    def get_device(self):
-        """Return the device of the model (for engine.py compatibility)."""
-        # TODO - Review this, probably just assume cuda.
-        return self.embed.weight.device
-    def forward(self, input_seq: Tensor, target_seq: Tensor = None, seqlens: Tensor = None, bigram_input_seq: Tensor = None, schedule_cfg: ForwardScheduleConfig = None, loss_reduction: str = 'mean', *, kv_cache=None):
-        # Inference mode: Engine calls forward(ids, kv_cache=cache)
-        if kv_cache is not None:
-            return self.forward_inference(input_seq, kv_cache)
-
+    def forward(self, input_seq: Tensor, target_seq: Tensor = None, seqlens: Tensor = None, bigram_input_seq: Tensor = None, schedule_cfg: ForwardScheduleConfig = None, loss_reduction: str = 'mean'):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1317,472 +1247,6 @@ class GPT(nn.Module):
                 return logits_for_loss
             loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction=loss_reduction)
         return loss
-
-    def forward_inference(self, idx: Tensor, kv_cache):
-        """
-        Inference forward pass for text generation (compatible with engine.py).
-        
-        Args:
-            idx: Token indices of shape (B, T)
-            kv_cache: KVCache object for incremental decoding (required)
-            
-        Returns:
-            logits: Output logits of shape (B, T, vocab_size)
-        """
-        assert kv_cache is not None, "kv_cache is required for inference"
-        B, T = idx.size()
-        
-        # Skip connection and backout config (matches training)
-        skip_in = [3]   # save hidden state at layer 3
-        skip_out = [6]  # apply skip connection at layer 6
-        backout_layer = 7
-        
-        # Get scalars for residual connections and gates
-        resid_lambdas = self.scalars[:self.num_layers]
-        x0_lambdas = self.x0_lambdas
-        sa_lambdas = self.scalars[self.num_layers:3 * self.num_layers].view(-1, 2)
-        bigram_lambdas = self.scalars[3 * self.num_layers:4 * self.num_layers]
-        smear_lambda = self.scalars[4 * self.num_layers]
-        backout_lambda = self.scalars[4 * self.num_layers + 1]
-        skip_lambda = self.scalars[4 * self.num_layers + 2]
-        
-        # Compute bigram indices using XOR hash (must match get_bigram_hash exactly)
-        rand_int_1 = 36313
-        rand_int_2 = 27191
-        mod = self.bigram_embed.num_embeddings - 1
-        
-        if T > 1:
-            # Prefill: Compute for all adjacent pairs in the sequence
-            curr = idx[:, 1:].to(torch.int32)
-            prev = idx[:, :-1].to(torch.int32)
-            
-            # Initialize with the "reserved" token for the first position
-            bigram_idx = torch.full_like(idx, mod, dtype=torch.int32)
-            
-            # Apply XOR hash to the rest
-            bigram_idx[:, 1:] = torch.bitwise_xor(rand_int_1 * curr, rand_int_2 * prev) % mod
-            
-            # Cache the last token for subsequent decode steps
-            kv_cache.prev_token = idx[:, -1:].clone()
-        else:
-            # Decode: Use cached previous token
-            if kv_cache.prev_token is not None:
-                curr = idx.to(torch.int32)
-                prev = kv_cache.prev_token.to(torch.int32)
-                
-                # Apply XOR hash
-                bigram_idx = torch.bitwise_xor(rand_int_1 * curr, rand_int_2 * prev) % mod
-            else:
-                # No previous token (start of generation if T=1 passed initially)
-                bigram_idx = torch.full_like(idx, mod, dtype=torch.int32)
-            
-            # Update cache with current token
-            kv_cache.prev_token = idx.clone()
-        
-        # Compute bigram embedding
-        x0_bigram = self.bigram_embed(bigram_idx)  # (B, T, model_dim)
-        
-        # Embedding lookup
-        x = self.embed(idx)
-        
-        # Smear gate: blend each token's embedding with previous token's embedding
-        # During prefill (T > 1): apply smear gate like training
-        # During decode (T == 1): use cached previous embedding from kv_cache
-        if T > 1:
-            # Prefill: apply smear gate across the sequence
-            smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[:, 1:, :12]))
-            x = torch.cat([x[:, :1], x[:, 1:] + smear_gate_out * x[:, :-1]], dim=1)
-            # Cache the last embedding for subsequent decode steps
-            kv_cache.prev_embed = x[:, -1:].clone()
-        else:
-            # Decode: use cached previous embedding
-            if kv_cache.prev_embed is not None:
-                smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[..., :12]))
-                x = x + smear_gate_out * kv_cache.prev_embed
-            # Update cache with current embedding
-            kv_cache.prev_embed = x.clone()
-        
-        x = x0 = norm(x)
-        
-        # Value embeddings - single Parameter viewed as 5 embeddings, same pattern as training
-        # Pattern: 01 ... 234 structure on token value embeddings by @photomz
-        ve_all = self.value_embeds.view(5, self.vocab_size, -1)[:, idx]  # (5, B, T, D)
-        ve = [ve_all[0], ve_all[1]] + [None] * (self.num_layers - 5) + [ve_all[2], ve_all[3], ve_all[4]]
-        
-        # veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)] (already bf16?)
-        # VE gate bank - same pattern as training 
-        veg = self.ve_gate_bank.unbind(0)
-        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
-        
-        # ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] # already bf16?
-        # Attention gate bank - same pattern as training (layer 6 has no attention)
-        ag = self.attn_gate_bank.unbind(0)
-        attn_gates = ag[:6] + [None] + ag[6:]
-        
-        # Use full context window for inference (no sliding window)
-        window_size = self.config.sequence_len
-        
-        # Get weights from parameter banks
-        attn_weights = self.attn_bank.unbind(0)
-        mlp_fcs = self.mlp_bank[:, 0, :, :].unbind(0)
-        mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)
-        
-        # Skip connection and backout buffers
-        skip_buffer = None
-        x_backout = None
-        
-        # Forward through transformer blocks
-        for i in range(self.num_layers):
-            # Apply skip connection at layer 6 (before residual scaling)
-            if i in skip_out and skip_buffer is not None:
-                skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :12]))
-                x = x + skip_gate_out * skip_buffer
-            
-            # Apply residual scaling with bigram embedding (matches training)
-            if i == 0:
-                x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
-            else:
-                x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-            
-            # Get weights for this layer
-            qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
-            c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            c_proj = mlp_projs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
-            
-            # Use inference forward path
-            x = self.blocks[i].forward_inference(
-                x, qkvo_w, c_fc, c_proj,
-                self.yarn, ve[i], ve_gates[i], attn_gates[i], sa_lambdas[i],
-                window_size, kv_cache, i
-            )
-            
-            # Save skip connection at layer 3
-            if i in skip_in:
-                skip_buffer = x.clone()
-            
-            # Save backout at layer 7
-            if i == backout_layer:
-                x_backout = x.clone()
-        
-        # Backout: subtract scaled layer 7 output from final hidden state
-        # This removes "context-building" contributions not needed for direct prediction
-        x = x - backout_lambda * x_backout
-        
-        # Final norm and lm_head
-        x = norm(x)
-        logits = self.lm_head(x)
-        
-        # Apply softcap (inference version: 23 * sigmoid((logits + 5) / 7.5))
-        logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-        
-        return logits
-
-"""
-Engine for efficient inference of our models.
-
-Everything works around token sequences:
-- The user can send token sequences to the engine
-- The engine returns the next token
-
-Notes:
-- The engine knows nothing about tokenization, it's purely token id sequences.
-
-The whole thing is made as efficient as possible.
-"""
-
-import signal
-import warnings
-from contextlib import contextmanager
-from collections import deque
-
-# -----------------------------------------------------------------------------
-# Calculator tool helpers
-@contextmanager
-def timeout(duration, formula):
-    def timeout_handler(signum, frame):
-        raise Exception(f"'{formula}': timed out after {duration} seconds")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
-    yield
-    signal.alarm(0)
-
-def eval_with_timeout(formula, max_time=3):
-    try:
-        with timeout(max_time, formula):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                return eval(formula, {"__builtins__": {}}, {})
-    except Exception as e:
-        signal.alarm(0)
-        # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
-        return None
-
-def use_calculator(expr):
-    """
-    Evaluate a Python expression safely.
-    Supports both math expressions and string operations like .count()
-    """
-    # Remove commas from numbers
-    expr = expr.replace(",", "")
-
-    # Check if it's a pure math expression (old behavior)
-    if all([x in "0123456789*+-/.() " for x in expr]):
-        if "**" in expr:  # disallow power operator
-            return None
-        return eval_with_timeout(expr)
-
-    # Check if it's a string operation we support
-    # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
-    allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\"()._ "
-    if not all([x in allowed_chars for x in expr]):
-        return None
-
-    # Disallow dangerous patterns
-    dangerous_patterns = ['__', 'import', 'exec', 'eval', 'compile', 'open', 'file',
-                         'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
-                         'getattr', 'setattr', 'delattr', 'hasattr']
-    expr_lower = expr.lower()
-    if any(pattern in expr_lower for pattern in dangerous_patterns):
-        return None
-
-    # Only allow .count() method for now (can expand later)
-    if '.count(' not in expr:
-        return None
-
-    # Evaluate with timeout
-    return eval_with_timeout(expr)
-
-# -----------------------------------------------------------------------------
-class KVCache:
-    """
-    KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
-
-    Key differences from FA2-style cache:
-    - Tensors are (B, T, H, D) not (B, H, T, D)
-    - FA3 updates the cache in-place during flash_attn_with_kvcache
-    - Position tracked per batch element via cache_seqlens tensor
-    """
-
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
-        self.batch_size = batch_size
-        self.max_seq_len = seq_len
-        self.n_layers = num_layers
-        self.n_heads = num_heads
-        self.head_dim = head_dim
-        # Pre-allocate cache tensors: (n_layers, B, T, H, D)
-        self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-        self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-        # Current sequence length per batch element (FA3 needs int32)
-        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        # Previous embedding for smear gate (modded_gpt only)
-        self.prev_embed = None
-        # Previous token for bigram embedding (modded_gpt only)
-        self.prev_token = None
-
-    def reset(self):
-        """Reset cache to empty state."""
-        self.cache_seqlens.zero_()
-        self.prev_embed = None
-        self.prev_token = None
-
-    def get_pos(self):
-        """Get current position (assumes all batch elements at same position)."""
-        return self.cache_seqlens[0].item()
-
-    def get_layer_cache(self, layer_idx):
-        """Return (k_cache, v_cache) views for a specific layer."""
-        return self.k_cache[layer_idx], self.v_cache[layer_idx]
-
-    def advance(self, num_tokens):
-        """Advance the cache position by num_tokens."""
-        self.cache_seqlens += num_tokens
-
-    def prefill(self, other):
-        """
-        Copy cached KV from another cache into this one.
-        Used when we do batch=1 prefill and then want to generate multiple samples in parallel.
-        """
-        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
-        assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
-        assert self.max_seq_len >= other.max_seq_len
-        other_pos = other.get_pos()
-        self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
-        self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
-        self.cache_seqlens.fill_(other_pos)
-        # Copy prev_embed for smear gate (expand to batch size if needed)
-        if other.prev_embed is not None:
-            self.prev_embed = other.prev_embed.expand(self.batch_size, -1, -1).clone()
-        else:
-            self.prev_embed = None
-        # Copy prev_token for bigram embedding (expand to batch size if needed)
-        if other.prev_token is not None:
-            self.prev_token = other.prev_token.expand(self.batch_size, -1).clone()
-        else:
-            self.prev_token = None
-
-# -----------------------------------------------------------------------------
-@torch.inference_mode()
-def sample_next_token(logits, rng, temperature=1.0, top_k=None):
-    """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
-    assert temperature >= 0.0, "temperature must be non-negative"
-    if temperature == 0.0:
-        return torch.argmax(logits, dim=-1, keepdim=True)
-    if top_k is not None and top_k > 0:
-        k = min(top_k, logits.size(-1))
-        vals, idx = torch.topk(logits, k, dim=-1)
-        vals = vals / temperature
-        probs = F.softmax(vals, dim=-1)
-        choice = torch.multinomial(probs, num_samples=1, generator=rng)
-        return idx.gather(1, choice)
-    else:
-        logits = logits / temperature
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1, generator=rng)
-
-# -----------------------------------------------------------------------------
-
-class RowState:
-    # Per-row state tracking during generation
-    def __init__(self, current_tokens=None):
-        self.current_tokens = current_tokens or [] # Current token sequence for this row
-        self.forced_tokens = deque() # Queue of tokens to force inject
-        self.in_python_block = False # Whether we are inside a python block
-        self.python_expr_tokens = [] # Tokens of the current python expression
-        self.completed = False # Whether this row has completed generation
-
-class Engine:
-
-    def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer # needed for tool use
-
-    @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Generate tokens autoregressively. Prefills batch=1, then decodes num_samples in parallel."""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
-        device = self.model.get_device()
-        dtype = torch.bfloat16  # CUDA-only, always bfloat16
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
-
-        # Get the special tokens we need to coordinate the tool use state machine
-        get_special = lambda s: self.tokenizer.encode_special(s)
-        python_start = get_special("<|python_start|>")
-        python_end = get_special("<|python_end|>")
-        output_start = get_special("<|output_start|>")
-        output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
-
-        # 1) Run a batch 1 prefill of the prompt tokens
-        m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
-
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
-
-        # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
-
-        # 4) Main generation loop
-        num_generated = 0
-        while True:
-            # Stop condition: we've reached max tokens
-            if max_tokens is not None and num_generated >= max_tokens:
-                break
-            # Stop condition: all rows are completed
-            if all(state.completed for state in row_states):
-                break
-
-            # Sample the next token for each row
-            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-            sampled_tokens = next_ids[:, 0].tolist()
-
-            # Process each row: choose the next token, update state, optional tool use
-            token_column = [] # contains the next token id along each row
-            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
-            for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
-                token_column.append(next_token)
-                # Update the state of this row to include the next token
-                state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
-                    state.completed = True
-                # Handle tool logic
-                if next_token == python_start:
-                    state.in_python_block = True
-                    state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
-                    state.in_python_block = False
-                    if state.python_expr_tokens:
-                        expr = self.tokenizer.decode(state.python_expr_tokens)
-                        result = use_calculator(expr)
-                        if result is not None:
-                            result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
-                            state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
-                    state.python_expr_tokens = []
-                elif state.in_python_block:
-                    state.python_expr_tokens.append(next_token)
-
-            # Yield the token column
-            yield token_column, token_masks
-            num_generated += 1
-
-            # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
-
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
-        """
-        Non-streaming batch generation that just returns the final token sequences.
-        Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
-        """
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        bos = self.tokenizer.get_bos_token_id()
-        results = [tokens.copy() for _ in range(num_samples)]
-        masks = [[0] * len(tokens) for _ in range(num_samples)]
-        completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
-            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
-                if not completed[i]:
-                    if token == assistant_end or token == bos:
-                        completed[i] = True
-                    else:
-                        results[i].append(token)
-                        masks[i].append(mask)
-            # Stop if all rows are completed
-            if all(completed):
-                break
-        return results, masks
-
-
 
 # -----------------------------------------------------------------------------
 # Dataset download
@@ -3224,6 +2688,47 @@ wandb_run.log({
     **{f"chat/{label}/accuracy": acc for label, acc in chat_out["results"].items()},
     **{f"chat/{label}/centered": c for label, c in chat_out["centered_results"].items()},
     "timing/chat_eval_seconds": chat_eval_elapsed,
+})
+
+
+# =============================================================================
+# Phase 5: Chat Generative Evaluation (GSM8K, HumanEval, SpellingBee)
+# =============================================================================
+from generation import evaluate_chat_generative
+
+print0("", console=True)
+print0("=" * 60, console=True)
+print0("Chat Generative Evaluation", console=True)
+print0("=" * 60, console=True)
+
+# Run the benchmark tasks
+gen_eval_t0 = time.time()
+gen_out = evaluate_chat_generative(model, device, DATASET_NAME)
+gen_eval_elapsed = time.time() - gen_eval_t0
+
+print0(f"Generative ChatCORE: {gen_out['generative_chatcore_metric']:.4f} | time: {gen_eval_elapsed:.2f}s", console=True)
+for label, acc in gen_out['results'].items():
+    centered = gen_out['centered_results'][label]
+    print0(f"  {label}: accuracy={acc:.4f} centered={centered:.4f}", console=True)
+
+# Log generative results to wandb
+wandb_run.log({
+    "step": train_steps + sft_step if sft_batch is not None else train_steps,
+    "chat_gen/generative_chatcore_metric": gen_out["generative_chatcore_metric"],
+    **{f"chat_gen/{label}/accuracy": acc for label, acc in gen_out["results"].items()},
+    **{f"chat_gen/{label}/centered": c for label, c in gen_out["centered_results"].items()},
+    "timing/gen_eval_seconds": gen_eval_elapsed,
+})
+
+# Compute combined ChatCORE metric across all 6 tasks (3 categorical + 3 generative)
+all_centered = {}
+all_centered.update(chat_out["centered_results"])  # MMLU, ARC-Easy, ARC-Challenge
+all_centered.update(gen_out["centered_results"])    # GSM8K, HumanEval, SpellingBee
+combined_chatcore = sum(all_centered.values()) / len(all_centered)
+print0(f"Combined ChatCORE (all 6 tasks): {combined_chatcore:.4f}", console=True)
+wandb_run.log({
+    "step": train_steps + sft_step if sft_batch is not None else train_steps,
+    "chat/combined_chatcore_metric": combined_chatcore,
 })
 
 # --- Final timing summary ---
