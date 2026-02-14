@@ -2732,8 +2732,9 @@ if False:
 # =============================================================================
 # Phase 5: Chat Generative Evaluation (GSM8K, HumanEval, SpellingBee)
 # =============================================================================
-from generation import evaluate_chat_generative, set_flash_attn
+from generation import evaluate_chat_generative, set_flash_attn, set_fused_mlp
 set_flash_attn(flash_attn_interface)
+set_fused_mlp(FusedLinearReLUSquareFunction)
 
 print0("", console=True)
 print0("=" * 60, console=True)
