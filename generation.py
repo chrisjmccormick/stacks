@@ -23,9 +23,18 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
 from dataclasses import dataclass
-from kernels import get_kernel
+flash_attn_interface = None  # Initialized by caller via set_flash_attn()
+fused_mlp_fn = None  # Initialized by caller via set_fused_mlp()
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+def set_flash_attn(module):
+    """Set the flash_attn_interface module (avoids recompiling the kernel)."""
+    global flash_attn_interface
+    flash_attn_interface = module
+
+def set_fused_mlp(fn):
+    """Set the FusedLinearReLUSquareFunction (avoids recompiling the kernel)."""
+    global fused_mlp_fn
+    fused_mlp_fn = fn
 
 # Module-level globals, initialized by _init_distributed()
 rank = 0
@@ -361,11 +370,11 @@ class GPTInference(nn.Module):
         ve = [ve_all[0], ve_all[1]] + [None] * (self.num_layers - 5) + [ve_all[2], ve_all[3], ve_all[4]]
 
         # VE gate bank - same pattern as training
-        veg = self.ve_gate_bank.unbind(0)
+        veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
         ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
 
         # Attention gate bank - same pattern as training (layer 6 has no attention)
-        ag = self.attn_gate_bank.unbind(0)
+        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         attn_gates = ag[:6] + [None] + ag[6:]
 
         # Use full context window for inference (no sliding window)
@@ -397,7 +406,7 @@ class GPTInference(nn.Module):
             # --- Attention (inline) ---
             if i in self.layer_to_attn_idx:
                 qkvo_w = attn_weights[self.layer_to_attn_idx[i]]
-                h = norm(x)
+                h = norm(x).bfloat16()
 
                 # Compute Q, K, V projections
                 q, k, v = F.linear(h, sa_lambdas[i][0] * qkvo_w[:self.dim * 3].type_as(h)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
@@ -412,7 +421,8 @@ class GPTInference(nn.Module):
                     ve_gate_out = 2 * torch.sigmoid(F.linear(h[..., :12], ve_gates[i])).view(B, T, self.num_heads, 1)
                     v = v + ve_gate_out * ve[i].view_as(v)  # @KoszarskyB & @Grad62304977
 
-                # Flash Attention with KV cache
+                # Flash Attention with KV cache (FA3 requires bf16/fp16/fp8)
+                q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
                 k_cache, v_cache = kv_cache.get_layer_cache(i)
                 y = flash_attn_interface.flash_attn_with_kvcache(
                     q, k_cache, v_cache,
@@ -441,7 +451,14 @@ class GPTInference(nn.Module):
             if i in self.layer_to_mlp_idx:
                 c_fc = mlp_fcs[self.layer_to_mlp_idx[i]]
                 c_proj = mlp_projs[self.layer_to_mlp_idx[i]]
-                x = x + F.linear(F.relu(F.linear(norm(x), c_fc)).square(), c_proj)
+                # TODO - The kernel will OOM: "The fused Triton kernel has block sizes tuned for training's large 
+                #        batch/sequence dimensions. During inference (batch=1, single-token decode), those block 
+                #        sizes require more shared memory (458KB) than the GPU has (232KB)." 
+                # x = x + fused_mlp_fn.apply(norm(x), c_fc, c_proj)
+                # Non-kernel option:
+                #c_fc is standard layout (out, in) so F.linear transposes correctly
+                #c_proj is CastedLinearT layout (in, out) so use @ directly (no transpose)
+                x = x + F.relu(F.linear(norm(x), c_fc)).square() @ c_proj
 
             # Save skip connection at layer 3
             if i in skip_in:

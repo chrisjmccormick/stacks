@@ -1260,23 +1260,24 @@ DATASET_DIR = os.path.join(_data_path, f"data/{DATASET_NAME}")
 _config_path = os.path.join(DATASET_DIR, "config.json")
 
 if not os.path.exists(_config_path):
-    from huggingface_hub import HfApi, hf_hub_download, login
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        login(token=hf_token)
-    os.makedirs(DATASET_DIR, exist_ok=True)
-    print(f"=== Downloading dataset from {HF_REPO_ID} ===")
-    api = HfApi()
-    train_prefix = "train_"
-    for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
-        # Only download the first NUM_TRAIN_SHARDS training shards
-        if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
-            continue
-        if not os.path.exists(os.path.join(DATASET_DIR, fname)):
-            print(f"  {fname}")
-            hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
-    assert os.path.exists(_config_path), "config.json missing after download"
-    print("  Done.")
+    if master_process:
+        from huggingface_hub import HfApi, hf_hub_download, login
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            login(token=hf_token)
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        print(f"=== Downloading dataset from {HF_REPO_ID} ===")
+        api = HfApi()
+        train_prefix = "fineweb_edu/train_"
+        for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
+            # Only download the first NUM_TRAIN_SHARDS training shards
+            if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
+                continue
+            if not os.path.exists(os.path.join(DATASET_DIR, fname)):
+                hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
+        assert os.path.exists(_config_path), "config.json missing after download"
+        print("  Done.")
+    dist.barrier()  # all ranks wait for rank 0 to finish downloading
 
 # Verify chat eval data is present (fail fast rather than after hours of training)
 _chat_eval_dir = os.path.join(DATASET_DIR, "chat_eval")
@@ -1813,8 +1814,8 @@ import datetime
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/val_*.bin") # input .bin to eval validation loss on
+    train_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/fineweb_edu/train_*.bin") # input .bin to train on
+    val_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/fineweb_edu/val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_max_seq_len: int = 128 * 16
@@ -1823,8 +1824,7 @@ class Hyperparameters:
     num_scheduled_iterations: int = 3960  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     # evaluation and logging
-    #run_id: str = f"2000-steps-{uuid.uuid4()}"
-    run_id: str = f"{str(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S'))}-4000-steps"
+    run_id: str = f"{str(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S'))}-baseline"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = True
     # wandb logging ("dummy" disables wandb)
@@ -2348,7 +2348,7 @@ print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 10
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 
 # ========================================================================================
-#                                       SFT TRAINING                                     
+#                                   SFT TRAINING                                     
 # ========================================================================================
 # After pre-training, we fine-tune on SFT conversation data (pre-tokenized .bin shards
 # produced by data/sft_dataset.py). The model architecture and compiled graph are reused;
@@ -2691,10 +2691,49 @@ wandb_run.log({
 })
 
 
+# ============ TEMPORARY HACK: Load checkpoint and run CORE eval only ============
+if False:  # Set to False to disable this hack
+    _ckpt_path = "/home/ubuntu/stacks/logs/2026-02-12_063725-4000-steps/state_step004000.pt"
+    print0(f"HACK: Loading checkpoint from {_ckpt_path}", console=True)
+    _ckpt = torch.load(_ckpt_path, map_location=device, weights_only=False)
+    model.load_state_dict(_ckpt["model"])
+    print0(f"HACK: Loaded model state from step {_ckpt.get('step', '?')}", console=True)
+    del _ckpt
+
+
+if False:
+    # Replay schedule transitions to get correct YaRN RoPE state and window sizes
+    for _ts in training_manager.get_transition_steps():
+        training_manager.advance_schedule(_ts)
+    training_manager.advance_schedule(training_schedule.total_steps)
+    training_manager.apply_final_ws_ext()
+
+    # Run CORE eval
+    core_eval_t0 = time.time()    
+    model.eval()
+    schedule_cfg = training_manager.get_forward_args()
+    print0(f"HACK: Running CORE eval (ws_short={training_manager.ws_short}, ws_long={training_manager.ws_long})", console=True)
+    core_out = evaluate_core(model, device, schedule_cfg, bos_id=BOS_ID)
+    print0(f"CORE metric: {core_out['core_metric']:.4f}", console=True)
+    for label, acc in core_out['results'].items():
+        centered = core_out['centered_results'][label]
+        print0(f"  {label}: accuracy={acc:.4f} centered={centered:.4f}", console=True)
+
+    core_eval_elapsed = time.time() - core_eval_t0
+    print0(f"CORE metric: {core_out['core_metric']:.4f} | total CORE eval time: {core_eval_elapsed:.2f}s", console=True)
+
+    # print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+    #        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+    dist.destroy_process_group()
+    sys.exit(0)
+# ============ END TEMPORARY HACK ============
+
+
 # =============================================================================
 # Phase 5: Chat Generative Evaluation (GSM8K, HumanEval, SpellingBee)
 # =============================================================================
-from generation import evaluate_chat_generative
+from generation import evaluate_chat_generative, set_flash_attn
+set_flash_attn(flash_attn_interface)
 
 print0("", console=True)
 print0("=" * 60, console=True)

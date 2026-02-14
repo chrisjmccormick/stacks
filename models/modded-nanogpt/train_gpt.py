@@ -1261,23 +1261,24 @@ DATASET_DIR = os.path.join(_data_path, f"data/{DATASET_NAME}")
 _config_path = os.path.join(DATASET_DIR, "config.json")
 
 if not os.path.exists(_config_path):
-    from huggingface_hub import HfApi, hf_hub_download, login
-    hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        login(token=hf_token)
-    os.makedirs(DATASET_DIR, exist_ok=True)
-    print(f"=== Downloading dataset from {HF_REPO_ID} ===")
-    api = HfApi()
-    train_prefix = "train_"
-    for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
-        # Only download the first NUM_TRAIN_SHARDS training shards
-        if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
-            continue
-        if not os.path.exists(os.path.join(DATASET_DIR, fname)):
-            print(f"  {fname}")
-            hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
-    assert os.path.exists(_config_path), "config.json missing after download"
-    print("  Done.")
+    if master_process:
+        from huggingface_hub import HfApi, hf_hub_download, login
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            login(token=hf_token)
+        os.makedirs(DATASET_DIR, exist_ok=True)
+        print(f"=== Downloading dataset from {HF_REPO_ID} ===")
+        api = HfApi()
+        train_prefix = "fineweb_edu/train_"
+        for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
+            # Only download the first NUM_TRAIN_SHARDS training shards
+            if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
+                continue
+            if not os.path.exists(os.path.join(DATASET_DIR, fname)):
+                hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
+        assert os.path.exists(_config_path), "config.json missing after download"
+        print("  Done.")
+    dist.barrier()  # all ranks wait for rank 0 to finish downloading
 
 # Load vocab config
 with open(_config_path) as f:
@@ -1685,8 +1686,8 @@ import datetime
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/val_*.bin") # input .bin to eval validation loss on
+    train_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/fineweb_edu/train_*.bin") # input .bin to train on
+    val_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/fineweb_edu/val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_max_seq_len: int = 128 * 16
