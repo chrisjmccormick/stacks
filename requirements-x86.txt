@@ -1,0 +1,17 @@
+--index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://pypi.org/simple
+torch==2.10
+triton
+
+numpy
+huggingface_hub
+kernels
+wandb
+pyarrow
+tokenizers
+rustbpe
+tiktoken
+filelock
+jinja2
+requests
+tqdm
