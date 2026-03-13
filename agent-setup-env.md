@@ -43,6 +43,14 @@ Install requirements:
 pip install -r requirements-x86.txt
 ```
 
+Download the dataset:
+
+```bash
+source ~/env.sh
+cd ~/stacks
+python data/download_dataset.py
+```
+
 Finally, remind me to activate the environment in my terminal:
 
 ```bash

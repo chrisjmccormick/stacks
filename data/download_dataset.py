@@ -13,16 +13,19 @@ Downloads into ./data/:
 
 Usage:
   # Download everything (all training shards + validation + tokenizer + core eval)
-  python stacks/modded/data/download_dataset.py
+  python data/download_dataset.py --num-train-shards -1
 
   # Download a specific dataset variant
-  python stacks/modded/data/download_dataset.py --dataset-name fineweb_edu_16k
+  python data/download_dataset.py --dataset-name fineweb_edu_16k
 
   # Download only the first N training shards (+ validation + tokenizer)
-  python stacks/modded/data/download_dataset.py --num-train-shards 10
+  python data/download_dataset.py --num-train-shards 10
+
+  # Download all training shards (default is 20 to match decoderstack_medium_pt-sft.py)
+  python data/download_dataset.py --num-train-shards -1
 
   # Download only the tokenizer (no dataset shards or core eval)
-  python stacks/modded/data/download_dataset.py --tokenizer-only
+  python data/download_dataset.py --tokenizer-only
 """
 
 import os
@@ -62,8 +65,8 @@ def main():
         help="Name of the dataset to download (default: fineweb_edu_32k_8_370)"
     )
     parser.add_argument(
-        "--num-train-shards", type=int, default=-1,
-        help="Number of training shards to download (-1 = all, default: -1)"
+        "--num-train-shards", type=int, default=20,
+        help="Number of training shards to download (-1 = all, default: 20 to match decoderstack_medium_pt-sft.py)"
     )
     parser.add_argument(
         "--tokenizer-only", action="store_true",
@@ -82,7 +85,7 @@ def main():
 
     HF_REPO_ID = f"{args.hf_user}/{args.dataset_name}"
 
-    # Everything goes into ./modded/<dataset_name>/ (co-located with the script)
+    # Everything goes into data/<dataset_name>/ (sibling of script dir)
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     DATASET_DIR = os.path.join(SCRIPT_DIR, args.dataset_name)
     TOKENIZER_DIR = os.path.join(DATASET_DIR, "tokenizer")
@@ -140,16 +143,30 @@ def main():
     if "config.json" in repo_files:
         download_file(HF_REPO_ID, "config.json", DATASET_DIR)
 
-    # Separate val and train shard files
-    val_files = sorted([f for f in repo_files if f.startswith("val_") and f.endswith(".bin")])
-    train_files = sorted([f for f in repo_files if f.startswith("train_") and f.endswith(".bin")])
+    # Match decoderstack_medium_pt-sft.py: fineweb_edu/train_*.bin and fineweb_edu/val_*.bin
+    TRAIN_PREFIX = "fineweb_edu/train_"
+    VAL_PREFIX = "fineweb_edu/val_"
+
+    def train_shard_index(fname):
+        if not fname.startswith(TRAIN_PREFIX) or not fname.endswith(".bin"):
+            return None
+        try:
+            return int(fname[len(TRAIN_PREFIX):].split(".")[0])
+        except ValueError:
+            return None
+
+    train_files = sorted(
+        [f for f in repo_files if train_shard_index(f) is not None],
+        key=lambda f: train_shard_index(f),
+    )
+    val_files = sorted([f for f in repo_files if f.startswith(VAL_PREFIX) and f.endswith(".bin")])
 
     # Download validation shard(s)
     print(f"\n  --- Validation shards ({len(val_files)} files) ---")
     for fname in val_files:
         download_file(HF_REPO_ID, fname, DATASET_DIR)
 
-    # Download training shards
+    # Download training shards (first N, matching decoder NUM_TRAIN_SHARDS=20)
     if args.num_train_shards == -1:
         num_to_download = len(train_files)
     else:
