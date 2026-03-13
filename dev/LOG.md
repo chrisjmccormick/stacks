@@ -91,3 +91,34 @@ All old values preserved in comments (e.g. `# To use FineWeb-EDU instead: DATASE
 The ClimbMix-trained tokenizer shows a large improvement on code (+31%) since ClimbMix includes code in its mixture, unlike FineWeb-EDU which was text-only.
 
 ---
+
+## 2026-03-13: Fused ReLU² MLP Kernel — Not Viable for Medium Track
+
+Investigated porting the `FusedLinearReLUSquareFunction` Triton kernel from the small track to the medium track. The kernel fuses `relu(x @ W1.T)²` into a single Triton kernel, avoiding materializing the full `(T, mlp_hdim)` intermediate to HBM. It is actively used in the small track's MLP forward pass.
+
+**Result: abandoned.** The kernel OOMs on the medium track due to activation memory. The approach works for the small track only because of its much smaller footprint.
+
+### What we learned
+
+**Forward correctness is perfect.** The kernel produces bit-identical output to the unfused path for medium dimensions (N=6144, K=1536), with zero max absolute difference.
+
+**The blocker is backward memory, not compute.** `FusedLinearReLUSquareFunction` saves both `pre` and `post` tensors (each `(T, 6144)` bf16) via `ctx.save_for_backward`. Across 24 layers at T=131072 tokens, that's ~72 GiB of saved activations — far exceeding H100 PCIe's 80 GiB capacity once model parameters and optimizer states are included.
+
+**The small track survives because the numbers are radically different:**
+
+| Factor | Small | Medium | Ratio |
+|--------|-------|--------|-------|
+| mlp_hdim | 3072 | 6144 | 2x |
+| n_embd | 768 | 1536 | 2x |
+| MLP layers | ~11 | 24 | ~2x |
+| Activation per layer | T × 3072 × 2B | T × 6144 × 2B | 2x |
+| **Total activation saves** | **~9 GiB** | **~72 GiB** | **~8x** |
+
+**The custom autograd Function defeats `torch.compile`.** With the unfused path (`c_fc` → `relu²` → `c_proj`), `torch.compile` has full graph visibility and can optimize what to save vs recompute during backward. The custom Function is an opaque boundary — the compiler must keep everything `ctx.save_for_backward` requests alive.
+
+**The compute benefit is small anyway.** The kernel saves one HBM round-trip of the `(T, 6144)` intermediate per layer by fusing relu² into the matmul. But the matmuls are compute-bound on H100, so this bandwidth saving is a minor fraction of MLP time. `torch.compile` likely already fuses `F.relu(x).square()` into a single pointwise kernel after the matmul.
+
+### Observations for future work
+
+- Storing c_proj weight as `(6144, 1536)` instead of `(1536, 6144)` (matching c_fc's layout) would let all 48 MLP matrices share one Muon group instead of two separate groups. This is an independent change from the fused kernel and may be worth evaluating separately.
+- The `FusedLinearReLUSquareFunction` backward has a latent bug: it doesn't handle non-contiguous `grad_output` (e.g. expanded tensors from `.sum().backward()`). Not an issue in practice since gradients arriving through the model graph are always contiguous, but worth fixing if the kernel is reused elsewhere.
