@@ -982,6 +982,13 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+        """
+        lr scaling:
+        - unembedding_lr = 0.004 * (1536 / 768)^-0.5 = 0.002828
+        - embedding_lr   =   0.2 * (1536 / 768)^-0.5 = 0.1414
+        - matrix_lr      =  0.02 * (1536 / 768)^-0.5 = 0.01414
+        - scalar_lr      =   0.5 * (1536 / 768)^-0.5 = 0.35355
+        """
         model_dim = self.config.n_embd
         ddp = dist.is_initialized()
 

@@ -40,13 +40,15 @@ I'm hoping to place a greater emphasis on accessibility, with:
 
 Here's what exists currently:
 
-* `decoderstack_small_pt-eval-sft.py` - Training and evaluating the DecoderStack is the main focus of this repo.
+* `decoderstack_*_pt-sft.py` - Training and evaluating the DecoderStack is the main focus of this repo.
+* `generation_*.py` - Contains the kv cache version of the model and additional code for running the benchmarks which require generating text.
+
 * `baselines/` - Similar to modded's `records/` folder, this will hold the history of improvements to the DecoderStack.
 * `data/*.py` - Train a tokenizer then pre-process + pre-tokenize all of the nanochat datasets.
 * `models/` - One-off implementations of other projects and architectures, wrapped in the DecoderStack infrastructure.
     * `modded/train_gpt.py` - modded-nanogpt with minimal changes to compare performance on nanochat's benchmarks.
 
-## DecoderStack
+## DecoderStack-small
 
 Started out as: flatten nanochat to a single file then swap in all of modded-nanogpt's optimizations.
 
@@ -79,15 +81,47 @@ To get the best of both worlds, the `data/` folder includes scripts for training
 
 I've also folded in all of nanochat's code for preparing the CORE and SFT training and evaluation data and then tokenizing those into hosted shards as well. Data processing turned out to be a major bottleneck in nanochat's post-training (CORE evaluation, SFT training and evaluation) which this removes.
 
+### How to Run
+
+Run from the **repo root** directory (the script expects `data/` and `triton_kernels.py` as siblings):
+
+```bash
+# Single GPU
+torchrun --standalone --nproc_per_node=1 decoderstack_small_pt-eval-sft.py
+
+# Multi-GPU (e.g. 8xH100)
+torchrun --standalone --nproc_per_node=8 decoderstack_small_pt-eval-sft.py
+```
+
+The dataset is downloaded automatically from HuggingFace on first run. Set `HF_TOKEN` if needed for gated repos. To store data elsewhere, set `DATA_PATH`:
+
+```bash
+DATA_PATH=/mnt/data torchrun --standalone --nproc_per_node=1 decoderstack_small_pt-eval-sft.py
+```
+
+---
+
+## DecoderStack-medium
+
+The `small` track is close to a replica of the modded-nanogpt ~12-layer model, while the `medium` track is similarly a near-replica of the nanochat 24-layer model.
+
+Compared to nanochat:
+* Removed FP8 support
+* Removed configurability / scaling--it's hardcoded for d24.
+* Using the pre-tokenized binary file dataset approach from modded.
+* Added in bigram embeddings (Karpathy found these to work well at d24 scale, but not higher).
 
 ## models/modded-nanogpt
 
+This is setup to evaluate modded-nanogpt's performance against nanochat with minimal changes to modded's train_gpt.py script.
 
+The changes are:
+* Switch to nanochat's 32k vocab and ClimbMix training and validation sets (previously fineweb-edu).
+* Switch to bits-per-byte as the validation metric.
+* Evaluate the trained model on the CORE benchmark.
 
+I don't necessarily plan to maintain this--it's more like an interesting experiment, and served as the starting point for the DecoderStack.
 
-
-
-
-
+### How to Run
 
 
