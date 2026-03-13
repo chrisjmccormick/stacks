@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import XTX, XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
 
 dynamo.config.recompile_limit = 64
 
@@ -196,49 +196,84 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
+def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
+                  split_baddbmm: bool = False):
     """
-    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    Fused Nesterov momentum + Polar Express Sign Method.
+    Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
+    orthogonalization, avoiding materialization of the FP32 intermediate between graph breaks.
+
+    Polar Express: https://arxiv.org/pdf/2505.16932
     by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+
+    momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
     """
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    # Nesterov momentum (in FP32)
+    momentum = momentum_t.to(grad_chunk.dtype)
+    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
+    g = grad_chunk.lerp_(momentum_buffer, momentum)
+
+    X = g.bfloat16()
+    is_tall = g.size(-2) > g.size(-1)
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
 
-    # Allocate buffers
     X = X.contiguous()
-    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-    B = torch.empty_like(A)
-    C = torch.empty_like(X)
 
-    # Select batched vs unbatched
-    if split_baddbmm:
-        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
-    else:
-        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+    if is_tall:
+        # Tall: use Triton kernels with X^T @ X (small) and right multiplication
+        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
 
-    # Perform the iterations
-    for a, b, c in polar_express_coeffs:
-        XXT(X, out=A)  # A = X @ X.mT
-        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
-
-        # Referencing X twice causes pytorch to make a defensive copy,
-        # resulting in a cudaMemcpyAsync in baddbmm.
-        # For large matrices (i.e., the mlp weights), it's faster to split
-        # the operation into two kernels to avoid this.
+        # Select batched vs unbatched
         if split_baddbmm:
-            BX_matmul(B, X, out=C)  # C = B @ X
-            C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            XB_matmul = torch.bmm if X.ndim > 2 else torch.mm
         else:
-            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+            aX_plus_XB = torch.baddbmm if X.ndim > 2 else torch.addmm
 
-        X, C = C, X  # Swap references to avoid unnecessary copies
+        # Perform the iterations
+        for a, b, c in polar_express_coeffs:
+            XTX(X, out=A)  # A = X.T @ X
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b*A + c*(A@A)
 
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+            # Referencing X twice causes pytorch to make a defensive copy,
+            # resulting in a cudaMemcpyAsync in baddbmm.
+            # For large matrices (i.e., the mlp weights), it's faster to split
+            # the operation into two kernels to avoid this.
+            if split_baddbmm:
+                XB_matmul(X, B, out=C)  # C = X @ B
+                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            else:
+                aX_plus_XB(X, X, B, beta=a, out=C)  # C = a * X + X @ B
+
+            X, C = C, X  # Swap references to avoid unnecessary copies
+    else:
+        # Wide: use Triton kernels with X @ X^T (small) and left multiplication
+        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
+
+        # Select batched vs unbatched
+        if split_baddbmm:
+            BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+        else:
+            aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+        # Perform the iterations
+        for a, b, c in polar_express_coeffs:
+            XXT(X, out=A)  # A = X @ X.mT
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+
+            if split_baddbmm:
+                BX_matmul(B, X, out=C)  # C = B @ X
+                C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+            else:
+                aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+
+            X, C = C, X  # Swap references to avoid unnecessary copies
+
     return X
 
 
@@ -356,6 +391,7 @@ class NorMuonAndAdam:
         self._step_size_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -747,17 +783,16 @@ class NorMuonAndAdam:
         p_state = self.param_states[param]
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
-        # Momentum update
-        momentum_buffer = p_state["momentum_buffer"]
-        momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
-        updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
-
+        self._momentum_t.fill_(p_cfg.momentum)
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Polar Express orthogonalization
+        # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        v_chunk = polar_express(
+            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+            split_baddbmm=is_large_matrix,
+        )
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -1251,50 +1286,35 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Dataset download
 
-# Downloads everything in the repo (pre-training, validation, tokenizer, CORE eval) 
-NUM_TRAIN_SHARDS = 20 # Only download the first 20 training shards
-DATASET_NAME = "fineweb_edu_32k_8_370"
+NUM_TRAIN_SHARDS = 20
+# To use FineWeb-EDU instead: DATASET_NAME = "fineweb_edu_32k_8_370"
+DATASET_NAME = "climbmix_32k_8_170"
 HF_REPO_ID = f"ChrisMcCormick/{DATASET_NAME}"
 _data_path = os.environ.get("DATA_PATH", ".")
 DATASET_DIR = os.path.join(_data_path, f"data/{DATASET_NAME}")
 _config_path = os.path.join(DATASET_DIR, "config.json")
 
-if not os.path.exists(_config_path):
-    if master_process:
-        from huggingface_hub import HfApi, hf_hub_download, login
-        hf_token = os.environ.get("HF_TOKEN")
-        if hf_token:
-            login(token=hf_token)
-        os.makedirs(DATASET_DIR, exist_ok=True)
-        print(f"=== Downloading dataset from {HF_REPO_ID} ===")
-        api = HfApi()
-        train_prefix = "fineweb_edu/train_"
-        for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
-            # Only download the first NUM_TRAIN_SHARDS training shards
-            if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
-                continue
-            if not os.path.exists(os.path.join(DATASET_DIR, fname)):
-                hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
-        assert os.path.exists(_config_path), "config.json missing after download"
+if master_process:
+    from huggingface_hub import HfApi, hf_hub_download, login
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        login(token=hf_token)
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    api = HfApi()
+    # To use FineWeb-EDU instead: train_prefix = "fineweb_edu/train_"
+    train_prefix = "climbmix/train_"
+    to_download = []
+    for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
+        if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
+            continue
+        if not os.path.exists(os.path.join(DATASET_DIR, fname)):
+            to_download.append(fname)
+    if to_download:
+        print(f"=== Downloading {len(to_download)} files from {HF_REPO_ID} ===")
+        for fname in to_download:
+            hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
         print("  Done.")
-    dist.barrier()  # all ranks wait for rank 0 to finish downloading
-
-# Verify chat eval data is present (fail fast rather than after hours of training)
-_chat_eval_dir = os.path.join(DATASET_DIR, "chat_eval")
-_chat_eval_config_path = os.path.join(_chat_eval_dir, "config.json")
-assert os.path.exists(_chat_eval_config_path), (
-    f"Chat eval config not found at {_chat_eval_config_path}. "
-    f"Run `python data/chat_eval_dataset.py` to generate chat eval data."
-)
-with open(_chat_eval_config_path) as f:
-    _chat_eval_config = json.load(f)
-for _task_info in _chat_eval_config['tasks']:
-    _pt_path = os.path.join(_chat_eval_dir, _task_info['file'])
-    assert os.path.exists(_pt_path), (
-        f"Chat eval data not found: {_pt_path}. "
-        f"Run `python data/chat_eval_dataset.py` to generate chat eval data."
-    )
-del _chat_eval_config, _chat_eval_dir, _chat_eval_config_path, _task_info, _pt_path
+dist.barrier()
 
 # Load vocab config
 with open(_config_path) as f:
@@ -1814,8 +1834,9 @@ import datetime
 class Hyperparameters:
     # data
     data_path = os.environ.get("DATA_PATH", ".")
-    train_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/fineweb_edu/train_*.bin") # input .bin to train on
-    val_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/fineweb_edu/val_*.bin") # input .bin to eval validation loss on
+    # To use FineWeb-EDU instead: replace "climbmix" with "fineweb_edu" in the two paths below
+    train_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/climbmix/train_*.bin") # input .bin to train on
+    val_files: str = os.path.join(data_path, f"data/{DATASET_NAME}/climbmix/val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
     train_max_seq_len: int = 128 * 16
@@ -2490,7 +2511,7 @@ assert _sft_shard_files, f"No SFT training shards found at {sft_train_files}"
 # overestimates by ~2x, so we hardcode the observed value instead).
 # NOTE: this is calibrated for dataset='{DATASET_NAME}' with sft_total_batch_size={sft_total_batch_size:,}.
 #       If either changes, re-run once with sft_estimated_steps = -1 and note the final step count.
-_sft_known_steps = 838  # observed on dataset='fineweb_edu_32k_8_370', batch=524288
+_sft_known_steps = 838  # observed on dataset='fineweb_edu_32k_8_370', batch=524288; needs recalibration for climbmix
 sft_estimated_steps = _sft_known_steps
 if sft_num_iterations > 0:
     sft_estimated_steps = min(sft_estimated_steps, sft_num_iterations)

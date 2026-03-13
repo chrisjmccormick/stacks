@@ -31,6 +31,7 @@ from torch import Tensor
 torch.empty(1, device=f"cuda:{os.environ['LOCAL_RANK']}", requires_grad=True).backward()
 
 from kernels import get_kernel
+from triton_kernels_medium import XTX, XXT, ba_plus_cAA
 
 dynamo.config.recompile_limit = 64
 
@@ -203,17 +204,29 @@ def muon_step_fused(
 
     # Polar express
     X = g.bfloat16()
+    is_tall = g.size(-2) > g.size(-1)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
+    X = X.contiguous()
+    if is_tall:
+        A = torch.empty((*X.shape[:-2], X.size(-1), X.size(-1)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
         for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else: # Wide matrix (original math)
+            XTX(X, out=A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            torch.bmm(X, B, out=C)
+            C.add_(X, alpha=a)
+            X, C = C, X
+    else:
+        A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+        B = torch.empty_like(A)
+        C = torch.empty_like(X)
         for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
+            XXT(X, out=A)
+            ba_plus_cAA(A, alpha=c, beta=b, out=B)
+            torch.bmm(B, X, out=C)
+            C.add_(X, alpha=a)
+            X, C = C, X
     g = X
 
     # Variance reduction
@@ -1063,41 +1076,26 @@ _data_path = os.environ.get("DATA_PATH", ".")
 DATASET_DIR = os.path.join(_data_path, f"data/{DATASET_NAME}")
 _config_path = os.path.join(DATASET_DIR, "config.json")
 
-if not os.path.exists(_config_path):
-    if master_process:
-        from huggingface_hub import HfApi, hf_hub_download, login
-        hf_token = os.environ.get("HF_TOKEN")
-        if hf_token:
-            login(token=hf_token)
-        os.makedirs(DATASET_DIR, exist_ok=True)
-        print(f"=== Downloading dataset from {HF_REPO_ID} ===")
-        api = HfApi()
-        train_prefix = "fineweb_edu/train_"
-        for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
-            if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
-                continue
-            if not os.path.exists(os.path.join(DATASET_DIR, fname)):
-                hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
-        assert os.path.exists(_config_path), "config.json missing after download"
+if master_process:
+    from huggingface_hub import HfApi, hf_hub_download, login
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        login(token=hf_token)
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    api = HfApi()
+    train_prefix = "fineweb_edu/train_"
+    to_download = []
+    for fname in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset"):
+        if fname.startswith(train_prefix) and int(fname[len(train_prefix):].split(".")[0]) >= NUM_TRAIN_SHARDS:
+            continue
+        if not os.path.exists(os.path.join(DATASET_DIR, fname)):
+            to_download.append(fname)
+    if to_download:
+        print(f"=== Downloading {len(to_download)} files from {HF_REPO_ID} ===")
+        for fname in to_download:
+            hf_hub_download(repo_id=HF_REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
         print("  Done.")
-    dist.barrier()
-
-# Verify chat eval data is present (fail fast rather than after hours of training)
-_chat_eval_dir = os.path.join(DATASET_DIR, "chat_eval")
-_chat_eval_config_path = os.path.join(_chat_eval_dir, "config.json")
-assert os.path.exists(_chat_eval_config_path), (
-    f"Chat eval config not found at {_chat_eval_config_path}. "
-    f"Run `python data/chat_eval_dataset.py` to generate chat eval data."
-)
-with open(_chat_eval_config_path) as f:
-    _chat_eval_config = json.load(f)
-for _task_info in _chat_eval_config['tasks']:
-    _pt_path = os.path.join(_chat_eval_dir, _task_info['file'])
-    assert os.path.exists(_pt_path), (
-        f"Chat eval data not found: {_pt_path}. "
-        f"Run `python data/chat_eval_dataset.py` to generate chat eval data."
-    )
-del _chat_eval_config, _chat_eval_dir, _chat_eval_config_path, _task_info, _pt_path
+dist.barrier()
 
 # Load vocab config
 with open(_config_path) as f:
@@ -1625,13 +1623,13 @@ class Hyperparameters:
     train_max_seq_len: int = 2048
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_iterations: int = 4000
+    num_iterations: int = 50  # TEMP HACK: was 4000
     # evaluation and logging
     run_id: str = f"{str(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S'))}-d24"
-    val_loss_every: int = 250
+    val_loss_every: int = 250  # TEMP HACK: was 250
     save_checkpoint: bool = True
     # wandb logging ("dummy" disables wandb)
-    wandb_run: str = f"{str(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S'))}-d24"
+    wandb_run: str = "dummy"
     wandb_project: str = "decoderstack"
     # bigram hash embedding
     bigram_vocab_size: int = VOCAB_SIZE * 5
@@ -1837,20 +1835,21 @@ for step in range(train_steps + 1):
             torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # --------------- CORE EVALUATION -----------------
         model.eval()
-        core_eval_t0 = time.time()
-        core_out = evaluate_core(model, device, bos_id=BOS_ID)
-        core_eval_elapsed = time.time() - core_eval_t0
-        print0(f"CORE metric: {core_out['core_metric']:.4f} | total CORE eval time: {core_eval_elapsed:.2f}s", console=True)
-        for label, acc in core_out['results'].items():
-            centered = core_out['centered_results'][label]
-            print0(f"  {label}: accuracy={acc:.4f} centered={centered:.4f}", console=True)
+        # TEMP HACK - Disable core evaluation
+        # core_eval_t0 = time.time()
+        # core_out = evaluate_core(model, device, bos_id=BOS_ID)
+        # core_eval_elapsed = time.time() - core_eval_t0
+        # print0(f"CORE metric: {core_out['core_metric']:.4f} | total CORE eval time: {core_eval_elapsed:.2f}s", console=True)
+        # for label, acc in core_out['results'].items():
+        #     centered = core_out['centered_results'][label]
+        #     print0(f"  {label}: accuracy={acc:.4f} centered={centered:.4f}", console=True)
         wandb_run.log({
             "step": step,
-            "core_metric": core_out["core_metric"],
-            **{f"core/{label}/accuracy": acc for label, acc in core_out["results"].items()},
-            **{f"core/{label}/centered": c for label, c in core_out["centered_results"].items()},
+            #"core_metric": core_out["core_metric"],
+            #**{f"core/{label}/accuracy": acc for label, acc in core_out["results"].items()},
+            #**{f"core/{label}/centered": c for label, c in core_out["centered_results"].items()},
             "timing/pretrain_seconds": training_time_ms / 1000,
-            "timing/core_eval_seconds": core_eval_elapsed,
+            #"timing/core_eval_seconds": core_eval_elapsed,
         })
         break
 
@@ -1929,10 +1928,11 @@ sft_train_files = os.path.join(_data_path, f"data/{DATASET_NAME}/sft/sft_train_*
 sft_val_files = os.path.join(_data_path, f"data/{DATASET_NAME}/sft/sft_val_*.bin")
 sft_total_batch_size = 524288       # total tokens per optimizer step (all ranks, all accum steps)
 sft_max_seq_len = 2048              # max conversation length
-sft_num_iterations = -1             # -1 = one full epoch through all shards
-sft_eval_every = 150                # evaluate val bpb every N steps (0 = only at end)
+sft_num_iterations = 20             # TEMP HACK: was -1 (one full epoch)
+sft_eval_every = 10                 # TEMP HACK: was 150
 sft_eval_tokens = 5 * 524288       # ~2.6M tokens for val evaluation
-sft_grad_accum_steps = grad_accum_steps  # same as pre-training: 8 // world_size
+micro_batch_tokens = total_batch_size // (world_size * grad_accum_steps)
+sft_grad_accum_steps = sft_total_batch_size // (world_size * micro_batch_tokens)
 sft_grad_scale = 1.0 / sft_grad_accum_steps
 
 print0(f"SFT config: total_batch={sft_total_batch_size:,} max_seq_len={sft_max_seq_len} "

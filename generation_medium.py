@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
 from dataclasses import dataclass
+COMPUTE_DTYPE = torch.bfloat16
 flash_attn_interface = None  # Initialized by caller via set_flash_attn()
 fused_mlp_fn = None  # Initialized by caller via set_fused_mlp()
 
@@ -159,11 +160,11 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn_interface.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
+            y = flash_attn_interface.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
@@ -366,7 +367,8 @@ class GPTInference(nn.Module):
         bigram_vs = tm.bigram_embed.num_embeddings if hasattr(tm, 'bigram_embed') else 0
         m = cls(cfg, bigram_vocab_size=bigram_vs)
         m.to_empty(device=dev)
-        m.load_state_dict(tm.state_dict(), strict=True)
+        sd = {k.removeprefix("_orig_mod."): v for k, v in tm.state_dict().items()}
+        m.load_state_dict(sd, strict=True)
         m.eval()
         return m
 
