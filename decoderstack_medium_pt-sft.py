@@ -652,9 +652,6 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # Max total tokens in a single forward pass (packed batch). Determines RoPE cache size.
-    # 0 = auto: sequence_len * 10 (only safe when packed batches are small)
-    max_packed_tokens: int = 0
 
 
 def norm(x):
@@ -794,8 +791,9 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
-        # Rotary cache must cover the largest packed-batch token count seen in any forward pass.
-        self.rotary_seq_len = config.max_packed_tokens if config.max_packed_tokens > 0 else config.sequence_len * 10
+        # Rotary cache must cover the largest packed-batch token count (val batches are the largest).
+        # grad_accum_steps * world_size = 8 always (invariant of this speedrun).
+        self.rotary_seq_len = args.val_batch_size // 8
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
@@ -1665,12 +1663,10 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 # -----------------------------------------------------------------------------
 # Initialize the Model (hardcoded medium: depth=24, model_dim=1536, 12 heads)
 
-max_packed = args.val_batch_size // (grad_accum_steps * world_size)
 config = GPTConfig(
     sequence_len=2048, vocab_size=VOCAB_SIZE,
     n_layer=24, n_head=12, n_kv_head=12, n_embd=1536,
     window_pattern="SSSL",
-    max_packed_tokens=max_packed,
 )
 with torch.device("meta"):
     model = GPT(config)
