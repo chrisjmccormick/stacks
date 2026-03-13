@@ -40,11 +40,14 @@ def get_base_dir():
 # The specifics of the current pretraining dataset
 
 # The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
-MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
+# To use FineWeb-EDU instead: BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
+BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+# To use FineWeb-EDU instead: MAX_SHARD = 1822
+MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data")
+# To use FineWeb-EDU instead: DATA_DIR = os.path.join(base_dir, "base_data")
+DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
@@ -150,9 +153,9 @@ def download_single_file(index):
 # # look at dev/repackage_data_reference.py for details on how this data was prepared
 # python -m nanochat.dataset -n 8
 # # Immediately also kick off downloading more shards in the background while tokenizer trains
-# # Approximately 350 shards are needed for 10B tokens of data for pretraining.
-# # The maximum total number of shards available in the entire dataset is 1822.
-# python -m nanochat.dataset -n 370 &
+# # Approximately 150 shards are needed for GPT-2 capability pretraining, add 20 for padding.
+# # The maximum total number of shards available in the entire dataset is 6542.
+# python -m nanochat.dataset -n 170 &
 # DATASET_DOWNLOAD_PID=$!
 # ```
 
@@ -165,15 +168,16 @@ def download_single_file(index):
 # -----------------------------------------------------------------------------
 # Command line arguments
 # -----------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Download, tokenize, and prepare FineWeb-Edu dataset")
+parser = argparse.ArgumentParser(description="Download, tokenize, and prepare ClimbMix dataset")
 parser.add_argument("--vocab-size", type=int, default=32768,
                     help="Vocabulary size (default: 32768 = 2^15)")
-parser.add_argument("--num-shards", type=int, default=370,
-                    help="Total parquet shards to download. Last shard becomes val. (default: 370)")
+parser.add_argument("--num-shards", type=int, default=170,
+                    help="Total parquet shards to download. Last shard becomes val. (default: 170)")
 parser.add_argument("--tok-train-shards", type=int, default=8,
                     help="Number of shards to download before tokenizer training (default: 8, matching nanochat)")
-parser.add_argument("--dataset-name", type=str, default="fineweb_edu_32k_8_370",
-                    help="Name for the output dataset directory (default: fineweb_edu_32k_8_370)")
+# To use FineWeb-EDU instead: --dataset-name fineweb_edu_32k_8_370
+parser.add_argument("--dataset-name", type=str, default="climbmix_32k_8_170",
+                    help="Name for the output dataset directory (default: climbmix_32k_8_170)")
 parser.add_argument("--num-workers", type=int, default=4,
                     help="Number of parallel download workers (default: 4)")
 parser.add_argument("--max-chars", type=int, default=2_000_000_000,
@@ -221,7 +225,7 @@ def download_shards(n):
 # This replicates nanochat's two-phase approach from speedrun.sh:
 #   python -m nanochat.dataset -n 8    ← download 8 shards
 #   python -m scripts.tok_train        ← train tokenizer (sees shards 0-6 as train, shard 7 as val)
-#   python -m nanochat.dataset -n 370  ← download rest in background
+#   python -m nanochat.dataset -n 170  ← download rest in background
 #
 # parquets_iter_batched(split="train") uses list_parquet_files()[:-1],
 # so with 8 shards on disk it trains on shards 0-6 (~1.75B chars).
@@ -552,10 +556,10 @@ all_text = [
     ("code", code_text),
     ("math", math_text),
     ("science", science_text),
-    ("fwe-train", train_text),
+    ("cm-train", train_text),
 ]
 if val_text:
-    all_text.append(("fwe-val", val_text))
+    all_text.append(("cm-val", val_text))
 
 # Try out current default compared to GPT-2 and GPT-4 tokenizers
 tokenizer_results = {}
@@ -680,9 +684,9 @@ print(f"\n=== Phase 2: Download remaining shards (up to {args.num_shards} total)
 download_shards(args.num_shards)
 
 # ================================================================================
-#    Pre-tokenize fineweb-edu parquets into .bin shards for modded-nanogpt
+#    Pre-tokenize ClimbMix parquets into .bin shards for modded-nanogpt
 #
-#    Reads from the already-downloaded fineweb-edu parquet shards (above) and
+#    Reads from the already-downloaded ClimbMix parquet shards (above) and
 #    tokenizes with the custom-trained vocabulary (above) to produce .bin files
 #    in the format expected by the modded-nanogpt dataloader.
 # ================================================================================
@@ -725,6 +729,13 @@ def write_datafile(filename, toks):
 SHARD_SIZE = 10**8  # 100M tokens per shard
 
 # DATA_CACHE_DIR and TOKENIZER_DIR are already defined at the top from CLI args
+
+# Subfolder within the dataset directory for .bin shards.
+# The training scripts and HF repo use this path: data/{DATASET_NAME}/{BIN_SUBDIR}/train_*.bin
+# To use FineWeb-EDU instead: BIN_SUBDIR = "fineweb_edu"
+BIN_SUBDIR = "climbmix"
+BIN_DIR = os.path.join(DATA_CACHE_DIR, BIN_SUBDIR)
+os.makedirs(BIN_DIR, exist_ok=True)
 
 # ------------------------------------------
 # Load the custom-trained tokenizer
@@ -791,7 +802,7 @@ def pack_tokens(tokens_np):
 
         # shard is full — write it out
         if token_count == SHARD_SIZE:
-            filename = os.path.join(DATA_CACHE_DIR, f"{current_split}_{shard_index:06d}.bin")
+            filename = os.path.join(BIN_DIR, f"{current_split}_{shard_index:06d}.bin")
             write_datafile(filename, all_tokens_np)
             shard_index += 1
             token_count = 0
@@ -818,7 +829,7 @@ for split in ["val", "train"]:
     # After processing val, flush the (likely incomplete) val shard immediately.
     # This keeps val data cleanly separated from training data.
     if split == "val" and token_count > 0:
-        filename = os.path.join(DATA_CACHE_DIR, f"val_{shard_index:06d}.bin")
+        filename = os.path.join(BIN_DIR, f"val_{shard_index:06d}.bin")
         write_datafile(filename, all_tokens_np[:token_count])
         shard_index += 1
         token_count = 0

@@ -41,9 +41,10 @@ import torch
 parser = argparse.ArgumentParser(
     description="Pre-tokenize chat-formatted categorical evaluation data into .pt files"
 )
+# To use FineWeb-EDU instead: --dataset-name fineweb_edu_32k_8_370
 parser.add_argument(
-    "--dataset-name", type=str, default="fineweb_edu_32k_8_370",
-    help="Name of the dataset directory containing the tokenizer (default: fineweb_edu_32k_8_370)"
+    "--dataset-name", type=str, default="climbmix_32k_8_170",
+    help="Name of the dataset directory containing the tokenizer (default: climbmix_32k_8_170)"
 )
 parser.add_argument(
     "--hf-user", type=str, default="ChrisMcCormick",

@@ -10,14 +10,14 @@ All scripts should be run from the **repo root** (`stacks/`), not from inside `d
 
 ### 1. `data/dataset_and_vocab.py` — Train tokenizer + pre-tokenize training data
 
-This is the starting point. It downloads FineWeb-Edu, trains a BPE tokenizer on it, then pre-tokenizes the full dataset into `.bin` shards that the training script can load directly.
+This is the starting point. It downloads ClimbMix (NVIDIA's curated 400B-token blend of web text, code, math, and other sources), trains a BPE tokenizer on it, then pre-tokenizes the full dataset into `.bin` shards that the training script can load directly.
 
 ```bash
 python data/dataset_and_vocab.py
 ```
 
 Steps it performs:
-1. Downloads FineWeb-Edu parquet shards from HuggingFace (cached in `~/.cache/nanochat/base_data/`)
+1. Downloads ClimbMix parquet shards from HuggingFace (cached in `~/.cache/nanochat/base_data_climbmix/`)
 2. Trains a BPE tokenizer on the first N shards
 3. Evaluates the tokenizer against GPT-2/GPT-4 baselines
 4. Pre-tokenizes all shards into `.bin` files
@@ -26,10 +26,10 @@ Steps it performs:
 **Produces:** `data/<dataset_name>/` containing:
 - `tokenizer/tokenizer.pkl` and `tokenizer/token_bytes.pt`
 - `config.json`
-- `train_000000.bin`, `train_000001.bin`, ... (pre-training shards)
-- `val_000000.bin` (validation shard)
+- `climbmix/train_000000.bin`, `climbmix/train_000001.bin`, ... (pre-training shards)
+- `climbmix/val_000000.bin` (validation shard)
 
-The default dataset name is `fineweb_edu_32k_8_370` (32k vocab, 8 shards for tokenizer training, 370 total shards). You can customize with `--vocab-size`, `--tok-train-shards`, `--num-shards`, etc.
+The default dataset name is `climbmix_32k_8_170` (32k vocab, 8 shards for tokenizer training, 170 total shards). You can customize with `--vocab-size`, `--tok-train-shards`, `--num-shards`, etc.
 
 ---
 

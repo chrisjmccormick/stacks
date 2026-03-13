@@ -1,30 +1,20 @@
 """
-Download the pre-tokenized FineWeb-Edu dataset, custom vocabulary, and
-pre-tokenized CORE eval benchmark needed for training and evaluation.
+Download all pre-tokenized data needed for a training run from HuggingFace.
 
-This downloads the outputs of dataset_and_vocab.py and core_dataset.py so you
-don't have to re-run the full tokenizer training + dataset tokenization
-pipeline (~hours of work).
-
-Downloads into ./data/:
-  - Tokenizer files       -> ./data/<dataset_name>/tokenizer/
-  - Dataset shards        -> ./data/<dataset_name>/
-  - CORE eval (pre-tok)   -> ./data/<dataset_name>/core_eval/
+This downloads everything in the HF repo: tokenizer, pre-training shards,
+validation shards, CORE eval, chat eval, and SFT data.
 
 Usage:
-  # Download everything (all training shards + validation + tokenizer + core eval)
+  # Download with defaults (climbmix, 20 training shards)
+  python data/download_dataset.py
+
+  # Download a different dataset
+  python data/download_dataset.py --dataset-name fineweb_edu_32k_8_370
+
+  # Download all training shards
   python data/download_dataset.py --num-train-shards -1
 
-  # Download a specific dataset variant
-  python data/download_dataset.py --dataset-name fineweb_edu_16k
-
-  # Download only the first N training shards (+ validation + tokenizer)
-  python data/download_dataset.py --num-train-shards 10
-
-  # Download all training shards (default is 20 to match decoderstack_medium_pt-sft.py)
-  python data/download_dataset.py --num-train-shards -1
-
-  # Download only the tokenizer (no dataset shards or core eval)
+  # Download only the tokenizer
   python data/download_dataset.py --tokenizer-only
 """
 
@@ -32,153 +22,75 @@ import os
 import argparse
 from huggingface_hub import HfApi, hf_hub_download, login
 
-
-# ---------------------------------------------------------------------------
-# Download helpers
-# ---------------------------------------------------------------------------
-
-def download_file(repo_id, filename, local_dir):
-    """Download a single file from the HF repo, skipping if it already exists."""
-    local_path = os.path.join(local_dir, filename)
-    if os.path.exists(local_path):
-        print(f"  Skipping {filename} (already exists)")
-        return
-    print(f"  Downloading {filename}...")
-    hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        repo_type="dataset",
-        local_dir=local_dir,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# Known training shard prefixes per dataset
+TRAIN_PREFIXES = {
+    "climbmix_32k_8_170": "climbmix/train_",
+    "fineweb_edu_32k_8_370": "fineweb_edu/train_",
+}
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download pre-tokenized FineWeb-Edu dataset and vocabulary from HuggingFace"
+        description="Download pre-tokenized dataset from HuggingFace"
     )
     parser.add_argument(
-        "--dataset-name", type=str, default="fineweb_edu_32k_8_370",
-        help="Name of the dataset to download (default: fineweb_edu_32k_8_370)"
+        "--dataset-name", type=str, default="climbmix_32k_8_170",
+        help="Name of the dataset to download (default: climbmix_32k_8_170)"
     )
     parser.add_argument(
         "--num-train-shards", type=int, default=20,
-        help="Number of training shards to download (-1 = all, default: 20 to match decoderstack_medium_pt-sft.py)"
+        help="Max training shards to download (-1 = all, default: 20)"
     )
     parser.add_argument(
         "--tokenizer-only", action="store_true",
-        help="Only download the tokenizer files (no dataset shards)"
+        help="Only download the tokenizer files"
     )
     parser.add_argument(
         "--hf-user", type=str, default="ChrisMcCormick",
-        help="HuggingFace username/org for the repo (default: ChrisMcCormick)"
+        help="HuggingFace username/org (default: ChrisMcCormick)"
     )
     args = parser.parse_args()
 
-    # Log in using HF_TOKEN from the environment (needed for private repos)
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
         login(token=hf_token)
 
-    HF_REPO_ID = f"{args.hf_user}/{args.dataset_name}"
+    repo_id = f"{args.hf_user}/{args.dataset_name}"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    dataset_dir = os.path.join(script_dir, args.dataset_name)
+    os.makedirs(dataset_dir, exist_ok=True)
 
-    # Everything goes into data/<dataset_name>/ (sibling of script dir)
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    DATASET_DIR = os.path.join(SCRIPT_DIR, args.dataset_name)
-    TOKENIZER_DIR = os.path.join(DATASET_DIR, "tokenizer")
+    print(f"Repo:        {repo_id}")
+    print(f"Dataset dir: {dataset_dir}")
 
-    os.makedirs(DATASET_DIR, exist_ok=True)
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    print(f"HuggingFace repo: {HF_REPO_ID}")
-    print(f"Dataset dir:      {DATASET_DIR}")
-    print(f"Tokenizer dir:    {TOKENIZER_DIR}")
-
-    # ------------------------------------------------------------------
-    # List all files in the repo
-    # ------------------------------------------------------------------
-    print("\n  Listing repo files...")
     api = HfApi()
-    repo_files = api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
+    repo_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
 
-    # ------------------------------------------------------------------
-    # 1) Download pre-tokenized CORE eval
-    # ------------------------------------------------------------------
-    CORE_EVAL_DIR = os.path.join(DATASET_DIR, "core_eval")
-    os.makedirs(CORE_EVAL_DIR, exist_ok=True)
+    train_prefix = TRAIN_PREFIXES.get(args.dataset_name)
 
-    core_eval_files = sorted([f for f in repo_files if f.startswith("core_eval/")])
-    if core_eval_files:
-        print(f"\n=== Downloading pre-tokenized CORE eval to {CORE_EVAL_DIR} ({len(core_eval_files)} files) ===")
-        for fname in core_eval_files:
-            download_file(HF_REPO_ID, fname, DATASET_DIR)
-        print("  CORE eval download complete.")
-    else:
-        print("\n  No core_eval/ files found in repo, skipping CORE eval download.")
+    to_download = []
+    for fname in repo_files:
+        if args.tokenizer_only and not fname.startswith("tokenizer/"):
+            continue
+        if train_prefix and fname.startswith(train_prefix) and args.num_train_shards >= 0:
+            try:
+                shard_idx = int(fname[len(train_prefix):].split(".")[0])
+                if shard_idx >= args.num_train_shards:
+                    continue
+            except ValueError:
+                pass
+        if not os.path.exists(os.path.join(dataset_dir, fname)):
+            to_download.append(fname)
 
-    # ------------------------------------------------------------------
-    # 2) Download tokenizer files
-    # ------------------------------------------------------------------
-    print(f"\n=== Downloading tokenizer to {TOKENIZER_DIR} ===")
-
-    tokenizer_repo_files = [f for f in repo_files if f.startswith("tokenizer/")]
-    for fname in tokenizer_repo_files:
-        download_file(HF_REPO_ID, fname, DATASET_DIR)
-
-    print("  Tokenizer download complete.")
-
-    if args.tokenizer_only:
-        print("\n--tokenizer-only specified, skipping dataset shards.")
+    if not to_download:
+        print("All files already downloaded.")
         return
 
-    # ------------------------------------------------------------------
-    # 3) Download dataset files
-    # ------------------------------------------------------------------
-    print(f"\n=== Downloading dataset to {DATASET_DIR} ===")
+    print(f"Downloading {len(to_download)} files...")
+    for fname in to_download:
+        print(f"  {fname}")
+        hf_hub_download(repo_id=repo_id, filename=fname, repo_type="dataset", local_dir=dataset_dir)
 
-    # Download config.json
-    if "config.json" in repo_files:
-        download_file(HF_REPO_ID, "config.json", DATASET_DIR)
-
-    # Match decoderstack_medium_pt-sft.py: fineweb_edu/train_*.bin and fineweb_edu/val_*.bin
-    TRAIN_PREFIX = "fineweb_edu/train_"
-    VAL_PREFIX = "fineweb_edu/val_"
-
-    def train_shard_index(fname):
-        if not fname.startswith(TRAIN_PREFIX) or not fname.endswith(".bin"):
-            return None
-        try:
-            return int(fname[len(TRAIN_PREFIX):].split(".")[0])
-        except ValueError:
-            return None
-
-    train_files = sorted(
-        [f for f in repo_files if train_shard_index(f) is not None],
-        key=lambda f: train_shard_index(f),
-    )
-    val_files = sorted([f for f in repo_files if f.startswith(VAL_PREFIX) and f.endswith(".bin")])
-
-    # Download validation shard(s)
-    print(f"\n  --- Validation shards ({len(val_files)} files) ---")
-    for fname in val_files:
-        download_file(HF_REPO_ID, fname, DATASET_DIR)
-
-    # Download training shards (first N, matching decoder NUM_TRAIN_SHARDS=20)
-    if args.num_train_shards == -1:
-        num_to_download = len(train_files)
-    else:
-        num_to_download = min(args.num_train_shards, len(train_files))
-
-    print(f"\n  --- Training shards ({num_to_download}/{len(train_files)} files) ---")
-    for fname in train_files[:num_to_download]:
-        download_file(HF_REPO_ID, fname, DATASET_DIR)
-
-    print(f"\nDone! Downloaded to {DATASET_DIR}")
-    print(f"  Validation shards: {len(val_files)}")
-    print(f"  Training shards:   {num_to_download}/{len(train_files)}")
+    print(f"Done! Downloaded to {dataset_dir}")
 
 if __name__ == "__main__":
     main()
