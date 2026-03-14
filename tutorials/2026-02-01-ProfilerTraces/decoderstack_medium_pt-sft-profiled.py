@@ -1634,10 +1634,10 @@ class Hyperparameters:
     train_max_seq_len: int = 2048
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_iterations: int = 50  # nanochat calculates 13,224 for bs 512K (9.5x data-to-pararm)
+    num_iterations: int = 50  # TEMP HACK: was 4000
     # evaluation and logging
     run_id: str = f"{str(datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S'))}-d24"
-    val_loss_every: int = 250 
+    val_loss_every: int = 250  # TEMP HACK: was 250
     save_checkpoint: bool = True
     # wandb logging ("dummy" disables wandb)
     wandb_run: str = "dummy"
@@ -1818,7 +1818,65 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 
-for step in range(train_steps + 1):
+
+# =====================================================================================
+#                                PROFILING SETUP
+# =====================================================================================
+# Set up logging directories based on run name (RUN_ID set after compute_init for sync)
+
+from torch.profiler import profile, record_function, ProfilerActivity
+
+# Small helper for timestamping.
+from zoneinfo import ZoneInfo
+import datetime as dt
+
+def get_timestamp(timezone_str: str = "America/Los_Angeles") -> str:
+    tz = ZoneInfo(timezone_str)
+    now = dt.datetime.now(tz)
+    return now.strftime("%Y-%m-%d_%H%M%S")
+
+# Generate RUN_ID on rank 0 and broadcast to all ranks for consistent trace filenames
+import torch.distributed as dist
+
+# First, generate RUN_ID on rank 0.
+RUN_ID = args.run_id if master_process else None
+
+# Broadcast RUN_ID from rank 0 to all other ranks
+if dist.is_initialized():
+    run_id_list = [RUN_ID] if master_process else [None]
+    dist.broadcast_object_list(run_id_list, src=0)
+    RUN_ID = run_id_list[0]
+
+# Create logging directories
+TRACE_LOG_DIR = f"logs/{RUN_ID}/traces"
+os.makedirs(TRACE_LOG_DIR, exist_ok=True)
+
+# Profiler setup
+trace_filename = f"{TRACE_LOG_DIR}/{RUN_ID} - Rank {int(os.environ['RANK']):02d}.json.gz"
+print0(f"Chrome trace will be saved to: {trace_filename}")
+
+# Set up profiler activities
+activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+
+# Create profiler with schedule
+profiler = profile(
+    activities=activities,
+    record_shapes=False,
+    profile_memory=False,
+    with_stack=False,
+    schedule=torch.profiler.schedule(wait=5, warmup=5, active=4, repeat=1),
+)
+
+# Training loop
+profiled_steps = 0
+
+# Start profiler context
+profiler.__enter__()
+   
+for step in range(14):
+# =============================================================================
+
+# for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
@@ -1918,6 +1976,11 @@ for step in range(train_steps + 1):
         "total_training_time_ms": approx_training_time_ms,
     })
 
+    # =========================================================================
+    # Advance profiler schedule
+    profiler.step()
+    # =========================================================================
+
     # GC management
     if step == 0:
         gc.collect()
@@ -1928,6 +1991,33 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+# ============================================================================
+#                            PROFILING COMPLETE
+# ============================================================================
+
+# Export the chrome trace files (executed on all ranks)
+print(f"Exporting chrome trace to: {trace_filename}")
+profiler.__exit__(None, None, None)  # Stop the profiler
+profiler.export_chrome_trace(trace_filename)
+print(f"Chrome trace saved successfully to: {trace_filename}")
+
+# OPTIONAL, multi-gpu only: Zip up all 8 trace files to make them easier to download.
+import zipfile
+if dist.is_initialized():
+    dist.barrier()  # Wait for all ranks to finish writing their traces
+if master_process:
+    zip_filename = f"{TRACE_LOG_DIR}/{RUN_ID}.zip"
+    with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for rank in range(int(os.environ['WORLD_SIZE'])): # TODO - Just zip the folder to simply this.
+            trace_path = f"{TRACE_LOG_DIR}/{RUN_ID} - Rank {rank:02d}.json.gz"
+            if os.path.exists(trace_path):
+                zipf.write(trace_path, f"rank_{rank:02d}.json.gz")
+            else:
+                print(f"Warning: trace file not found: {trace_path}")
+    print(f"Zip file saved successfully to: {zip_filename}")
+
+# ============================================================================
 
 
 # ========================================================================================
