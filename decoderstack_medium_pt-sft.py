@@ -90,7 +90,9 @@ def print0(*args, console=False, **kwargs):
     if master_process:
         print(*args, **kwargs)
 
-# -----------------------------------------------------------------------------
+# ========================================================================================
+#                                   OPTIMIIZERS                                     
+# ========================================================================================
 # optim.py
 
 """
@@ -635,9 +637,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
 
-# -----------------------------------------------------------------------------
+# ========================================================================================
+#                                   MODEL CODE                                     
+# ========================================================================================
 # gpt.py
-
 
 """
 GPT model (rewrite, a lot simpler)
@@ -1073,7 +1076,9 @@ class GPT(nn.Module):
             # inference: return logits (used by CORE eval)
             return logits
 
-# -----------------------------------------------------------------------------
+# ========================================================================================
+#                                   DATASET DOWNLOAD                                     
+# ========================================================================================
 # Dataset download
 
 NUM_TRAIN_SHARDS = 20
@@ -1114,8 +1119,14 @@ with open(_config_path) as f:
 VOCAB_SIZE = _vocab_config["vocab_size"]
 BOS_ID = _vocab_config["bos_id"]
 
-# -----------------------------------------------------------------------------
-# Distributed data loader
+# ========================================================================================
+#                                   DISTRIBUTED DATA LOADER                                     
+# ========================================================================================
+# Based on the dataloader from modded-nanogpt.
+# - Designed for use with flashattention_varlen_func, meaning it returns a packed token
+#   buffer of sequences and their lengths via cu_seqlens.
+# - Hardcoded for single-epoch training.
+# - Compared to `modded`, it does not support changing batch size mid-training.
 
 def _load_data_shard(file: Path):
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
@@ -1155,6 +1166,7 @@ class Shard:
             self.bos_idx = self._full_idx
 
     def next_batch(self, num_tokens_local: int, max_seq_len: int):
+        """Returns (starts, ends) per rank, or None if this shard is exhausted."""
         self._maybe_switch()
         n = len(self.bos_idx)
         starts = [[] for _ in range(self.world_size)]
@@ -1165,7 +1177,7 @@ class Shard:
             cur_len = 0
             while cur_len <= num_tokens_local:
                 if idx >= n:
-                    raise StopIteration(f"Insufficient BOS ahead; hit tail of shard.")
+                    return None
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
                 end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
@@ -1212,84 +1224,121 @@ def get_bigram_hash(x):
     return x
 
 def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
-    # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
+    """
+    Generator (i.e., yields rather than returns) the token ids for a micro-batch (batch / accum steps). 
+    Provides both the input and target, and TODO - the bigram hash. 
+    For 8 GPUs and batch size 512K, we use 2 grad accum steps, and this returns
+    32K tokens.
+    Only return sequences from their beginning, discarding tokens past 2048
+    The BOS token is included. 
+    Also used for validation batches.
+    Args:
+        filename_pattern: pattern to match the dataset files
+        num_tokens:       512K tokens for training 
+        max_seq_len:      2048
+        grad_accum_steps: 2 for batch size 512K
+        align_to_bos:           
+    """
+    # This GPU's rank and total GPU count.
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
-    num_tokens = num_tokens // grad_accum_steps
+    
+    # Confirm it all divides evenly, then calculate the per-GPU micro-batch size.
+    assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"    
+    num_tokens_local = num_tokens // grad_accum_steps // world_size
 
+    # To fix the size of cu_seqlens, we need to establish a fixed number of documents
+    # per micro-batch. We don't need to use every position in cu_seqlens, but we do need
+    # to ensure that we always have enough documents to fill the micro-batch. 
+    # We estimate an upper-bound by leveraging the known median document length, and
+    # we round up to next multiple of 128.
+    max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)  # median doc length is ~400
+
+    # Get the list of shard files and wrap in an iterator.
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+    file_iter = iter(files)
 
-    file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
+    # Load the first shard.
     tokens = _load_data_shard(next(file_iter))
-    if align_to_bos:
-        shard = Shard(tokens, world_size)
-        next_shard_getter = Shard.load_async(next(file_iter), world_size)
-    else:
-        pos = 0  # for unaligned case
+    
+    shard = Shard(tokens, world_size)
+    remaining_files = list(file_iter)
+    next_shard_idx = 0
+    next_shard_getter = Shard.load_async(remaining_files[0], world_size) if remaining_files else None
 
     while True:
-        num_tokens_local = num_tokens // world_size
-        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)  # median doc length is ~400
+        # Get the start and end indices (within `tokens`) of the sequences to use for 
+        # the current micro-batch.
+        result = shard.next_batch(num_tokens_local, max_seq_len)
+        
+        # If this shard is exhausted,
+        if result is None:
+            # If there are no more shards, kill the dataloader.
+            if next_shard_getter is None:
+                return 
 
-        if align_to_bos:
-            try:
-                seq_starts, seq_ends = shard.next_batch(num_tokens_local, max_seq_len)
-                start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
-            except StopIteration:
-                # This shard is exhausted, load the next one in the next loop iteration.
-                shard = next_shard_getter()
-                tokens = shard.tokens
-                try:
-                    next_shard_getter = Shard.load_async(next(file_iter), world_size)
-                except StopIteration:
-                    next_shard_getter = None  # no more shards to preload
-                continue
+            # Load the next shard.
+            shard = next_shard_getter()
+            tokens = shard.tokens
+            next_shard_idx += 1
+            next_shard_getter = Shard.load_async(remaining_files[next_shard_idx], world_size) if next_shard_idx < len(remaining_files) else None
+            
+            # Re-start the loop.
+            continue
 
-            buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
-            _inputs = buf[:-1]
-            _targets = buf[1:]
-            end_idxs[-1] -= 1  # last document was too long to account for _targets offset
-            cum_lengths = (end_idxs - start_idxs).cumsum(0)
+        # Locations of the documents in `tokens`. Only specifies the
+        # number of documents needed, not max.
+        start_idxs = torch.tensor(result[0][rank])
+        end_idxs = torch.tensor(result[1][rank])
+        
+        # `tokens` contains the entire shard. The sequences defined by the starts and ends
+        # may or may not be contiguous within `tokens`, due to some sequences being
+        # truncated, so we slice them and then re-concatenate into a single tensor. 
+        buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+        
+        # `buf` contains `num_tokens_local + 1` tokens to allow for the inputs vs.
+        # targets offset.
+        _inputs = buf[:-1] # All tokens minus the last
+        _targets = buf[1:] # Shift the tokens to the left, so that targets contains the 
+                           # next token for each input token. 
 
-        else:
-            if pos + num_tokens + 1 >= len(tokens):  # should not occur for val data
-                tokens, pos = _load_data_shard(next(file_iter)), 0
+        # The final document includes an extra token that is the target of the last 
+        # token in the last document. Now that we have our `_targets`, we can remove it.
+        end_idxs[-1] -= 1  
 
-            pos_local = pos + rank * num_tokens_local
-            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
-            _inputs = buf[:-1].view(num_tokens_local, )
-            _targets = buf[1:].view(num_tokens_local, )
+        # Calculate the start indices of the documents within `_inputs`. (flashattention
+        # start_idxs are relative to the `tokens` buffer, so we convert them by
+        # accumulating the document lengths.  
+        # cum_lengths starts with the second document, so we'll shift 
+        cum_lengths = (end_idxs - start_idxs).cumsum(0)
 
-            cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
-            pos += num_tokens
-
-
+        # The actual cu_seqlens array always needs to contain `max_num_docs` elements so we
+        # the compiler can build a single graph.
+        # We allocate that buffer here and fill it with "empty documents", i.e., setting their start index
+        # to one past the end of the `_inputs` buffer.
         _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
+        
+        # Then copy in the lengths, inserting the first document (index 0).
         _cum_lengths[0] = 0
         _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
 
-        # Cast to int32 on CPU before transfer to avoid dtype conversion during .to()
+        # Cast to int32 / int64 on the CPU before transfer to avoid dtype conversion during .to()
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
+        # Calculate the index of the bigram embedding for each input token.
         _bigram_inputs = get_bigram_hash(_inputs)
 
-        new_params = yield (
+        yield (
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
             _bigram_inputs.to(device="cuda", non_blocking=True)
         )
+        # Execution resumes here on the next call.
 
-        if new_params is not None:
-            # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
-            new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-            assert new_num_tokens % (world_size * new_grad_accum_steps) == 0, "Num tokens must be divisible by world size"
-            num_tokens = new_num_tokens // new_grad_accum_steps
-            max_seq_len = new_max_seq_len
 
 # -----------------------------------------------------------------------------
 # CORE Evaluation
