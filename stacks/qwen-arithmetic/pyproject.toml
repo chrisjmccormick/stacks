@@ -1,0 +1,55 @@
+[project]
+name = "qwen-arithmetic"
+version = "0.1.0"
+description = "Single-file GRPO speedrun: Qwen2.5-0.5B-Instruct on basic arithmetic"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26.0",
+    "torch==2.10.0",
+    "kernels>=0.11.7",
+    "safetensors>=0.5.0",
+    "huggingface_hub>=0.30.0",
+    "tokenizers>=0.22.0",
+    "rustbpe>=0.1.0",
+    "wandb>=0.21.0",
+    "pyarrow>=21.0.0",
+    "filelock>=3.19.0",
+    # Not imported by the project itself — the agent-ops analysis/verification
+    # scripts run against this venv and the convention is that they emit
+    # markdown tables rather than console-only results.
+    "tabulate>=0.9.0",
+]
+
+# Script mini-repo — no importable package to install. This venv serves the
+# data/ prep scripts and the raw H100 baseline (baselines/20260813_raw-h100/);
+# the hf-vllm baseline needs a DIFFERENT env (transformers must not be
+# installed here) — see baselines/20260813_hf-vllm/setup_hf_vllm.sh. The
+# shipped T4 speedrun needs neither: it runs on stock Colab.
+[tool.uv]
+package = false
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+    ],
+]
+
+[project.optional-dependencies]
+cpu = ["torch==2.10.0"]
+gpu = ["torch==2.10.0"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "gpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

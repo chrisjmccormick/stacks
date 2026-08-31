@@ -1,0 +1,9 @@
+# Second venv (the hf-vllm baseline's; plain .venv is ignored repo-wide)
+.venv-hf-vllm/
+
+# Per-run telemetry the trainers write to the cwd
+metrics_*.csv
+evals_*.csv
+evals_detail_*.csv
+result_*.json
+trace_*.json.gz
