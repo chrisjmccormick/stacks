@@ -1,0 +1,21 @@
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+torch==2.10
+triton
+
+numpy
+huggingface_hub
+# kernels >= 0.14 can't load get_kernel("varunneal/flash-attention-3"): the
+# publisher trust gate 404s on user-owned repos, and 0.16 rejects classic
+# model repos outright (new kernels repo-type API). 0.13.0 = validated-run era.
+kernels==0.13.0
+wandb
+pyarrow
+tokenizers
+rustbpe
+tiktoken
+filelock
+jinja2
+requests
+tqdm
+datasets
