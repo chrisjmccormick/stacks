@@ -217,7 +217,7 @@ marimo/_lsp/
 __marimo__/
 env.sh
 
-# decoder-rtx downloads its dataset + checkpoints here (train_stack.py / train_gsm8k.py)
+# decoder-rtx downloads its dataset + writes checkpoints here (train_stack.py)
 stacks/decoder-rtx/data/
 stacks/decoder-rtx/logs/
 stacks/decoder-rtx/wandb/
