@@ -1,8 +1,12 @@
 import glob
+import json
+import math
+import os
 import threading
-from pathlib import Path
+import time
+
+import numpy as np
 import torch
-from torch import Tensor
 
 
 # ------------------------------------------------------------------------------
@@ -54,23 +58,72 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqle
 
 
 # ------------------------------------------------------------------------------
-# Data Loader
+# Dataset
 # ------------------------------------------------------------------------------
 
-def _load_data_shard(file: Path):
-    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+REPO_ID = "ChrisMcCormick/climbmix_32k_8_170"
+DATASET_DIR = "./data/climbmix_32k_8_170"
+
+NUM_TRAIN_SHARDS   = 10      # the 988-step plan reads 8 (100M raw tokens each)
+EVAL_BUFFER_TOKENS = 65536   # tokens per validation micro-batch
+CAP0               = 256     # document prefix cap at micro-batch 0
+CAP_RAMP_FRAC      = 0.5     # fraction of the run over which it reaches seq_len
+
+
+def download_dataset():
+    """The shards, tokenizer and config into DATASET_DIR, if not already there."""
+    from huggingface_hub import HfApi, hf_hub_download
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    print("=== Downloading dataset files ===")
+    for fname in HfApi().list_repo_files(repo_id=REPO_ID, repo_type="dataset"):
+        if not (fname.startswith("climbmix/") or fname.startswith("tokenizer/") or fname == "config.json"):
+            continue
+        # Skip over excess training shards.
+        if fname.startswith("climbmix/train_") and int(fname[len("climbmix/train_"):].split(".")[0]) > NUM_TRAIN_SHARDS:
+            continue
+        # Download everything else.
+        if not os.path.exists(os.path.join(DATASET_DIR, fname)):
+            hf_hub_download(repo_id=REPO_ID, filename=fname, repo_type="dataset", local_dir=DATASET_DIR)
+    print("  Done.")
+
+
+def _load_shard(path, pin=False):
+    """The uint16 token tensor of one .bin shard (256-int32 header)."""
+    header = torch.from_file(str(path), False, 256, dtype=torch.int32)  # header is 256 int32
+    assert header[0] == 20240520, f"magic number mismatch in {path}"
+    assert header[1] == 1, f"unsupported version in {path}"
+    num_tokens = int(header[2])  # number of tokens (claimed)
+    tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=pin)
+    with open(path, "rb", buffering=0) as f:
         f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+        nbytes = f.readinto(tokens.numpy())  # avoid bytes->array copy by @YouJiacheng
+    assert nbytes == 2 * num_tokens, f"number of tokens read does not match header in {path}"
     return tokens
 
+
+def _doc_stream(bos_id):
+    """The train shards as one stream of documents in corpus order, each a uint16
+    array beginning with BOS. Documents split across two shards are stitched."""
+    carry = None
+    for k in range(1, NUM_TRAIN_SHARDS + 1):
+        toks = _load_shard(os.path.join(DATASET_DIR, f"climbmix/train_{k:06d}.bin")).numpy()
+        bos = np.flatnonzero(toks == bos_id)
+        if bos.size == 0:
+            carry = toks if carry is None else np.concatenate([carry, toks])
+            continue
+        if carry is not None:
+            yield np.concatenate([carry, toks[:bos[0]]])
+        elif bos[0] != 0:
+            raise ValueError(f"shard {k} starts mid-document with no preceding shard")
+        for i in range(bos.size - 1):
+            yield toks[bos[i]:bos[i + 1]]
+        carry = toks[bos[-1]:]
+    if carry is not None:
+        yield carry
+
+
 class Shard:
-    def __init__(self, tokens: Tensor, bos_id: int):
+    def __init__(self, tokens, bos_id: int):
         self.tokens = tokens
         self.size = tokens.numel()
         self.bos_id = bos_id
@@ -120,13 +173,12 @@ class Shard:
         return starts, ends
 
     @staticmethod
-    def load_async(file: Path, bos_id: int):
+    def load_async(file, bos_id: int):
         """Returns getter function for async shard loading"""
         result = {}
         ready = threading.Event()
         def load():
-            tokens = _load_data_shard(file)
-            result['shard'] = Shard(tokens, bos_id)
+            result['shard'] = Shard(_load_shard(file, pin=True), bos_id)
             ready.set()
         thread = threading.Thread(target=load)
         thread.start()
@@ -136,35 +188,108 @@ class Shard:
             return result['shard']
         return get
 
-def data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int,
-                   bos_id: int, max_num_docs: int):
+
+# ------------------------------------------------------------------------------
+# Data Loader
+# ------------------------------------------------------------------------------
+
+def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
     """
     Generator (i.e., yields rather than returns) of one micro-batch per call:
-    `num_tokens` tokens, as (inputs, targets, cu_seqlens) device tensors -- the
-    packed varlen layout the forward passes consume.
-    Sequences are BOS-aligned and only returned from their beginning; tokens
-    past max_seq_len are discarded (the next sequence starts at the next BOS).
-    Single-epoch: the generator ends when the shards run out.
-    Serves training (micro_batch_tokens) and validation (eval_buffer_tokens).
+    `tokens_per_micro` tokens for "train" and EVAL_BUFFER_TOKENS for "val", as
+    (inputs, targets, cu_seqlens) device tensors -- the packed varlen layout the
+    forward passes consume.
+    "train" plans and stages all `total_micro_steps` + 1 micro-batches up front,
+    placing each document's first cap(i) tokens (see CAP0) and cutting at most
+    one document per micro-batch to fill it exactly.
+    "val" is single-epoch: sequences are BOS-aligned and only returned from their
+    beginning; tokens past `seq_len` are discarded (the next sequence starts at
+    the next BOS). The generator ends when the shards run out.
     """
-    # Get the list of shard files and wrap in an iterator.
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    # This is to set the fixed size of 'cu_seqlens' for varlen.
+    # Estimating 192 docs per 64K tokens.
+    max_num_docs = 192 * math.ceil(tokens_per_micro / EVAL_BUFFER_TOKENS)
+
+    with open(os.path.join(DATASET_DIR, "config.json")) as f:
+        bos_id = json.load(f)["bos_id"]
+
+    # --------------------------- Training ---------------------------
+    if split == "train":
+        num_tokens = tokens_per_micro
+        num_micro = total_micro_steps + 1
+        ramp = max(1, round(CAP_RAMP_FRAC * total_micro_steps))
+        print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: document prefix cap "
+              f"{CAP0} -> {seq_len} over the first {ramp}, then {seq_len} ===")
+
+        inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
+        targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)
+        inp_np, tgt_np = inputs.numpy(), targets.numpy()  # views: write straight into pinned memory
+        starts = [[] for _ in range(num_micro)]
+
+        docs = _doc_stream(bos_id)
+        num_docs, raw_tokens = 0, 0
+        t0 = time.perf_counter()
+        for i in range(num_micro):
+            cap = seq_len if i >= ramp else int(round(CAP0 * (seq_len / CAP0) ** (i / ramp)))
+            pos = 0
+            while pos < num_tokens:
+                doc = next(docs, None)
+                assert doc is not None, \
+                    f"document stream exhausted: {NUM_TRAIN_SHARDS} train shards do not cover this horizon"
+                L = doc.size
+                num_docs += 1
+                raw_tokens += L
+                n = min(L, cap, num_tokens - pos)   # capped, or cut to fill
+                inp_np[i, pos:pos + n] = doc[:n]
+                if n < L:                           # cut short
+                    tgt_np[i, pos:pos + n] = doc[1:n + 1]
+                else:                               # ran to its end
+                    tgt_np[i, pos:pos + n - 1] = doc[1:n]
+                    tgt_np[i, pos + n - 1] = bos_id
+                starts[i].append(pos)
+                pos += n
+
+        # cu_seqlens, checked against the BOS positions in the inputs.
+        docs_per_micro = np.array([len(s) for s in starts])
+        cu_width = max(max_num_docs, 64 * math.ceil((int(docs_per_micro.max()) + 1) / 64))
+        cu = torch.full((num_micro, cu_width), num_tokens, dtype=torch.int32, pin_memory=True)
+        for i in range(num_micro):
+            b = np.flatnonzero(inp_np[i] == bos_id)
+            assert np.array_equal(b, np.array(starts[i])), f"micro-batch {i}: BOS positions != planned starts"
+            cu[i, :b.size] = torch.from_numpy(b.astype(np.int32))
+
+        train_tokens = num_micro * num_tokens
+        print(f"  planned in {time.perf_counter() - t0:.1f}s "
+              f"({(inputs.numel() * 4 + targets.numel() * 8) / 2**30:.1f} GiB pinned): "
+              f"{num_docs:,} docs, {raw_tokens:,} raw tokens -> {train_tokens:,} trained "
+              f"({100 * (1 - train_tokens / raw_tokens):.1f}% discarded by the cap and the fill)")
+        print(f"  docs per micro-batch: first {docs_per_micro[0]}, mean {docs_per_micro.mean():.0f}, "
+              f"max {docs_per_micro.max()} (cu_seqlens width {cu_width})")
+
+        for i in range(num_micro):
+            yield (inputs[i].to("cuda", non_blocking=True),
+                   targets[i].to("cuda", non_blocking=True),
+                   cu[i].to("cuda", non_blocking=True))
+        return
+
+    # -------------------------- Validation --------------------------
+    num_tokens = EVAL_BUFFER_TOKENS
+
+    # Get the list of shard files.
+    files = sorted(glob.glob(os.path.join(DATASET_DIR, "climbmix/val_*.bin")))
     if not files:
-        raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
-    file_iter = iter(files)
+        raise FileNotFoundError(f"No val shards found under {DATASET_DIR}")
 
     # Load the first shard.
-    tokens = _load_data_shard(next(file_iter))
-
-    shard = Shard(tokens, bos_id)
-    remaining_files = list(file_iter)
+    shard = Shard(_load_shard(files[0], pin=True), bos_id)
+    remaining_files = files[1:]
     next_shard_idx = 0
     next_shard_getter = Shard.load_async(remaining_files[0], bos_id) if remaining_files else None
 
     while True:
-        # Get the start and end indices (within `tokens`) of the sequences to use for
+        # Get the start and end indices (within the shard) of the sequences to use for
         # the current micro-batch.
-        result = shard.next_batch(num_tokens, max_seq_len)
+        result = shard.next_batch(num_tokens, seq_len)
 
         # If this shard is exhausted,
         if result is None:
@@ -174,22 +299,21 @@ def data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int,
 
             # Load the next shard.
             shard = next_shard_getter()
-            tokens = shard.tokens
             next_shard_idx += 1
             next_shard_getter = Shard.load_async(remaining_files[next_shard_idx], bos_id) if next_shard_idx < len(remaining_files) else None
 
             # Re-start the loop.
             continue
 
-        # Locations of the documents in `tokens`. Only specifies the
+        # Locations of the documents in the shard. Only specifies the
         # number of documents needed, not max.
         start_idxs = torch.tensor(result[0])
         end_idxs = torch.tensor(result[1])
 
-        # `tokens` contains the entire shard. The sequences defined by the starts and ends
-        # may or may not be contiguous within `tokens`, due to some sequences being
+        # `shard.tokens` holds the entire shard. The sequences defined by the starts and
+        # ends may or may not be contiguous within it, due to some sequences being
         # truncated, so we slice them and then re-concatenate into a single tensor.
-        buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+        buf = torch.cat([shard.tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
 
         # `buf` contains `num_tokens + 1` tokens to allow for the inputs vs.
         # targets offset.
@@ -211,10 +335,8 @@ def data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int,
         assert len(cum_lengths) < max_num_docs, \
             f"micro-batch packed {len(cum_lengths)} docs; cu_seqlens holds only {max_num_docs}"
 
-        # The actual cu_seqlens array always needs to contain `max_num_docs` elements so we
-        # the compiler can build a single graph.
-        # We allocate that buffer here and fill it with "empty documents", i.e., setting their start index
-        # to one past the end of the `_inputs` buffer.
+        # We allocate that buffer here and fill it with "empty documents", i.e., setting
+        # their start index to one past the end of the `_inputs` buffer.
         _cum_lengths = torch.full((max_num_docs,), num_tokens)
 
         # Then copy in the lengths, inserting the first document (index 0).
