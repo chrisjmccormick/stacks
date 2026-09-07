@@ -219,7 +219,7 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
         num_micro = total_micro_steps + 1
         ramp = max(1, round(CAP_RAMP_FRAC * total_micro_steps))
         print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: document prefix cap "
-              f"{CAP0} -> {seq_len} over the first {ramp}, then {seq_len} ===")
+              f"{CAP0} -> {seq_len} over the first {ramp} micro-batches, then {seq_len} ===")
 
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
         targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)

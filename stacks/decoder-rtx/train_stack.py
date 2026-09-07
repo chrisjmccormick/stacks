@@ -88,7 +88,7 @@ class StackConfig:
     # ---- Architecture ----
 
     # Model
-    n_layers:   int = 12
+    n_layers:   int = 11
     d_model:    int = 768
 
     backout_layer: int = 6 # nanochat: n_layers // 2
@@ -106,13 +106,13 @@ class StackConfig:
     # Context and Sliding Window Attention
     seq_len:          int = 2048
     short_win_size:   int = 768
-    full_ctxt_layers: list[int] = [   3,    7,    11] # "SSSL" tiled, last layer always full
+    full_ctxt_layers: list[int] = [   3,    6,    10]
     window_sizes:     list[tuple[int, int]]  # Derived below.
 
     # Attention - Value Embeddings
     d_ve_gate: int = 12  # Gate input is first 12-dims of the layer's residual stream.
                          # Each head has its own gate, all with same input.
-    ve_layers: list[int] = [1, 3, 5, 7, 9, 11]
+    ve_layers: list[int] = [1, 2, 8, 9, 10]
     ve_index:  list[int] # Derived from ve_layers.
     num_ves:   int
 
@@ -131,7 +131,7 @@ class StackConfig:
     grad_accum_steps:   int
 
     # Training
-    num_steps: int = 988
+    num_steps: int = 1035
 
     # Evaluation and logging
     val_loss_every:  int = 125
@@ -313,7 +313,7 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
+def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
     """One micro-batch through the model. Use backward=False for validation."""
 
     # Residual stream naming:
@@ -484,6 +484,9 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     # -----------------------------
     #           Backward
     # -----------------------------
+    # Only compute some grads on the last micro batch.
+    is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
+
 
     # Scalar grads are collected, grad tensors updated at the end.
     g_resid = []; g_x0 = []
@@ -496,7 +499,8 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     xf_grad = bf16(xf_inv_rms * (xf_norm_grad.float() - (xf_norm.float() * res_ms)))
 
     # Dot product between final vs. backout streams.
-    m.backout_lambda.grad.add_(-sum32(xf_grad * x_backout))  # (T, d_model)
+    if is_last_micro:
+        m.backout_lambda.grad.add_(-sum32(xf_grad * x_backout))  # (T, d_model)
 
     # stream_grad updates every layer, keep xf_grad for backout layer.
     stream_grad = xf_grad           # grad wrt layer num_layers-1's output
@@ -590,16 +594,18 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
             xb_norm_grad[:, :cfg.d_ve_gate] += d_xn_ve
         xb_grad = xm_grad + bf16(st.xb_inv_rms * (xb_norm_grad.float() - (xb_norm.float() * (xb_norm.float() * xb_norm_grad.float()).mean(dim=-1, keepdim=True))))
         # --- blend backward: xb = resid_lambdas[i]*x_in + x0_lambdas[i]*x0 ---
-        g_resid.append(sum32(xb_grad * st.x_in))
-        g_x0.append(sum32(xb_grad * x0))
+        if is_last_micro:
+            g_resid.append(sum32(xb_grad * st.x_in))
+            g_x0.append(sum32(xb_grad * x0))
         x0_grad = x0_grad + m.x0_lambdas.w[i] * xb_grad  # TRAP: x0 feeds every layer, accumulate
         stream_grad = m.resid_lambdas.w[i] * xb_grad
         stash[i] = None                          # free this layer's stash as we go
 
     # Land the per-layer resid/x0 scalar sums (collected in REVERSED layer
     # order) as one stacked add each.
-    m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
-    m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
+    if is_last_micro:
+        m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
+        m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
 
     # stream_grad is now the grad through layer 0's input, which IS x0 (same tensor)
     smeared_grad = x0_grad + stream_grad         # grad wrt the smeared embedding
@@ -1164,16 +1170,18 @@ class StepStats:
     # Validation, on val steps only
     bpb:          float | None = None
     eval_seconds: float | None = None
+    slack:        int   | None = None
 
     # Run clocks, in minutes; stamped by log_step
     train_total:  float | None = None
     wall_total:   float | None = None
+    eta:          float | None = None
 
 
 # Field -> wandb panel. A field not named here lands under `train/`.
 WANDB_GROUPS = {
-    "val":  ("bpb", "eval_seconds"),
-    "time": ("train_total", "wall_total"),
+    "val":  ("bpb", "eval_seconds", "slack"),
+    "time": ("train_total", "wall_total", "eta"),
 }
 _WANDB_PREFIX = {f: g for g, fs in WANDB_GROUPS.items() for f in fs}
 assert set(_WANDB_PREFIX) <= {f.name for f in fields(StepStats)}, \
@@ -1342,9 +1350,9 @@ for step in range(cfg.num_steps + 1):
         val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
-        for _ in range(cfg.val_steps):
+        for micro_i in range(cfg.val_steps):
             v_inputs, v_targets, v_cu_seqlens = next(val_loader)
-            loss_flat = forward_backward(v_inputs, v_targets, v_cu_seqlens, backward=False)
+            loss_flat = forward_backward(v_inputs, v_targets, v_cu_seqlens, micro_step=micro_i, backward=False)
             num_bytes_flat = token_bytes[v_targets]
             total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
             total_bytes += num_bytes_flat.sum()
@@ -1355,6 +1363,7 @@ for step in range(cfg.num_steps + 1):
         total_val_time += val_elapsed
         print0(f"step:{step}/{cfg.num_steps} val_bpb:{val_bpb:.6f} val_time:{val_elapsed:.2f}s", console=True)
         stats.bpb, stats.eval_seconds = val_bpb, val_elapsed
+        stats.slack = round((VAL_BPB_TARGET - val_bpb) * 1e6)
 
     # --------------- Checkpoint -----------------
     if cfg.save_checkpoint and (last_step or step in cfg.save_steps):
@@ -1372,10 +1381,11 @@ for step in range(cfg.num_steps + 1):
     step_t0 = time.perf_counter()
 
     # Gradient Accumulation Loop
-    for micro in range(cfg.grad_accum_steps):
+    for micro_i in range(cfg.grad_accum_steps):
 
         # Forward and Backward pass
         loss = forward_backward(inputs, targets, cu_seqlens,
+                                micro_step=micro_i,
                                 loss_scale=1.0 / (cfg.grad_accum_steps * inputs.size(0)))
 
         # Next training batch
@@ -1426,6 +1436,7 @@ for step in range(cfg.num_steps + 1):
     stats.lr_mult_t = float(lr_mult_t[step])
     if step > 10:   # the compile and warm-up rates are not the run's rates
         stats.dt, stats.tok_per_sec, stats.mfu = dt, tok_per_sec, mfu
+        stats.eta = remaining_time
     log_step(stats)
 
     if profiler is not None:
