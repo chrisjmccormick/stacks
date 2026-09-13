@@ -95,6 +95,7 @@ class StackConfig:
 
     # Input
     d_vocab:    int = 32768
+    d_bigram:   int = 5 * 32768 # 163,840 hashed [prev, curr] token pairs.
     d_smr_gate: int = 24    # Gate input is first 24-dims of input embed.
 
     # Attention
@@ -124,7 +125,7 @@ class StackConfig:
     d_mlp:      int = 4 * 768 # 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 286_262_522     # every trained weight (§ Weight Init & Schedule)
+    num_params:          int = 412_091_653     # every trained weight (§ Weight Init & Schedule)
     num_flops_per_token: int = 780_934_320     # 6 * 110,101,704 matmul params + attention
 
     # ---- Training ----
@@ -144,7 +145,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "sep14_B_attn_gates"  # both wandb and log files
+    run_name:        str = "sep14_C_bigram"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -237,9 +238,10 @@ class Model:
     """Container for the model's weights, plus RoPE buffers"""
 
     # Input
-    input_embeds: Param = None
-    smear_gate:   Param
-    smear_lambda: Param
+    input_embeds:  Param = None
+    bigram_embeds: Param
+    smear_gate:    Param
+    smear_lambda:  Param
 
     # Attention
     W_Q: Param
@@ -256,6 +258,7 @@ class Model:
 
     # Cross-Layer
     x0_lambdas:     Param   # Per-layer coefficient for reading the input embedding.
+    bigram_lambdas: Param   # Per-layer coefficient for reading the bigram embedding.
     resid_lambdas:  Param   # Per-layer gain on the residual stream.
     backout_lambda: Param
 
@@ -381,6 +384,15 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # The smeared input embedding; also added back to the stream at every layer.
     x0 = torch.cat([x_embed_hat[:1], x_embed_hat[1:] + gate * x_embed_hat[:-1]], dim=0)  # appears as x0b in bwd
 
+    # Hash each [prev, curr] token pair into a bigram slot. Position 0 takes the
+    # reserved slot; a doc's first token hashes against the previous doc's last.
+    bigram_ids = idx.to(torch.int32).clone()
+    bigram_ids[0] = cfg.d_bigram - 1
+    bigram_ids[1:] = torch.bitwise_xor(36313 * bigram_ids[1:],
+                                       27191 * bigram_ids[:-1]) % (cfg.d_bigram - 1)
+    # Re-read by every layer alongside x0; appears as xb_bigram in bwd.
+    x_bigram = F.embedding(bigram_ids, m.bigram_embeds.w)
+
     # The residual stream starts as the smeared embedding.
     x = x0
 
@@ -391,8 +403,9 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     for i in range(cfg.n_layers):
         x_in = x
 
-        # Scale residual stream, add input embedding
-        x_biased = m.resid_lambdas.w[i] * x_in + m.x0_lambdas.w[i] * x0
+        # Scale residual stream, add input and bigram embeddings
+        x_biased = (m.resid_lambdas.w[i] * x_in + m.x0_lambdas.w[i] * x0
+                    + m.bigram_lambdas.w[i] * x_bigram)
         x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
 
@@ -518,7 +531,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
 
     # Scalar grads are collected, grad tensors updated at the end.
-    g_resid = []; g_x0 = []
+    g_resid = []; g_x0 = []; g_bigram = []
 
     # Each stream's cosine similarity to the vocab signal, divided by d_model.
     # (T, 1) = ((T, d_model) * (T, d_model)).mean()
@@ -532,8 +545,9 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         m.backout_lambda.grad.add_(-sum32(xb_final * x_backout))  # (T, d_model)
 
     # xb updates every layer, keep xb_final for backout layer.
-    xb = xb_final               # grad wrt layer num_layers-1's output
-    x0b = torch.zeros_like(x0)  # accumulates over layers
+    xb = xb_final                       # grad wrt layer num_layers-1's output
+    x0b = torch.zeros_like(x0)          # accumulates over layers
+    xb_bigram = torch.zeros_like(x0)    # accumulates over layers
 
     # For each layer in reverse order,
     for i in reversed(range(cfg.n_layers)):
@@ -637,19 +651,22 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         if xb_biased_hat_ve is not None:
             xb_biased_hat[:, :cfg.d_ve_gate] += xb_biased_hat_ve
         xb_biased = xb_attn_out + bf16(st.x_biased_inv_rms * (xb_biased_hat.float() - (x_biased_hat.float() * (x_biased_hat.float() * xb_biased_hat.float()).mean(dim=-1, keepdim=True))))
-        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0 ---
+        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0 + bigram_lambdas[i]*x_bigram ---
         if is_last_micro:
             g_resid.append(sum32(xb_biased * st.x_in))
             g_x0.append(sum32(xb_biased * x0))
+            g_bigram.append(sum32(xb_biased * x_bigram))
         x0b = x0b + m.x0_lambdas.w[i] * xb_biased  # TRAP: x0 feeds every layer, accumulate
+        xb_bigram = xb_bigram + m.bigram_lambdas.w[i] * xb_biased  # TRAP: same, x_bigram feeds every layer
         xb = m.resid_lambdas.w[i] * xb_biased
         stash[i] = None                          # free this layer's stash as we go
 
-    # Land the per-layer resid/x0 scalar sums (collected in REVERSED layer
-    # order) as one stacked add each.
+    # Land the per-layer resid/x0/bigram scalar sums (collected in REVERSED
+    # layer order) as one stacked add each.
     if is_last_micro:
         m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
         m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
+        m.bigram_lambdas.grad.add_(torch.stack(g_bigram[::-1]))
 
     # xb is now the grad through layer 0's input, which IS x0 (same tensor), so
     # it folds into x0b to give the full grad wrt the smeared embedding.
@@ -670,6 +687,8 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     xb_embed = bf16(x_embed_inv_rms * (xb_embed_hat.float() - (x_embed_hat.float() * (x_embed_hat.float() * xb_embed_hat.float()).mean(dim=-1, keepdim=True))))
     m.input_embeds.grad.add_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
+    m.bigram_embeds.grad.add_(
+        torch.ops.aten.embedding_dense_backward(xb_bigram, bigram_ids, cfg.d_bigram, -1, False))
 
     return loss
 
@@ -892,6 +911,7 @@ dev = lambda a: torch.tensor(a, dtype=torch.float32, device=device)
 
 resid_lambdas  = torch.linspace(1.15, 1.05, cfg.n_layers, dtype=torch.float32, device=device)
 x0_lambdas     = torch.linspace(0.20, 0.05, cfg.n_layers, dtype=torch.float32, device=device)
+bigram_lambdas = fp32_empty(cfg.n_layers).fill_(0.1)
 smear_lambda   = fp32_zeros(1)
 backout_lambda = fp32_empty(1).fill_(0.2)
 
@@ -905,6 +925,7 @@ scalar_configs = [
 #   name,               weights,       peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,   0.005,    0.2,        0.05,   0.05),
     ("x0_lambdas",      x0_lambdas,      0.5,      0.04,       0.05,   0.0),
+    ("bigram_lambdas",  bigram_lambdas,  0.5,      0.04,       0.05,   0.0),
     ("smear_gate",      smear_gate,      0.2,      0.2,        0.05,   0.0),
     ("smear_lambda",    smear_lambda,    0.2,      0.2,        0.05,   0.0),
     ("backout_lambda",  backout_lambda,  0.2,      0.2,        0.05,   0.0)
@@ -964,12 +985,15 @@ value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_
 value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
                    .uniform_(-matrix_init_s, matrix_init_s))
 
+bigram_embeds = bf16_zeros(cfg.d_bigram, cfg.d_model)
+
 ve_rows = cfg.num_ves * cfg.d_vocab
 
 embed_configs = [
 #   name,             weights,       peak lr,  b1_grad,  b2_grad,  wd,       slots
     ("input_embeds",  input_embeds,  0.3,      0.2,      0.005,    0.001,   1),
-    ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves)
+    ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves),
+    ("bigram_embeds", bigram_embeds, 0.3,      0.2,      0.005,    0.001,   1)
 ]
 
 # For each of the embedding tables...
@@ -1171,7 +1195,7 @@ for (name, w, peak_lr, rdim) in muon_configs:
     setattr(m, name, p)
 
 # The Params own everything now: free the fp32 draws and the prior tables, drop the adopted names.
-del lm_head, input_embeds, value_embeds, resid_lambdas, x0_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, attn_gate, ve_gate, W_in, W_out
+del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, attn_gate, ve_gate, W_in, W_out
 del embed_prior, head_prior
 
 
