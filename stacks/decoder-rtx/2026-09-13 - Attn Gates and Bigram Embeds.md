@@ -12,11 +12,27 @@ Branch: `sep-14-baseline`. All runs are 1035 steps, 512K tokens/step, one RTX PR
 | run | change | val_bpb | slack | s/step | peak mem |
 |-----|--------|---------|-------|--------|----------|
 | A | control (`sep-7-baseline`, renamed vars only) | 0.900104 | −104 | 1.502 | 85.6 GB |
-| B | + attention output gates | 0.900147 | −147 | 1.527 | ~86.9 GB |
+| B | + attention output gates | 0.900147 | −147 | 1.550 | 86.0 GB |
 | C | + gates + bigram embeds (lr 0.3) | 0.900492 | −492 | 1.565 | 88.2 GB |
-| D | C with bigram lr 0.9 | *pending* | | 1.566 | 89.1 GB |
+| D | C with bigram lr 0.9 | 0.900460 | −460 | 1.566 | 88.2 GB |
 
 Slack = (0.900000 − val_bpb) × 1e6. Stated noise floor is ±35; one step is worth ~70.
+
+Full val_bpb trajectories (the box was torn down after run D, so these are kept here;
+the runs are also in wandb under project `decoderstack_rtx`):
+
+| step | A control | B gates | C bigram lr .3 | D bigram lr .9 |
+|------|-----------|---------|----------------|----------------|
+| 0    | 1.841550 | 1.841550 | 1.841546 | 1.841546 |
+| 125  | 1.168177 | 1.165672 | 1.160861 | 1.170663 |
+| 250  | 1.065258 | 1.064685 | 1.064310 | 1.071816 |
+| 375  | 1.028779 | 1.028428 | 1.030188 | 1.029369 |
+| 500  | 0.986016 | 0.986253 | 0.986629 | 0.986430 |
+| 625  | 0.956121 | 0.956116 | 0.956268 | 0.956244 |
+| 750  | 0.933081 | 0.933099 | 0.933449 | 0.933210 |
+| 875  | 0.915088 | 0.915057 | 0.915435 | 0.915419 |
+| 1000 | 0.902273 | 0.902324 | 0.902678 | 0.902622 |
+| 1035 | 0.900104 | 0.900147 | 0.900492 | 0.900460 |
 
 Note the control itself lands at −104, i.e. it does not quite reach 0.900 in 1035 steps.
 The README's +410 figure describes the older 1000-step `2026-09-04_BigramInit` config, so
@@ -73,6 +89,12 @@ Ordered by guessed impact, all untested except the first:
    these compare directly in weight-delta units: C was running ~2–3.5× cold. Run D tests
    0.9. *The 75× multiplier is not the gap — the PR's Adam base is simply 37× colder than
    decoder-rtx's embedding lr.*
+
+   **Run D result:** 3× the lr moved the final number by +32 points (−492 → −460), inside
+   the ±35 noise floor. Its early trajectory was actually *worse* than C's (step 125:
+   1.170663 vs 1.160861) before converging back by step 375. So this particular lr change
+   did not recover the gap. That is one alternative value, not a sweep — a larger change,
+   or the lr not being the operative difference at all, both remain open.
 2. **β2.** PR uses 0.95 on every embedding; decoder-rtx uses 0.995. Unchanged in C and D.
 3. **Weight decay.** PR gives the bigram table 5× base; C/D use the input-embed value,
    which is 10× less than decoder-rtx's own `value_embeds`.
@@ -104,9 +126,14 @@ Any of these could be why the port hasn't landed yet, and several could be actin
 
 - Sweep the attention-gate lr — cheapest untested knob, and B's near-perfect overlap with
   the control is consistent with the gate simply not moving.
-- If run D's hotter lr doesn't help, the redundancy question (bigram init vs bigram hash
-  table) is the one worth isolating, since it is the structural difference rather than a
-  tuning one.
+- For bigram, the lr looks less promising than it did before run D, so the redundancy
+  question (bigram distribution init vs. a learned bigram hash table) is probably the more
+  informative thing to isolate next — it is the structural difference rather than a tuning
+  one. Concretely: run the hash table with `embed_prior`/`head_prior` disabled and see
+  whether it earns its keep when the model no longer starts with bigram statistics baked
+  into the embedding and lm_head.
+- Also still untested for bigram: β2 (0.995 here vs the PR's 0.95), weight decay (10× less
+  than decoder-rtx's own `value_embeds`), and a much larger lr than 0.9.
 - Adding 126M zero-init parameters to a 543M-token run is a real cost regardless; the PR
   itself notes the model ends up with more parameters than training tokens, which it could
   afford and this budget may not.
