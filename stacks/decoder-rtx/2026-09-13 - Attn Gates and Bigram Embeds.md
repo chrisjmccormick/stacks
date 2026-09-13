@@ -105,6 +105,13 @@ Ordered by guessed impact, all untested except the first:
 5. **`cooldown_frac`.** The PR raised it 0.50 → 0.55 *together with* the step cut, noting
    "I find it works to increase this as step count decreases." Not yet relevant — there is
    no step cut to make. decoder-rtx is already at 0.65, though the schedule shapes differ.
+6. **Batch-size schedule.** modded ramps the batch in thirds of its scheduled steps —
+   131,072 → 262,144 → 393,216 tokens/step — with the lr stepping alongside it
+   (`(16/8)**0.6`, `(24/8)**0.5`). decoder-rtx runs flat at 524,288. So their first 520
+   steps are at a quarter of our batch size, and they take 1600 optimizer steps to our
+   1035. A zero-init sparse table gets many more updates per token early on there, which
+   is plausibly when it most needs to move. This is independent of the lr *value* and was
+   not varied in any run here.
 
 ### Confounds that make the PR a loose reference
 
@@ -112,7 +119,18 @@ decoder-rtx and modded-nanogpt differ in ways that have nothing to do with this 
 
 - **Vocab** — 32,768 vs 50,304
 - **Dataset** — Climbmix vs FineWeb
-- **Loss target** — 0.900 val bpb vs 3.28 CE, and a much shorter token budget here
+- **Loss target** — 0.900 val bpb vs 3.28 CE
+- **Token budget** — decoder-rtx trains on **~543M** tokens (1035 × 2 × 262,144; the
+  planner reports 542,900,224 actually trained). modded post-PR trains on **~425M**
+  (520 × 131,072 + 520 × 262,144 + 560 × 393,216). So **we train on ~1.28× more tokens
+  than they do**, over fewer optimizer steps (1035 vs 1600).
+
+  This kills an earlier guess that ours is the tighter budget for 126M cold parameters —
+  the ratio favours us. Their post-bigram model is roughly 548M params against 425M
+  tokens (**0.77 tokens/param**, matching the PR's own "more parameters than training
+  tokens" remark); runs C/D are 412M params against 543M tokens (**1.32**). They took the
+  win at the worse ratio, so "too many cold params for the budget" is not a live
+  explanation and should not be carried forward.
 - **Bigram distribution init** — decoder-rtx folds corpus bigram statistics into the input
   embedding and lm_head (`embed_prior`/`log_bigram`, credited with removing the 40-step
   warmup). modded-nanogpt has no counterpart. A learned bigram hash table may overlap with
@@ -132,8 +150,21 @@ Any of these could be why the port hasn't landed yet, and several could be actin
   one. Concretely: run the hash table with `embed_prior`/`head_prior` disabled and see
   whether it earns its keep when the model no longer starts with bigram statistics baked
   into the embedding and lm_head.
+- **Find an init strategy for the bigram table.** The table presumably captures more than
+  the raw bigram distribution — decoder-rtx already has that baked in via `embed_prior`,
+  so whatever the table earns in modded is likely something else. The approach that worked
+  for the bigram *init* applies here: analyse a trained model to see what the table
+  actually learned, then initialise it to that instead of to zeros. Concretely — train a
+  run with the table in, then look at which slots move at all vs. stay near zero, how row
+  norms track pair frequency, whether learned rows align with the existing `embed_prior`
+  direction for the same pair (that would measure the redundancy directly rather than
+  inferring it), and whether rows cluster by anything interpretable — position in a word,
+  multi-token names, common collocations. A good init would also sidestep the
+  "zero-init table needs many updates to climb out" problem that the lr and batch-schedule
+  differences both bear on.
 - Also still untested for bigram: β2 (0.995 here vs the PR's 0.95), weight decay (10× less
-  than decoder-rtx's own `value_embeds`), and a much larger lr than 0.9.
+  than decoder-rtx's own `value_embeds`), the batch-size ramp, and a much larger lr
+  than 0.9.
 - Adding 126M zero-init parameters to a 543M-token run is a real cost regardless; the PR
   itself notes the model ends up with more parameters than training tokens, which it could
   afford and this budget may not.
