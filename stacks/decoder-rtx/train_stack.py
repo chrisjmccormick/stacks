@@ -145,7 +145,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "sep14_C_bigram"  # both wandb and log files
+    run_name:        str = "sep14_D_bigram_lr09"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -993,7 +993,7 @@ embed_configs = [
 #   name,             weights,       peak lr,  b1_grad,  b2_grad,  wd,       slots
     ("input_embeds",  input_embeds,  0.3,      0.2,      0.005,    0.001,   1),
     ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves),
-    ("bigram_embeds", bigram_embeds, 0.3,      0.2,      0.005,    0.001,   1)
+    ("bigram_embeds", bigram_embeds, 0.9,      0.2,      0.005,    0.001,   1)
 ]
 
 # For each of the embedding tables...
