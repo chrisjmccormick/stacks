@@ -909,7 +909,7 @@ scalar_configs = [
 #   name,               weights,       peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,   0.005,    0.2,        0.05,   0.05),
     ("x0_lambdas",      x0_lambdas,      0.5,      0.04,       0.05,   0.0),
-    ("bigram_lambdas",  bigram_lambdas,  0.5,      0.04,       0.05,   0.0),
+    ("bigram_lambdas",  bigram_lambdas,  0.1,      0.04,       0.05,   0.0),
     ("smear_gate",      smear_gate,      0.2,      0.2,        0.05,   0.0),
     ("smear_lambda",    smear_lambda,    0.2,      0.2,        0.05,   0.0),
     ("backout_lambda",  backout_lambda,  0.2,      0.2,        0.05,   0.0)
@@ -977,7 +977,7 @@ embed_configs = [
 #   name,             weights,       peak lr,  b1_grad,  b2_grad,  wd,       slots
     ("input_embeds",  input_embeds,  0.3,      0.2,      0.005,    0.001,   1),
     ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves),
-    ("bigram_embeds", bigram_embeds, 0.9,      0.2,      0.005,    0.001,   1)
+    ("bigram_embeds", bigram_embeds, 0.1,      0.2,      0.005,    0.001,   1)
 ]
 
 # For each of the embedding tables...
