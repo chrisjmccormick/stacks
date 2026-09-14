@@ -17,7 +17,8 @@ import torch
 
 from kernels import get_kernel
 
-_k = get_kernel("kernels-community/flash-attn2")
+# kernels >= 0.14 loads from the hub's kernel-type repos and takes the kernel's major version.
+_k = get_kernel("kernels-community/flash-attn2", version=1)
 # The raw ops live in flash_attn_interface; the top level only re-exports
 # the varlen/kvcache wrappers.
 fa2 = getattr(_k, "flash_attn_interface", _k)
