@@ -219,7 +219,7 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
         num_micro = total_micro_steps + 1
         ramp = max(1, round(CAP_RAMP_FRAC * total_micro_steps))
         print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: document prefix cap "
-              f"{CAP0} -> {seq_len} over the first {ramp} micro-batches, then {seq_len} ===")
+              f"{CAP0} -> {seq_len} in 64-token steps over the first {ramp} micro-batches, then {seq_len} ===")
 
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
         targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)
@@ -230,7 +230,9 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
         num_docs, raw_tokens = 0, 0
         t0 = time.perf_counter()
         for i in range(num_micro):
-            cap = seq_len if i >= ramp else int(round(CAP0 * (seq_len / CAP0) ** (i / ramp)))
+            # Rounded to a multiple of 64: FA2 varlen's cost steps up each time a
+            # document crosses a 64-token boundary.
+            cap = seq_len if i >= ramp else 64 * round(CAP0 * (seq_len / CAP0) ** (i / ramp) / 64)
             pos = 0
             while pos < num_tokens:
                 doc = next(docs, None)
