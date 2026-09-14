@@ -1,4 +1,9 @@
-# train_stack.py
+# train_stack.py -- the bigram-embeds branch
+#
+# The sep-14 baseline plus attention output gates and hashed bigram embeddings,
+# instrumented for studying them: every step it logs the value, grad and bias-corrected
+# m/sqrt_v of a few weights in each AdamW parameter (§ Parameter Traces) to the
+# decoder_rtx_bi_embed wandb project, and it checkpoints at steps 250, 500, 750 and the end.
 #
 # nanochat-based pre-training pipeline, with model code implemented as a single
 # forward_backward function, no nn.Module or autograd.
@@ -144,12 +149,12 @@ class StackConfig:
     val_steps:       int              # Derived: val micro-batches per pass.
 
     # Logging
-    wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "sep14_D_bigram_lr09"  # both wandb and log files
+    wandb_project:   str = "decoder_rtx_bi_embed"
+    run_name:        str = "bigram_embeds"  # both wandb and log files
     use_wandb:       bool = True
 
-    save_checkpoint: bool = False
-    save_steps:      tuple = ()
+    save_checkpoint: bool = True
+    save_steps:      tuple = (250, 500, 750)  # and the last step
 
     seed:            int  = 42      # For model initialization
 
@@ -1216,6 +1221,79 @@ del channel_range, inv_freq, t_pos, freqs
 
 
 # ==============================================================================
+# § Parameter Traces
+# ==============================================================================
+# Every training step, a few individual weights from each AdamW parameter, three
+# series apiece, one wandb section per parameter:
+#   param     the weight after this step's update (lm_head: its fp32 master)
+#   grad      this step's accumulated gradient, in the flipped sign convention
+#             (the direction the update pushes the weight). resid/x0/bigram/
+#             backout lambdas only collect it on the last micro-batch.
+#   m_sqrt_v  the bias-corrected normalized step, m_hat / (sqrt(v_hat) + 1e-10).
+#             The weight just moved by peak_lr * lr_mult_t * this, plus decay.
+#             Exactly +-1 at step 0 wherever the weight had a gradient.
+# The same rows go to logs/<run_name>_traces.csv. The Muon banks are not traced.
+
+# Three vocabulary rows spanning corpus frequency, in occurrences per 512K-token
+# step: ' the' ~19,400 | ' quantum' ~27 | ' morbidity' ~1.2
+trace_tokens = [(262, "the"), (4736, "quantum"), (32741, "morbidity")]
+
+# Two arbitrary channels: 0 is inside the slice the gates read, 500 is not.
+trace_channels = [0, 500]
+
+# (Param, [(label, row, col), ...]); 1-D weights read as (size, 1).
+# The bigram rows are the three tokens after ' of' (id 285), at the slot
+# forward_backward hashes each pair to. Pairs collide, so a slot trains on every
+# pair that lands there -- per step, and the traced pair's share of its slot:
+# ' of the' ~2,470, 99.9% | ' of quantum' ~4.1, 67% | ' of morbidity' ~0.18, 12%
+trace_picks = [
+    (m.input_embeds,   [(f"{word}-c{c}", tid, c) for tid, word in trace_tokens for c in trace_channels]),
+    (m.lm_head,        [(f"{word}-c{c}", tid, c) for tid, word in trace_tokens for c in trace_channels]),
+    (m.bigram_embeds,  [(f"of_{word}-c{c}", ((36313 * tid) ^ (27191 * 285)) % (cfg.d_bigram - 1), c)
+                        for tid, word in trace_tokens for c in trace_channels]),
+    (m.value_embeds,   [(f"L{i:02d}-{word}-c{c}", cfg.ve_index[i] * cfg.d_vocab + tid, c)
+                        for i in (1, 10) for tid, word in trace_tokens for c in trace_channels]),
+    (m.resid_lambdas,  [(f"L{i:02d}", i, 0) for i in (0, 5, 10)]),
+    (m.x0_lambdas,     [(f"L{i:02d}", i, 0) for i in (0, 5, 10)]),
+    (m.bigram_lambdas, [(f"L{i:02d}", i, 0) for i in (0, 5, 10)]),
+    (m.smear_gate,     [(f"c{c}", 0, c) for c in (0, 12)]),
+    (m.smear_lambda,   [("value", 0, 0)]),
+    (m.backout_lambda, [("value", 0, 0)]),
+]
+
+# Series names, in the order read_traces returns them, and the device-side indices.
+trace_names = []
+trace_reads = []   # (Param, rows, cols, beta1, beta2)
+for p, elements in trace_picks:
+    # m_sqrt_v's bias correction assumes the betas hold constant over the run.
+    assert (p.mntm_b1_t == p.mntm_b1_t[0]).all() and (p.mntm_b2_t == p.mntm_b2_t[0]).all(), p.name
+    trace_names += [f"{p.name}/{label}_{field}" for label, _, _ in elements for field in ("param", "grad", "m_sqrt_v")]
+    trace_reads.append((p,
+                        torch.tensor([row for _, row, _ in elements], device=device),
+                        torch.tensor([col for _, _, col in elements], device=device),
+                        p.mntm_b1_t[0].item(), p.mntm_b2_t[0].item()))
+
+def gather_trace_grads():
+    """Each traced parameter's picked gradient elements, copied out before the
+    optimizer zeroes the grads. A few small gathers queued on the device; no sync."""
+    return [p.grad.view(p.w.size(0), -1)[rows, cols].float() for p, rows, cols, _, _ in trace_reads]
+
+def read_traces(step, trace_grads):
+    """The traced elements after this step's update, keyed by series name."""
+    columns = []
+    for (p, rows, cols, beta1, beta2), grad in zip(trace_reads, trace_grads):
+        pick = lambda buf: buf.view(p.w.size(0), -1)[rows, cols]
+        if p.mantissa is not None:
+            param = rebuild_master(pick(p.w), pick(p.mantissa.view(torch.int16)))
+        else:
+            param = pick(p.w).float()
+        m_hat = pick(p.first_mntm) / (1 - beta1 ** (step + 1))
+        v_hat = pick(p.scnd_mntm)  / (1 - beta2 ** (step + 1))
+        columns.append(torch.stack([param, grad, m_hat / (v_hat.sqrt() + 1e-10)], dim=1).view(-1))
+    return dict(zip(trace_names, torch.cat(columns).tolist()))   # one sync
+
+
+# ==============================================================================
 # § Training Harness
 # ==============================================================================
 
@@ -1336,17 +1414,28 @@ metrics_file = open(metrics_path, "w", newline="")
 metrics_csv = csv.DictWriter(metrics_file, fieldnames=[f.name for f in fields(StepStats)])
 metrics_csv.writeheader()
 
+# The parameter traces, one column per series.
+traces_path = f"logs/{cfg.run_name}_traces.csv"
+traces_file = open(traces_path, "w", newline="")
+traces_csv  = csv.DictWriter(traces_file, fieldnames=["step", *trace_names])
+traces_csv.writeheader()
 
-def log_step(stats):
-    """One step's row to the CSV and to wandb, stamped with the run clocks."""
+
+def log_step(stats, trace_row={}):
+    """One step's row to the CSV and to wandb, stamped with the run clocks.
+    Training steps also carry their parameter traces."""
     stats.train_total = np.sum(timed) / 60
     stats.wall_total = (time.perf_counter() - run_wall_t0) / 60
     row = asdict(stats)
     metrics_csv.writerow(row)
     metrics_file.flush()
+    if trace_row:
+        traces_csv.writerow({"step": stats.step, **trace_row})
+        traces_file.flush()
     wandb_run.log({"step": stats.step,
                    **{f"{_WANDB_PREFIX.get(k, 'train')}/{k}": v
-                      for k, v in row.items() if k != "step" and v is not None}})
+                      for k, v in row.items() if k != "step" and v is not None},
+                   **trace_row})
 
 gc_t0 = 0.0
 def gc_logging_hook(phase, info):
@@ -1463,6 +1552,9 @@ for step in range(cfg.num_steps + 1):
         # Next training batch
         inputs, targets, cu_seqlens = next(train_loader)
 
+    # Parameter traces: the traced gradient elements, before the grads are zeroed.
+    trace_grads = gather_trace_grads()
+
     # Smooth gradients, update weights, zero the grads
 
     # Muon 
@@ -1482,6 +1574,9 @@ for step in range(cfg.num_steps + 1):
     train_loss = loss.item()
     torch.cuda.synchronize()
     dt = time.perf_counter() - step_t0
+
+    # Parameter traces, read after the step clock stops.
+    trace_row = read_traces(step, trace_grads)
 
     # --------------- Timing and Logging -----------------
     pct_done = 100 * step / cfg.num_steps
@@ -1509,7 +1604,7 @@ for step in range(cfg.num_steps + 1):
     if step > 10:   # the compile and warm-up rates are not the run's rates
         stats.dt, stats.tok_per_sec, stats.mfu = dt, tok_per_sec, mfu
         stats.eta = remaining_time
-    log_step(stats)
+    log_step(stats, trace_row)
 
     if profiler is not None:
         profiler.step()
@@ -1541,6 +1636,7 @@ print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 10
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 
 metrics_file.close()
+traces_file.close()
 
 # The warm-up steps cost the compile plus whatever they were going to cost anyway.
 avg_step_time = float(np.mean(timed)) if timed else 0.0
@@ -1578,8 +1674,8 @@ if result.val_bpb is not None:
 print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
     print0(f"  {cfg.total_batch_size:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.total_batch_size / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
-print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
+print0(f"  rows -> {metrics_path} | traces -> {traces_path} | result -> {result_path}", console=True)
 
-for _f in (logfile, metrics_path, result_path):
+for _f in (logfile, metrics_path, traces_path, result_path):
     wandb_run.save(_f, policy="now")
 wandb_run.finish()
