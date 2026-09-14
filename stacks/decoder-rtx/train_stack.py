@@ -139,7 +139,7 @@ class StackConfig:
     val_steps:       int              # Derived: val micro-batches per pass.
 
     # Logging
-    wandb_project:   str = "decoderstack_rtx"  # baselines only; experiments -> decoderstack_rtx_dev
+    wandb_project:   str = "decoderstack_rtx"  # baselines only
     run_name:        str = "baseline"  # both wandb and log files
     use_wandb:       bool = True
 
