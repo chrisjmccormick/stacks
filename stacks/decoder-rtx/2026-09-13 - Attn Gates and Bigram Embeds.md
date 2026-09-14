@@ -171,3 +171,27 @@ Any of these could be why the port hasn't landed yet, and several could be actin
 - Attention gates cost ~1.7% step time and bigram a further ~2.5%. If neither earns that
   back, they should come out of the baseline — but that is a decision to make after the
   lr sweeps, not now.
+
+## 2026-09-14 update: the table's lr was the problem, in the other direction
+
+The 09-13 runs B–D trained the table frozen (its parameters were missing from the
+optimizer loops; fixed in `dc089dd`). With the table actually stepping at lr 0.9, Adam's
+normalized update (~lr per element per step, whatever the gradient) put every slot's vector
+at a norm of 200–290 by the end of the run against 44 for an input-embedding row, the
+rarest slots largest, and the model settled `bigram_lambdas` at ~0.1 / 0.0 / 0.06 — the
+table switched nearly off — finishing 0.901611 against the head-init baseline's 0.899560.
+Lowering the lr, with `bigram_lambdas`' lr at 0.1 so their first gradient no longer
+overshoots them to −0.26:
+
+| table peak lr | val bpb | slack |
+|---|---|---|
+| none (baseline) | 0.899560 | +440 |
+| 0.9 | 0.901611 | −1,611 |
+| 0.1 | 0.897176 | +2,824 |
+| 0.03 | 0.895198 | +4,802 |
+| 0.01 | 0.895067 | +4,933 |
+
+Ahead at every validation from step 125, under 0.90 by step 875, +1.1% step time; the
+attention gates are set aside on this branch (`d75f72d`, the last commit with them is
+`e8e6870`). A hit-rows-only Adam and a count-derived table init did not help. Provenance:
+`agent-ops-stacks/decoder-rtx/2026-09-14_0744am_bigram-hash-study/`.
