@@ -1000,6 +1000,19 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd, slots) in embed_configs:
 # LM Head
 # ------------------------------------------------------------------------------
 
+# Halve the head's log-frequency component.
+token_counts = torch.tensor(np.load(os.path.join(DATASET_DIR, "tokenizer/token_counts.npz"))["train"],
+                            dtype=torch.float32, device=device)
+occurrences_per_step = token_counts / token_counts.sum() * cfg.total_batch_size
+freq_weight = occurrences_per_step.clamp_min(1e-3)
+log_freq = (occurrences_per_step + 1e-3).log()
+log_freq = (log_freq - (freq_weight * log_freq).sum() / freq_weight.sum()).unsqueeze(1)           # centred, (V, 1)
+head_mean = (freq_weight.unsqueeze(1) * head_prior).sum(0) / freq_weight.sum()
+freq_direction = ((freq_weight.unsqueeze(1) * log_freq * (head_prior - head_mean)).sum(0)
+                  / (freq_weight * log_freq.squeeze(1).square()).sum())                           # (D,)
+head_prior -= 0.5 * log_freq * freq_direction
+del token_counts, occurrences_per_step, freq_weight, log_freq, head_mean, freq_direction
+
 lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001).add_(head_prior)
 
 # Per-step multiplier on the head's grad mix-ins (1-beta). Constant: no warmup ramp.
