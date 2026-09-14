@@ -1,9 +1,10 @@
 # train_stack.py -- the bigram-embeds branch
 #
-# The sep-14 baseline plus attention output gates and hashed bigram embeddings,
-# instrumented for studying them: every step it logs the value, grad and bias-corrected
-# m/sqrt_v of a few weights in each AdamW parameter (§ Parameter Traces) to the
-# decoder_rtx_bi_embed wandb project, and it checkpoints at steps 250, 500, 750 and the end.
+# The sep-14 baseline plus hashed bigram embeddings, instrumented for studying them:
+# every step it logs the value, grad and bias-corrected m/sqrt_v of a few weights in
+# each AdamW parameter (§ Parameter Traces) to the decoder_rtx_bi_embed wandb project,
+# and it checkpoints at steps 250, 500, 750 and the end. (The attention output gates
+# this branch also carried are set aside for now; e8e6870 is the last commit with them.)
 #
 # nanochat-based pre-training pipeline, with model code implemented as a single
 # forward_backward function, no nn.Module or autograd.
@@ -115,10 +116,6 @@ class StackConfig:
     full_ctxt_layers: list[int] = [   3,    6,    10]
     window_sizes:     list[tuple[int, int]]  # Derived below.
 
-    # Attention - Output Gate
-    d_attn_gate: int = 12  # Gate input is first 12-dims of the layer's residual stream.
-                           # Each head has its own gate, all with same input.
-
     # Attention - Value Embeddings
     d_ve_gate: int = 12  # Gate input is first 12-dims of the layer's residual stream.
                          # Each head has its own gate, all with same input.
@@ -130,8 +127,8 @@ class StackConfig:
     d_mlp:      int = 4 * 768 # 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 412_091_653     # every trained weight (§ Weight Init & Schedule)
-    num_flops_per_token: int = 780_934_320     # 6 * 110,101,704 matmul params + attention
+    num_params:          int = 412_090_861     # every trained weight (§ Weight Init & Schedule)
+    num_flops_per_token: int = 780_929_568     # 6 * 110,100,912 matmul params + attention
 
     # ---- Training ----
 
@@ -253,7 +250,6 @@ class Model:
     W_K: Param
     W_V: Param
     W_O: Param
-    attn_gate:    Param
     value_embeds: Param
     ve_gate:      Param
 
@@ -443,11 +439,8 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cfg.seq_len, cfg.window_sizes[i])
         y = y.contiguous()
 
-        # Per-head output gate, letting a head no-op on its context.
-        attn_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_attn_gate] @ m.attn_gate.w[i].mT)
-
         # Project value heads onto their output heads.
-        attn_out = (y * attn_gate_sig.unsqueeze(-1)).view(T, -1) @ m.W_O.w[i].mT
+        attn_out = y.view(T, -1) @ m.W_O.w[i].mT
 
         # Write back to the stream.
         x_attn_out = x_biased + attn_out
@@ -587,21 +580,8 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
 
         # Attention backward
         x_biased_hat = st.x_biased_hat
-
-        # Recompute the output gate; st.y is the ungated attention output.
-        attn_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_attn_gate] @ m.attn_gate.w[i].mT)
-
-        m.W_O.gbank[i].add_(xb_attn_out.mT @ (st.y * attn_gate_sig.unsqueeze(-1)).view(T, -1))
-
-        # Grad w.r.t. the gated heads, which the gate and st.y then split.
-        ybg = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo)
-
-        # The gate broadcasts over d_vo, so its grad sums that axis back out.
-        attn_gateb_a = (ybg * st.y).sum(dim=-1)              # (T, n_qo_heads)
-        attn_gateb_z = attn_gateb_a * attn_gate_sig * (1 - attn_gate_sig)
-        m.attn_gate.gbank[i].add_(attn_gateb_z.mT @ x_biased_hat[..., :cfg.d_attn_gate])
-
-        yb = ybg * attn_gate_sig.unsqueeze(-1)
+        m.W_O.gbank[i].add_(xb_attn_out.mT @ st.y.view(T, -1))
+        yb = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo)
 
         qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
             yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_seqlens, cfg.seq_len,
@@ -652,7 +632,6 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         m.W_V.gbank[i].add_(vb.mT @ x_biased_hat)
 
         xb_biased_hat = qb @ m.W_Q.w[i] + kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
-        xb_biased_hat[:, :cfg.d_attn_gate] += attn_gateb_z @ m.attn_gate.w[i]
         if xb_biased_hat_ve is not None:
             xb_biased_hat[:, :cfg.d_ve_gate] += xb_biased_hat_ve
         xb_biased = xb_attn_out + bf16(st.x_biased_inv_rms * (xb_biased_hat.float() - (x_biased_hat.float() * (x_biased_hat.float() * xb_biased_hat.float()).mean(dim=-1, keepdim=True))))
@@ -1124,8 +1103,6 @@ W_K =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_qk, cfg.d_model).uniform
 W_V =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_vo, cfg.d_model).uniform_(-matrix_init_s, matrix_init_s)
 W_O =   fp32_zeros(cfg.n_layers,               cfg.d_model, cfg.n_qo_heads * cfg.d_vo)  # projections start at zero
 
-attn_gate = fp32_empty(cfg.n_layers, cfg.n_qo_heads, cfg.d_attn_gate).uniform_(0.0, 0.02)
-
 ve_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(0.0, 0.02)
 
 W_in  = fp32_empty(cfg.n_layers, cfg.d_mlp,   cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4)
@@ -1150,7 +1127,7 @@ muon_wd[1:] = 0.28 * (0.5 * (1.0 + np.cos(math.pi * (1.0 - run_frac))))
 # Muon peak lr is 0.02, scaled up for tall matrices by their sqrt(fan_out/fan_in)
 # aspect ratio -- at d12 only W_in (the 4x MLP expansion -> 2.0). rdim is the
 # axis facing the residual stream: W_O and W_out live transposed -> -2; the
-# the attn_gate and ve_gate rows read a 12-dim slice of the stream -> -1.
+# ve_gate rows read a d_ve_gate slice of the stream -> -1.
 muon_configs = [
 #    name,      weights,  peak lr,  rdim
     ("W_Q",     W_Q,      0.02,      -1),
@@ -1159,7 +1136,6 @@ muon_configs = [
     ("W_O",     W_O,      0.02,      -2),
     ("W_in",    W_in,     0.04,      -1),
     ("W_out",   W_out,    0.02,      -2),
-    ("attn_gate", attn_gate, 0.02,   -1),
     ("ve_gate", ve_gate,  0.02,      -1)
 ]
 
@@ -1213,7 +1189,7 @@ for (name, w, peak_lr, rdim) in muon_configs:
     setattr(m, name, p)
 
 # The Params own everything now: free the fp32 draws and the prior tables, drop the adopted names.
-del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, attn_gate, ve_gate, W_in, W_out
+del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, W_in, W_out
 del embed_prior, head_prior
 
 
@@ -1571,7 +1547,7 @@ for step in range(cfg.num_steps + 1):
     # Smooth gradients, update weights, zero the grads
 
     # Muon 
-    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.attn_gate, m.ve_gate):
+    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate):
         muon_step_fused(p, p.grad, t_step)
         p.grad.zero_()
 
