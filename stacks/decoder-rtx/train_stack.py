@@ -977,7 +977,7 @@ embed_configs = [
 #   name,             weights,       peak lr,  b1_grad,  b2_grad,  wd,       slots
     ("input_embeds",  input_embeds,  0.3,      0.2,      0.005,    0.001,   1),
     ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves),
-    ("bigram_embeds", bigram_embeds, 0.1,      0.2,      0.005,    0.001,   1)
+    ("bigram_embeds", bigram_embeds, 0.03,     0.2,      0.005,    0.001,   1)
 ]
 
 # For each of the embedding tables...
