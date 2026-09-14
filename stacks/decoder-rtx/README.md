@@ -76,5 +76,7 @@ TODO - I'd like to try and carry forward crediting the individual algorithm and 
 ### Interesting Techniques
 
 - The baseline includes initialization of the vocabulary with the bigram distribution measured from the training data.
+- The head's log-frequency (unigram) component is halved at init. The first ten steps of training did that on their own, and doing it up front removes the step-1 loss spike (6.05 -> 7.6 nats) and finished 270 ubpb ahead of the same run without it.
+- The document-prefix cap ramp is rounded to multiples of 64 tokens: FA2 varlen's cost steps up each time a document crosses a 64-token boundary.
 - Selectively re-computing certain parts of the forward activation conserved enough memory to allow for a micro-batch size of 256K tokens.
 
