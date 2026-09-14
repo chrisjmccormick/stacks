@@ -1466,13 +1466,13 @@ for step in range(cfg.num_steps + 1):
     # Smooth gradients, update weights, zero the grads
 
     # Muon 
-    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate):
+    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.attn_gate, m.ve_gate):
         muon_step_fused(p, p.grad, t_step)
         p.grad.zero_()
 
     # AdamW
-    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
-              m.smear_gate, m.smear_lambda, m.backout_lambda):
+    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.bigram_embeds, m.resid_lambdas, m.x0_lambdas, \
+              m.bigram_lambdas, m.smear_gate, m.smear_lambda, m.backout_lambda):
         # Run AdamW
         adamw_step_fused(p, p.grad, t_step)
         p.grad.zero_()
