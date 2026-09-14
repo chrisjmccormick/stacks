@@ -1,29 +1,38 @@
-Final submitted runs should adhere to the following rules. Confirm that your code adheres to them before launching a candidate run for submission--the code will be automatically attached to the wandb run, so any issues should be addressed before running.
+A submitted run should read like the baseline it's competing with: one self-contained
+script that someone can open and follow start to finish. The code is attached to the wandb
+run automatically, so it *is* the submission -- settle these before launching a candidate.
 
-Have a subagent compare your code to the repo's baseline and report on each of the following items. Address any issues.
+Have a subagent compare your code to the repo's baseline and report on each item below.
 
-(1) Ensure the script does not use any passed-in arguments, either via command line or environment variables so that the code is self-contained. 
-    - The one exception is the WANDB_API_KEY environment variable.
-(2) Ensure that all code is contained within the logged scripts: 'train_stack.py' and 'utils.py'.
-(3) Ensure that the code is clear of any explanatory code comments written by you.
-    - Terse comments which mark the start of a block are ok.
-    - Terse function descriptions are ok if they do not explain details.
-    - Otherwise, remove anything else you wrote.
-(4) Restore any of the original code comments that have been removed.
-(5) Reduce the amount of indirection required to read the code: 
-    - Inline any helper functions you created at their call sites, unless they are lengthy and called multiple times.
-    - Replace any class definitions you added by inlining their code or converting to functions.
-        - (data structures are ok, this applies to classes with methods)
-    - Any values contained in the global 'cfg' object should be accessed directly rather than defining function arguments for those values. 
-(6) Improve the readability of multi-line object definitions by adding spacing to left-align the values (see the code for examples). Restore any spacing that may have been removed by your edits.
-(7) If you added any configurable features (e.g., that can be enabled or disabled with a flag), re-write them so that the only code path is the one that runs in the final submission. 
-(8) If you added any weight initialization, scheduling or optimizer parameters to the StackConfig, move these out and bake them into the code where they are used.
-(9) Check for any variables you added which do not have descriptive names, and consider renaming them to be more self-documenting; prefer clarity over brevity, but use your judgment.
-(10) The following techniques are not allowed in submissions:
-    - Triton
-    - FP8 / quantization
+**What the submission should be**
 
+(1) **Self-contained.** Everything the run needs is hardcoded in the script -- no command
+    line arguments, no environment variables -- so the attached code reproduces the number.
+    `WANDB_API_KEY` is the one exception.
+(2) **Fully contained in the logged scripts**, `train_stack.py` and `utils.py`. If it ran,
+    it's in there.
+(3) **One code path.** Any feature you made configurable during development gets rewritten
+    down to the single path that runs in the final submission -- the reader should see what
+    happened, not what could have.
 
+**How the code should read**
 
+(4) **Direct.** Inline the helper functions you added at their call sites, and convert any
+    classes you added with methods into functions or inline code (plain data structures are
+    fine). Read values straight from the global `cfg` rather than passing them in as
+    function arguments. Every hop a reader has to make costs them the thread.
+(5) **Self-documenting through names.** Give the variables you introduced descriptive names
+    -- prefer clarity over brevity, and use your judgment about how long is useful.
+(6) **Comment-light.** Keep the original comments: restore any your edits removed. Of your
+    own, keep terse block markers and terse function descriptions; let the code carry the
+    rest.
+(7) **Baked-in hyperparameters.** Weight initialization, scheduling and optimizer values you
+    added belong at the point of use, not in `StackConfig`.
+(8) **Aligned.** Left-align the values in multi-line object definitions (the code has
+    examples), and restore any alignment your edits disturbed.
 
+**The tools this speedrun sets aside**
 
+(9) Plain PyTorch is the interesting constraint here, so submissions leave out **Triton** and
+    **FP8 / quantization**. Both are very cool and both make a big difference -- they just
+    lead to some pretty nasty code, and a readable single file is what this speedrun is for.

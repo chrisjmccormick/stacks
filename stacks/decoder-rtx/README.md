@@ -26,6 +26,7 @@ The baseline approach means that we just need to assemble enough improvements th
 
 - The 'weekly folded-baseline' approach means sharing one run is enough.
 - The script logs itself and the run to wandb, so just share your result and the link to your run in the discussion section and/or on X.
+  - Send experiments to the **`decoderstack_rtx_dev`** project, and keep **`decoderstack_rtx`** for baselines. That way anyone opening the baseline project sees just the key runs, without having to pick them out of a sweep's worth of traces. Set it with `cfg.wandb_project` while you're iterating.
   - Keep the final run self-contained--settings hardcoded in the script, no env variables or command line arguments--so the code wandb captured *is* the run that produced your number.
 - Hand-written forward and backward, all the way through. Hacking the backward pass is the whole point :)
 - Plain PyTorch is the interesting constraint, so two genuinely great tools sit this one out--they're awesome, but messy:
