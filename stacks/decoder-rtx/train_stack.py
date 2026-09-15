@@ -909,7 +909,8 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd) in scalar_configs:
 # Embeddings
 # ------------------------------------------------------------------------------
 
-input_embeds =     bf16_zeros(cfg.d_vocab, cfg.d_model)  # + the token frequency prior, below
+input_embeds =     bf16_empty(cfg.d_vocab, cfg.d_model)  # + the token frequency prior, below
+input_embeds.copy_(fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.0))
 value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
 value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
                    .uniform_(-matrix_init_s, matrix_init_s))
