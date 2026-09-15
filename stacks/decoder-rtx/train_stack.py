@@ -131,7 +131,7 @@ class StackConfig:
     grad_accum_steps:   int
 
     # Training
-    num_steps: int = 1035
+    num_steps: int = 1050
 
     # Evaluation and logging
     val_loss_every:  int = 125
