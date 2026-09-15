@@ -5,10 +5,10 @@ triton
 
 numpy
 huggingface_hub
-# kernels >= 0.14 can't load get_kernel("varunneal/flash-attention-3"): the
-# publisher trust gate 404s on user-owned repos, and 0.16 rejects classic
-# model repos outright (new kernels repo-type API). 0.13.0 = validated-run era.
-kernels==0.13.0
+# The classic model-type copies of kernels-community's kernels were removed from the hub
+# on 2026-09-14; kernels >= 0.14 loads from the kernel-type repos instead, via
+# get_kernel(..., version=<major>). 0.17.0 validated (the same flash-attn2 build).
+kernels==0.17.0
 wandb
 pyarrow
 tokenizers
