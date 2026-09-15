@@ -36,16 +36,11 @@ del _time
 
 with open(sys.argv[0], 'r') as f:
     code = f.read()   # the run section logs the script source to wandb
-# utils.py holds the data loader; log its source too.
-with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "utils.py"), 'r') as f:
-    code += "\n\n# " + "=" * 78 + "\n# utils.py\n# " + "=" * 78 + "\n\n" + f.read()
 
-import csv
 import gc
 import json
 import math
 import time
-from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import NamedTuple
 
@@ -59,8 +54,7 @@ import torch._dynamo as dynamo
 import torch.nn.functional as F
 from torch import Tensor
 
-from utils import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dataset,
-                   flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
+from utils import data_generator, flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd
 
 dynamo.config.recompile_limit = 64
 
@@ -79,16 +73,11 @@ torch.cuda.set_device(device)
 # ==============================================================================
 
 class StackConfig:
-    """Model architecture constants and training configuration. Weight 
-    initialization, scheduling, and optimizer parameters are defined directly in
-    their code instead. This codebase generally only includes the codepath 
-    executed during the run, without togglable features; the "config" is for
-    referencing constants and documenting key settings."""
 
     # ---- Architecture ----
 
     # Model
-    n_layers:   int = 11
+    n_layers:   int = 12
     d_model:    int = 768
 
     backout_layer: int = 6 # nanochat: n_layers // 2
@@ -106,13 +95,13 @@ class StackConfig:
     # Context and Sliding Window Attention
     seq_len:          int = 2048
     short_win_size:   int = 768
-    full_ctxt_layers: list[int] = [   3,    6,    10]
+    full_ctxt_layers: list[int] = [   3,    7,    11] # "SSSL" tiled, last layer always full
     window_sizes:     list[tuple[int, int]]  # Derived below.
 
     # Attention - Value Embeddings
     d_ve_gate: int = 12  # Gate input is first 12-dims of the layer's residual stream.
                          # Each head has its own gate, all with same input.
-    ve_layers: list[int] = [1, 2, 8, 9, 10]
+    ve_layers: list[int] = [1, 3, 5, 7, 9, 11]
     ve_index:  list[int] # Derived from ve_layers.
     num_ves:   int
 
@@ -126,20 +115,22 @@ class StackConfig:
     # ---- Training ----
 
     # Batch Size
-    micro_batch_tokens: int = 2**18   # 256K tokens per micro-batch
-    total_batch_size:   int = 2**19   # 512K tokens per step
+    micro_batch_tokens: int = 2**18   # 128K tokens per micro-batch
+    total_batch_size:   int = 2**19   # 512K tokens per step (1M for d24)
     grad_accum_steps:   int
+    max_num_docs:       int           # Entries in the fixed-size cu_seqlens buffer.
 
     # Training
-    num_steps: int = 1050
+    num_steps: int = 1000   # the val-bpb-0.900 budget for this recipe (0.8994 at 1,000, 0.8960 at 1,050)
 
     # Evaluation and logging
     val_loss_every:  int = 125
     val_tokens:      int = 10485760   # 10M tokens per val-bpb pass
+    eval_buffer_tokens: int = 65536   # tokens per eval micro-batch
     val_steps:       int              # Derived: val micro-batches per pass.
 
     # Logging
-    wandb_project:   str = "decoderstack_rtx"  # baselines only
+    wandb_project:   str = "decoderstack_rtx"  # baselines only; test runs -> decoderstack_rtx_dev
     run_name:        str = "baseline"  # both wandb and log files
     use_wandb:       bool = True
 
@@ -180,20 +171,46 @@ for i in cfg.full_ctxt_layers:
     cfg.window_sizes[i] = (cfg.seq_len, 0)                   # ... then overwrite with full.
 
 cfg.grad_accum_steps = cfg.total_batch_size // cfg.micro_batch_tokens
-cfg.val_steps =        cfg.val_tokens       // EVAL_BUFFER_TOKENS
+cfg.val_steps =        cfg.val_tokens       // cfg.eval_buffer_tokens
 
-VAL_BPB_TARGET = 0.900
+# This is to set the fixed size of 'cu_seqlens' for varlen.
+# Estimating 192 docs per 64K tokens.
+cfg.max_num_docs = 192 * max(1, math.ceil(max(cfg.micro_batch_tokens, cfg.eval_buffer_tokens) / 65536))
 
 gpu_device_name = torch.cuda.get_device_name(0)   # "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 # Dense BF16 peak FLOPS of the RTX PRO 6000, the MFU denominator.
 gpu_peak_flops = 503.8e12
 
-download_dataset()
+DATASET_DIR = os.path.join("./data/climbmix_32k_8_170")
+train_files = os.path.join(DATASET_DIR, "climbmix/train_*.bin")
+val_files   = os.path.join(DATASET_DIR, "climbmix/val_*.bin")
+
+# How many of the hub's 91 train shards (100M raw tokens each, numbered from
+# 1) this horizon needs. Count against 85M usable per shard and round up.
+num_train_shards = math.ceil(cfg.num_steps * cfg.total_batch_size / (0.85 * 100_000_000))
 
 
-# Reject a vocab mismatch between the .bin shards and the model.
+from huggingface_hub import HfApi, hf_hub_download
+os.makedirs(DATASET_DIR, exist_ok=True)
+print(f"=== Downloading dataset files ===")
+for fname in HfApi().list_repo_files(repo_id="ChrisMcCormick/climbmix_32k_8_170", repo_type="dataset"):
+    if not (fname.startswith("climbmix/") or fname.startswith("tokenizer/") or fname == "config.json"):
+        continue
+    # Skip over excess training shards.
+    if fname.startswith("climbmix/train_") and int(fname[len("climbmix/train_"):].split(".")[0]) > num_train_shards:
+        continue
+    # Download everything else.
+    if not os.path.exists(os.path.join(DATASET_DIR, fname)):
+        hf_hub_download(repo_id="ChrisMcCormick/climbmix_32k_8_170", filename=fname,
+                        repo_type="dataset", local_dir=DATASET_DIR)
+print("  Done.")
+
+
+# Read the BOS id the .bin shards were packed with; reject a vocab mismatch.
 with open(os.path.join(DATASET_DIR, "config.json")) as f:
-    assert json.load(f)["vocab_size"] == cfg.d_vocab, "dataset vocab != model d_vocab"
+    _vocab_config = json.load(f)
+BOS_ID = _vocab_config["bos_id"]
+assert _vocab_config["vocab_size"] == cfg.d_vocab, "dataset vocab != model d_vocab"
 
 # token_bytes: per-token-id byte lengths (0 for special tokens), for the
 # vocab-size-independent bits-per-byte validation metric.
@@ -313,7 +330,7 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
+def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     """One micro-batch through the model. Use backward=False for validation."""
 
     # Residual stream naming:
@@ -484,9 +501,6 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # -----------------------------
     #           Backward
     # -----------------------------
-    # Only compute some grads on the last micro batch.
-    is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
-
 
     # Scalar grads are collected, grad tensors updated at the end.
     g_resid = []; g_x0 = []
@@ -499,8 +513,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     xf_grad = bf16(xf_inv_rms * (xf_norm_grad.float() - (xf_norm.float() * res_ms)))
 
     # Dot product between final vs. backout streams.
-    if is_last_micro:
-        m.backout_lambda.grad.add_(-sum32(xf_grad * x_backout))  # (T, d_model)
+    m.backout_lambda.grad.add_(-sum32(xf_grad * x_backout))  # (T, d_model)
 
     # stream_grad updates every layer, keep xf_grad for backout layer.
     stream_grad = xf_grad           # grad wrt layer num_layers-1's output
@@ -594,18 +607,16 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
             xb_norm_grad[:, :cfg.d_ve_gate] += d_xn_ve
         xb_grad = xm_grad + bf16(st.xb_inv_rms * (xb_norm_grad.float() - (xb_norm.float() * (xb_norm.float() * xb_norm_grad.float()).mean(dim=-1, keepdim=True))))
         # --- blend backward: xb = resid_lambdas[i]*x_in + x0_lambdas[i]*x0 ---
-        if is_last_micro:
-            g_resid.append(sum32(xb_grad * st.x_in))
-            g_x0.append(sum32(xb_grad * x0))
+        g_resid.append(sum32(xb_grad * st.x_in))
+        g_x0.append(sum32(xb_grad * x0))
         x0_grad = x0_grad + m.x0_lambdas.w[i] * xb_grad  # TRAP: x0 feeds every layer, accumulate
         stream_grad = m.resid_lambdas.w[i] * xb_grad
         stash[i] = None                          # free this layer's stash as we go
 
     # Land the per-layer resid/x0 scalar sums (collected in REVERSED layer
     # order) as one stacked add each.
-    if is_last_micro:
-        m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
-        m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
+    m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
+    m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
 
     # stream_grad is now the grad through layer 0's input, which IS x0 (same tensor)
     smeared_grad = x0_grad + stream_grad         # grad wrt the smeared embedding
@@ -1131,7 +1142,7 @@ del embed_prior, head_prior
 # Rotary Cache
 # ------------------------------------------------------------------------------
 
-rotary_seq_len = cfg.micro_batch_tokens
+rotary_seq_len = max(cfg.micro_batch_tokens, cfg.eval_buffer_tokens)
 channel_range = torch.arange(0, cfg.d_qk, 2, dtype=torch.float32, device=device)  # stride the channels
 inv_freq = 1.0 / (100000 ** (channel_range / cfg.d_qk))
 t_pos = torch.arange(rotary_seq_len, dtype=torch.float32, device=device)          # stride the time steps
@@ -1146,75 +1157,6 @@ del channel_range, inv_freq, t_pos, freqs
 # ==============================================================================
 # § Training Harness
 # ==============================================================================
-
-
-# ------------------------------------------------------------------------------
-# Stats
-# ------------------------------------------------------------------------------
-# One row per step. The CSV header is the field list, the wandb row is the same
-# fields under their panel prefixes. A field nobody wrote stays None, and both
-# sinks skip it.
-
-@dataclass
-class StepStats:
-
-    step:         int          = 0
-
-    # Training
-    loss:         float | None = None
-    lr_mult_t:    float | None = None
-    dt:           float | None = None   # seconds; unset for steps 0-10
-    tok_per_sec:  int   | None = None   # "
-    mfu:          float | None = None   # "
-
-    # Validation, on val steps only
-    bpb:          float | None = None
-    eval_seconds: float | None = None
-    slack:        int   | None = None
-
-    # Run clocks, in minutes; stamped by log_step
-    train_total:  float | None = None
-    wall_total:   float | None = None
-    eta:          float | None = None
-
-
-# Field -> wandb panel. A field not named here lands under `train/`.
-WANDB_GROUPS = {
-    "val":  ("bpb", "eval_seconds", "slack"),
-    "time": ("train_total", "wall_total", "eta"),
-}
-_WANDB_PREFIX = {f: g for g, fs in WANDB_GROUPS.items() for f in fs}
-assert set(_WANDB_PREFIX) <= {f.name for f in fields(StepStats)}, \
-    "WANDB_GROUPS names a field StepStats does not have"
-
-
-@dataclass
-class RunResult:
-    """The run in one row: the results panel, the result JSON, the runs table."""
-
-    # Identity, for the JSON; wandb has these from the run name and config
-    run_name:         str          = ""
-    num_steps:        int          = 0
-    total_batch_size: int          = 0
-
-    # The result
-    val_bpb:          float | None = None
-    min_val_bpb:      float | None = None
-    slack:            int   | None = None   # micro-bpb under VAL_BPB_TARGET
-
-    # The cost, in minutes
-    train_time:       float        = 0.0
-    val_time:         float        = 0.0
-    compile_time:     float        = 0.0
-    wall_time:        float        = 0.0
-
-    # The rate
-    avg_step_time:    float        = 0.0    # seconds
-    avg_mfu:          float        = 0.0    # percent of BF16 peak
-    peak_mem_gb:      float        = 0.0
-
-
-FINAL_IDENTITY = ("run_name", "num_steps", "total_batch_size")
 
 
 # ------------------------------------------------------------------------------
@@ -1257,25 +1199,6 @@ print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", cons
 print0(f"Total batch size: {cfg.total_batch_size:,} tokens = {cfg.micro_batch_tokens:,} tokens/micro "
        f"x {cfg.grad_accum_steps} grad accum", console=True)
 
-# A flat row per step and the result, for analysis without wandb.
-metrics_path = f"logs/{cfg.run_name}_metrics.csv"
-result_path  = f"logs/{cfg.run_name}_result.json"
-metrics_file = open(metrics_path, "w", newline="")
-metrics_csv = csv.DictWriter(metrics_file, fieldnames=[f.name for f in fields(StepStats)])
-metrics_csv.writeheader()
-
-
-def log_step(stats):
-    """One step's row to the CSV and to wandb, stamped with the run clocks."""
-    stats.train_total = np.sum(timed) / 60
-    stats.wall_total = (time.perf_counter() - run_wall_t0) / 60
-    row = asdict(stats)
-    metrics_csv.writerow(row)
-    metrics_file.flush()
-    wandb_run.log({"step": stats.step,
-                   **{f"{_WANDB_PREFIX.get(k, 'train')}/{k}": v
-                      for k, v in row.items() if k != "step" and v is not None}})
-
 gc_t0 = 0.0
 def gc_logging_hook(phase, info):
     """Registered at step 10: after setup, any collector run is a surprise
@@ -1302,7 +1225,7 @@ else:
         # The config, verbatim: every StackConfig field, defaults and derived.
         config={name: getattr(cfg, name) for name in StackConfig.__annotations__},
     )
-    wandb.define_metric("step", hidden=True)   # the x-axis, not a series
+    wandb.define_metric("step")
     wandb.define_metric("*", step_metric="step")
 
 profiler = None
@@ -1326,12 +1249,12 @@ val_bpb = None
 min_val_bpb = float("inf")
 smooth_train_loss = 0.0
 total_val_time = 0.0
-timed = []   # Length of each step in seconds, steps 0-10 excluded.
-             # Total training time = np.sum(timed).
-warmup = []  # Those first 11 steps, where the compile lives.
+timed = []  # Length of each step in seconds, excluding first 10.
+            # Total training time = np.sum(timed).
 
-train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens,
-                              cfg.num_steps * cfg.grad_accum_steps)
+train_loader = data_generator(
+    train_files, cfg.micro_batch_tokens, cfg.seq_len,
+    bos_id=BOS_ID, max_num_docs=cfg.max_num_docs)
 
 inputs, targets, cu_seqlens = next(train_loader)   # kick off the first batch
 
@@ -1341,18 +1264,18 @@ for step in range(cfg.num_steps + 1):
     # Set ABORT_STEP=0 to run validation only.
     last_step = step == (cfg.num_steps if ABORT_STEP is None else ABORT_STEP)
 
-    stats = StepStats(step=step)
-
     # --------------- Validation Loop -----------------
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens)
+        val_loader = data_generator(
+            val_files, cfg.eval_buffer_tokens, cfg.seq_len,
+            bos_id=BOS_ID, max_num_docs=cfg.max_num_docs)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
-        for micro_i in range(cfg.val_steps):
+        for _ in range(cfg.val_steps):
             v_inputs, v_targets, v_cu_seqlens = next(val_loader)
-            loss_flat = forward_backward(v_inputs, v_targets, v_cu_seqlens, micro_step=micro_i, backward=False)
+            loss_flat = forward_backward(v_inputs, v_targets, v_cu_seqlens, backward=False)
             num_bytes_flat = token_bytes[v_targets]
             total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
             total_bytes += num_bytes_flat.sum()
@@ -1362,8 +1285,9 @@ for step in range(cfg.num_steps + 1):
         val_elapsed = time.perf_counter() - val_t0
         total_val_time += val_elapsed
         print0(f"step:{step}/{cfg.num_steps} val_bpb:{val_bpb:.6f} val_time:{val_elapsed:.2f}s", console=True)
-        stats.bpb, stats.eval_seconds = val_bpb, val_elapsed
-        stats.slack = round((VAL_BPB_TARGET - val_bpb) * 1e6)
+        wandb_run.log({"step": step, "val/bpb": val_bpb, "val/eval_seconds": val_elapsed,
+                       "total_training_time": np.sum(timed),
+                       "time/wall_seconds": time.perf_counter() - run_wall_t0})
 
     # --------------- Checkpoint -----------------
     if cfg.save_checkpoint and (last_step or step in cfg.save_steps):
@@ -1373,7 +1297,6 @@ for step in range(cfg.num_steps + 1):
 
     # Exit final step after validation and checkpoint
     if last_step:
-        log_step(stats)
         break
 
     # --------------- Training Step -----------------
@@ -1381,11 +1304,10 @@ for step in range(cfg.num_steps + 1):
     step_t0 = time.perf_counter()
 
     # Gradient Accumulation Loop
-    for micro_i in range(cfg.grad_accum_steps):
+    for micro in range(cfg.grad_accum_steps):
 
         # Forward and Backward pass
         loss = forward_backward(inputs, targets, cu_seqlens,
-                                micro_step=micro_i,
                                 loss_scale=1.0 / (cfg.grad_accum_steps * inputs.size(0)))
 
         # Next training batch
@@ -1424,7 +1346,6 @@ for step in range(cfg.num_steps + 1):
         remaining_time = (cfg.num_steps - step - 1) * np.mean(timed) / 60
         eta_str = f" | eta: {remaining_time:.1f}m"
     else:
-        warmup.append(dt)
         eta_str = ""
 
     tok_per_sec = int(cfg.total_batch_size / dt)
@@ -1432,12 +1353,17 @@ for step in range(cfg.num_steps + 1):
 
     print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lr_mult_t: {lr_mult_t[step]:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
 
-    stats.loss = train_loss
-    stats.lr_mult_t = float(lr_mult_t[step])
-    if step > 10:   # the compile and warm-up rates are not the run's rates
-        stats.dt, stats.tok_per_sec, stats.mfu = dt, tok_per_sec, mfu
-        stats.eta = remaining_time
-    log_step(stats)
+    wandb_run.log({
+        "step": step,
+        "train/loss": debiased_smooth_loss,
+        "train/lr_mult_t": float(lr_mult_t[step]),
+        "train/dt": dt,
+        "time/wall_seconds": time.perf_counter() - run_wall_t0,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+        "train/loss_raw": train_loss,
+        "total_training_time": np.sum(timed),
+    })
 
     if profiler is not None:
         profiler.step()
@@ -1467,47 +1393,21 @@ if profiler is not None:
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+print0(f"total training time: {np.sum(timed)/60:.2f}m | val {total_val_time/60:.2f}m | "
+       f"wall {(time.perf_counter() - run_wall_t0)/60:.2f}m", console=True)
 
-metrics_file.close()
-
-# The warm-up steps cost the compile plus whatever they were going to cost anyway.
-avg_step_time = float(np.mean(timed)) if timed else 0.0
-compile_time = max(0.0, np.sum(warmup) - len(warmup) * avg_step_time)
-
-result = RunResult(
-    run_name         = cfg.run_name,
-    num_steps        = cfg.num_steps,
-    total_batch_size = cfg.total_batch_size,
-
-    train_time       = float(np.sum(timed)) / 60,
-    val_time         = total_val_time / 60,
-    compile_time     = compile_time / 60,
-    wall_time        = (time.perf_counter() - run_wall_t0) / 60,
-
-    avg_step_time    = avg_step_time,
-    avg_mfu          = (100 * cfg.num_flops_per_token * cfg.total_batch_size
-                        / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
-    peak_mem_gb      = torch.cuda.max_memory_reserved() / 2**30,
-)
-if val_bpb is not None:
-    result.val_bpb, result.min_val_bpb = val_bpb, min_val_bpb
-    result.slack = round((VAL_BPB_TARGET - val_bpb) * 1e6)
-
-row = asdict(result)
-with open(result_path, "w") as f:
-    json.dump(row, f, indent=1)
-wandb_run.log({"step": cfg.num_steps,
-               **{f"final/{k}": v for k, v in row.items()
-                  if k not in FINAL_IDENTITY and v is not None}})
-
-print0(f"== {result.run_name} ==", console=True)
-if result.val_bpb is not None:
-    print0(f"  val_bpb {result.val_bpb:.6f} | min {result.min_val_bpb:.6f} | slack {result.slack:+,} vs {VAL_BPB_TARGET:.3f}", console=True)
-print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
+# Step duration summary, steps 0-10 excluded (compile lives there).
 if timed:
-    print0(f"  {cfg.total_batch_size:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.total_batch_size / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
-print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
+    print0(f"  {cfg.total_batch_size:>9,} tokens/step: {len(timed):5d} steps  mean {np.mean(timed):.3f}s  "
+           f"median {np.median(timed):.3f}s  {int(cfg.total_batch_size / np.mean(timed)):,} tok/s", console=True)
 
-for _f in (logfile, metrics_path, result_path):
-    wandb_run.save(_f, policy="now")
+wandb_run.log({"step": cfg.num_steps, "time/train_seconds": np.sum(timed),
+               "time/val_seconds": total_val_time,
+               "time/wall_seconds": time.perf_counter() - run_wall_t0,
+               "time/step_seconds_mean": float(np.mean(timed)) if timed else 0.0})
+
+if val_bpb is not None:
+    print0(f"minimum validation bpb: {min_val_bpb:.6f}", console=True)
+
+wandb_run.save(logfile, policy="now")
 wandb_run.finish()
