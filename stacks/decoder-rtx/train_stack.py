@@ -800,52 +800,6 @@ def muon_step_fused(
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Bigram Prior
-# ------------------------------------------------------------------------------
-
-# Corpus bigram counts (all 91 train shards): bigram_counts[i, j] = how often token j follows token i.
-bigram = np.load(os.path.join(DATASET_DIR, "tokenizer/bigram_counts.npz"))
-bigram_counts = torch.zeros(cfg.d_vocab, cfg.d_vocab, dtype=torch.float32, device=device)
-bigram_counts[torch.from_numpy(np.repeat(np.arange(cfg.d_vocab), np.diff(bigram["train_indptr"]))).to(device),
-              torch.from_numpy(bigram["train_indices"].astype(np.int64)).to(device)] = \
-    torch.from_numpy(bigram["train_data"].astype(np.float32)).to(device)
-del bigram
-
-context_counts = bigram_counts.sum(dim=1, keepdim=True)                                            # (V, 1)
-next_unigram   = (bigram_counts.sum(dim=0) + 0.5) / (bigram_counts.sum() + 0.5 * cfg.d_vocab)     # (V,)
-
-# Smoothed next-token distribution of every context: 3,000 pseudo-counts of the unigram.
-log_bigram = ((bigram_counts + 3000.0 * next_unigram) / (context_counts + 3000.0)).log()          # (V, V)
-del bigram_counts
-
-# The softcapped logits the direct path should produce: each context's best next token at +10.
-log_bigram -= log_bigram.max(dim=1, keepdim=True).values - 10.0
-log_bigram.clamp_(-14.25, 14.25)
-raw_target = 15.0 * torch.atanh(log_bigram / 15.0)                                                 # pre-softcap
-del log_bigram
-
-# Rank-768 factorization, every context weighted by how often it occurs.
-context_weight = (context_counts / context_counts.sum() + 1e-9).sqrt()                            # (V, 1)
-torch.manual_seed(cfg.seed + 1)   # the randomized SVD's test matrix; the weights re-seed below
-U, S, _ = torch.svd_lowrank(context_weight * raw_target, q=cfg.d_model + 64, niter=4)
-embed_prior = U[:, :cfg.d_model] * S[:cfg.d_model].sqrt() / context_weight                          # (V, D)
-del U, S
-
-# The RMS norm keeps only each embedding row's direction: put every row at the stock norm
-# 0.8 * sqrt(D), then solve the head by weighted least squares against the normed rows.
-embed_prior *= 0.8 * cfg.d_model ** 0.5 / embed_prior.norm(dim=1, keepdim=True)
-xe_prior   = embed_prior / 0.8                                                                     # normed rows
-head_prior = torch.linalg.solve((xe_prior.T @ (context_weight ** 2 * xe_prior)).double(),
-                                ((context_weight ** 2 * xe_prior).T @ raw_target).double()).float().T   # (V, D)
-del raw_target, xe_prior, context_counts, context_weight, next_unigram
-
-# Cosine of each normed embedding with its bigram direction; the rest is the stock random draw.
-prior_cos = 1.0
-embed_prior *= prior_cos
-head_prior  /= prior_cos
-
-
-# ------------------------------------------------------------------------------
 # LR Schedule
 # ------------------------------------------------------------------------------
 
@@ -908,7 +862,7 @@ scalar_grad_mult_t = np.ones(cfg.num_steps)
 scalar_configs = [
 #   name,               weights,       peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,   0.005,    0.2,        0.05,   0.05),
-    ("x0_lambdas",      x0_lambdas,      0.5,      0.04,       0.05,   0.0),
+    ("x0_lambdas",      x0_lambdas,      0.1,      0.04,       0.05,   0.0),
     ("bigram_lambdas",  bigram_lambdas,  0.1,      0.04,       0.05,   0.0),
     ("smear_gate",      smear_gate,      0.2,      0.2,        0.05,   0.0),
     ("smear_lambda",    smear_lambda,    0.2,      0.2,        0.05,   0.0),
@@ -963,8 +917,7 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd) in scalar_configs:
 # Embeddings
 # ------------------------------------------------------------------------------
 
-input_embeds =     bf16_empty(cfg.d_vocab, cfg.d_model)
-input_embeds.copy_(fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.8 * (1.0 - prior_cos ** 2) ** 0.5).add_(embed_prior))
+input_embeds =     bf16_zeros(cfg.d_vocab, cfg.d_model)  # + the token frequency prior, below
 value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
 value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
                    .uniform_(-matrix_init_s, matrix_init_s))
@@ -1030,20 +983,7 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd, slots) in embed_configs:
 # LM Head
 # ------------------------------------------------------------------------------
 
-# Halve the head's log-frequency component.
-token_counts = torch.tensor(np.load(os.path.join(DATASET_DIR, "tokenizer/token_counts.npz"))["train"],
-                            dtype=torch.float32, device=device)
-occurrences_per_step = token_counts / token_counts.sum() * cfg.total_batch_size
-freq_weight = occurrences_per_step.clamp_min(1e-3)
-log_freq = (occurrences_per_step + 1e-3).log()
-log_freq = (log_freq - (freq_weight * log_freq).sum() / freq_weight.sum()).unsqueeze(1)           # centred, (V, 1)
-head_mean = (freq_weight.unsqueeze(1) * head_prior).sum(0) / freq_weight.sum()
-freq_direction = ((freq_weight.unsqueeze(1) * log_freq * (head_prior - head_mean)).sum(0)
-                  / (freq_weight * log_freq.squeeze(1).square()).sum())                           # (D,)
-head_prior -= 0.5 * log_freq * freq_direction
-del token_counts, occurrences_per_step, freq_weight, log_freq, head_mean, freq_direction
-
-lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001).add_(head_prior)
+lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001)  # + the token frequency prior, below
 
 # Per-step multiplier on the head's grad mix-ins (1-beta). Constant: no warmup ramp.
 lm_grad_mult_t = np.ones(cfg.num_steps)
@@ -1188,9 +1128,67 @@ for (name, w, peak_lr, rdim) in muon_configs:
     # Add the parameter to the "model" container.
     setattr(m, name, p)
 
-# The Params own everything now: free the fp32 draws and the prior tables, drop the adopted names.
+# The Params own everything now: free the fp32 draws, drop the adopted names.
 del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, W_in, W_out
-del embed_prior, head_prior
+
+
+# ------------------------------------------------------------------------------
+# Token Frequency Priors
+# ------------------------------------------------------------------------------
+
+# Corpus bigram counts (all 91 train shards): bigram_counts[i, j] = how often token j follows token i.
+bigram = np.load(os.path.join(DATASET_DIR, "tokenizer/bigram_counts.npz"))
+bigram_counts = torch.zeros(cfg.d_vocab, cfg.d_vocab, dtype=torch.float32, device=device)
+bigram_counts[torch.from_numpy(np.repeat(np.arange(cfg.d_vocab), np.diff(bigram["train_indptr"]))).to(device),
+              torch.from_numpy(bigram["train_indices"].astype(np.int64)).to(device)] = \
+    torch.from_numpy(bigram["train_data"].astype(np.float32)).to(device)
+del bigram
+
+context_counts = bigram_counts.sum(dim=1, keepdim=True)                                            # (V, 1)
+next_unigram   = (bigram_counts.sum(dim=0) + 0.5) / (bigram_counts.sum() + 0.5 * cfg.d_vocab)     # (V,)
+
+# Smoothed next-token distribution of every context: 3,000 pseudo-counts of the unigram.
+log_bigram = ((bigram_counts + 3000.0 * next_unigram) / (context_counts + 3000.0)).log()          # (V, V)
+del bigram_counts
+
+# The softcapped logits the direct path should produce: each context's best next token at +10.
+log_bigram -= log_bigram.max(dim=1, keepdim=True).values - 10.0
+log_bigram.clamp_(-14.25, 14.25)
+raw_target = 15.0 * torch.atanh(log_bigram / 15.0)                                                 # pre-softcap
+del log_bigram
+
+# Rank-768 factorization, every context weighted by how often it occurs.
+context_weight = (context_counts / context_counts.sum() + 1e-9).sqrt()                            # (V, 1)
+torch.manual_seed(cfg.seed + 1)   # the randomized SVD's test matrix
+U, S, _ = torch.svd_lowrank(context_weight * raw_target, q=cfg.d_model + 64, niter=4)
+embed_prior = U[:, :cfg.d_model] * S[:cfg.d_model].sqrt()                                          # (V, D)
+del U, S
+
+# The RMS norm keeps only each embedding row's direction: put every row at the stock norm
+# 0.8 * sqrt(D), then solve the head by weighted least squares against the normed rows.
+embed_prior *= 0.8 * cfg.d_model ** 0.5 / embed_prior.norm(dim=1, keepdim=True)
+xe_prior   = embed_prior / 0.8                                                                     # normed rows
+head_prior = torch.linalg.solve((xe_prior.T @ (context_weight ** 2 * xe_prior)).double(),
+                                ((context_weight ** 2 * xe_prior).T @ raw_target).double()).float().T   # (V, D)
+del raw_target, xe_prior, context_weight, next_unigram
+
+# Halve the head's log-frequency component. A token's context count is its corpus count
+# (short only the last token of each shard).
+occurrences_per_step = context_counts / context_counts.sum() * cfg.total_batch_size               # (V, 1)
+freq_weight = occurrences_per_step.clamp_min(1e-3)
+log_freq = (occurrences_per_step + 1e-3).log()
+log_freq -= (freq_weight * log_freq).sum() / freq_weight.sum()                                    # centred
+head_mean = (freq_weight * head_prior).sum(0) / freq_weight.sum()
+freq_direction = ((freq_weight * log_freq * (head_prior - head_mean)).sum(0)
+                  / (freq_weight * log_freq.square()).sum())                                      # (D,)
+head_prior -= 0.5 * log_freq * freq_direction
+del context_counts, occurrences_per_step, freq_weight, log_freq, head_mean, freq_direction
+
+# Add the priors to the initialized weights. The head's master lives split across bf16 + mantissa.
+m.input_embeds.w.add_(embed_prior)
+head_master = rebuild_master(m.lm_head.w, m.lm_head.mantissa).add_(head_prior)
+writeback_master(head_master, m.lm_head.w, m.lm_head.mantissa)
+del embed_prior, head_prior, head_master
 
 
 # ------------------------------------------------------------------------------
