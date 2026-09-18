@@ -193,13 +193,13 @@ class Shard:
 # Data Loader
 # ------------------------------------------------------------------------------
 
-def data_generator(split, seq_len, tokens_per_micro, bigram_rows, total_micro_steps=None):
+def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_steps=None):
     """
     Generator (i.e., yields rather than returns) of one micro-batch per call:
     `tokens_per_micro` tokens for "train" and EVAL_BUFFER_TOKENS for "val", as
-    (inputs, targets, bigram_ids, cu_seqlens) device tensors -- the packed varlen
-    layout the forward passes consume. `bigram_rows` maps a micro-batch's input
-    ids to its bigram table rows, on the host.
+    (inputs, targets, rows, cu_seqlens) device tensors -- the packed varlen
+    layout the forward passes consume. `table_rows` maps a micro-batch's input
+    ids to its lookup tables' rows, a (tables, tokens) int32 array, on the host.
     "train" plans and stages all `total_micro_steps` + 1 micro-batches up front,
     placing each document's first cap(i) tokens (see CAP0) and cutting at most
     one document per micro-batch to fill it exactly.
@@ -224,8 +224,8 @@ def data_generator(split, seq_len, tokens_per_micro, bigram_rows, total_micro_st
 
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
         targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)
-        bigram_ids = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
-        inp_np, tgt_np, rows_np = inputs.numpy(), targets.numpy(), bigram_ids.numpy()  # views: write straight into pinned memory
+        rows = torch.empty((num_micro, 3, num_tokens), dtype=torch.int32, pin_memory=True)
+        inp_np, tgt_np, rows_np = inputs.numpy(), targets.numpy(), rows.numpy()  # views: write straight into pinned memory
         starts = [[] for _ in range(num_micro)]
 
         docs = _doc_stream(bos_id)
@@ -252,7 +252,7 @@ def data_generator(split, seq_len, tokens_per_micro, bigram_rows, total_micro_st
                 starts[i].append(pos)
                 pos += n
 
-        # cu_seqlens (checked against the BOS positions in the inputs) and the bigram table rows.
+        # cu_seqlens (checked against the BOS positions in the inputs) and the tables' rows.
         docs_per_micro = np.array([len(s) for s in starts])
         cu_width = max(max_num_docs, 64 * math.ceil((int(docs_per_micro.max()) + 1) / 64))
         cu = torch.full((num_micro, cu_width), num_tokens, dtype=torch.int32, pin_memory=True)
@@ -260,11 +260,11 @@ def data_generator(split, seq_len, tokens_per_micro, bigram_rows, total_micro_st
             b = np.flatnonzero(inp_np[i] == bos_id)
             assert np.array_equal(b, np.array(starts[i])), f"micro-batch {i}: BOS positions != planned starts"
             cu[i, :b.size] = torch.from_numpy(b.astype(np.int32))
-            rows_np[i] = bigram_rows(inp_np[i])
+            rows_np[i] = table_rows(inp_np[i])
 
         train_tokens = num_micro * num_tokens
         print(f"  planned in {time.perf_counter() - t0:.1f}s "
-              f"({(inputs.numel() * 4 + targets.numel() * 8 + bigram_ids.numel() * 4) / 2**30:.1f} GiB pinned): "
+              f"({(inputs.numel() * 4 + targets.numel() * 8 + rows.numel() * 4) / 2**30:.1f} GiB pinned): "
               f"{num_docs:,} docs, {raw_tokens:,} raw tokens -> {train_tokens:,} trained "
               f"({100 * (1 - train_tokens / raw_tokens):.1f}% discarded by the cap and the fill)")
         print(f"  docs per micro-batch: first {docs_per_micro[0]}, mean {docs_per_micro.mean():.0f}, "
@@ -273,7 +273,7 @@ def data_generator(split, seq_len, tokens_per_micro, bigram_rows, total_micro_st
         for i in range(num_micro):
             yield (inputs[i].to("cuda", non_blocking=True),
                    targets[i].to("cuda", non_blocking=True),
-                   bigram_ids[i].to("cuda", non_blocking=True),
+                   rows[i].to("cuda", non_blocking=True),
                    cu[i].to("cuda", non_blocking=True))
         return
 
@@ -352,12 +352,12 @@ def data_generator(split, seq_len, tokens_per_micro, bigram_rows, total_micro_st
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _bigram_ids = torch.from_numpy(bigram_rows(_inputs.numpy()))
+        _rows = torch.from_numpy(table_rows(_inputs.numpy()))
 
         yield (
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
-            _bigram_ids.to(device="cuda", non_blocking=True),
+            _rows.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
         )
         # Execution resumes here on the next call.

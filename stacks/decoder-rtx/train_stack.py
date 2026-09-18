@@ -95,7 +95,9 @@ class StackConfig:
 
     # Input
     d_vocab:    int = 32768
-    d_bigram:   int = 5 * 32768 # 163,840 hashed [prev, curr] token pairs.
+    d_bigram:        int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the residual stream.
+    d_pair_values:   int = 16 * 32768 # 524,288 hashed [prev, curr] pairs, read into the attention values.
+    d_triple_values: int = 8 * 32768  # 262,144 hashed [prev2, prev, curr] triples, likewise.
     d_smr_gate: int = 24    # Gate input is first 24-dims of input embed.
 
     # Attention
@@ -121,7 +123,7 @@ class StackConfig:
     d_mlp:      int = 4 * 768 # 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 412_090_872     # every trained weight (§ Weight Init & Schedule)
+    num_params:          int = 4_111_467_720     # every trained weight (§ Weight Init & Schedule)
     num_flops_per_token: int = 780_929_568     # 6 * 110,100,912 matmul params + attention
 
     # ---- Training ----
@@ -246,6 +248,10 @@ class Model:
     W_O: Param
     value_embeds: Param
     ve_gate:      Param
+    pair_values:   Param  # [prev, curr]-indexed value memory, one table per VE layer.
+    pair_gate:     Param
+    triple_values: Param  # [prev2, prev, curr]-indexed value memory, one table per VE layer.
+    triple_gate:   Param
 
     # MLP
     W_in:  Param
@@ -317,7 +323,7 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
+def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
     """One micro-batch through the model. Use backward=False for validation."""
 
     # Direction naming:
@@ -359,6 +365,9 @@ def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scal
 
     cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, half)
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
+    pair_table   = m.pair_values.w.view(cfg.num_ves, cfg.d_pair_values, -1)
+    triple_table = m.triple_values.w.view(cfg.num_ves, cfg.d_triple_values, -1)
+    bigram_ids, pair_ids, triple_ids = rows   # each table's rows, computed on the host (see table_rows)
     x_backout = None
 
     # -----------------------------
@@ -380,7 +389,7 @@ def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scal
     # The smeared input embedding; also added back to the stream at every layer.
     x0 = torch.cat([x_embed_hat[:1], x_embed_hat[1:] + gate * x_embed_hat[:-1]], dim=0)  # appears as x0b in bwd
 
-    # Bigram embeddings, one row per [prev, curr] token pair (see bigram_rows)
+    # Bigram embeddings, one row per [prev, curr] token pair (see table_rows)
     x_bigram = F.embedding(bigram_ids, m.bigram_embeds.w)  # appears as xb_bigram in bwd
 
     # The residual stream starts as the smeared embedding.
@@ -412,6 +421,14 @@ def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scal
             ve_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_ve_gate] @ m.ve_gate.w[j].mT)
             ve_gate_a = 3 * ve_gate_sig          # (T, n_kv_heads), in [0, 3]
             v = v + ve_gate_a.unsqueeze(-1) * ve # ve and the gate are both recomputed in bwd, not stashed
+
+            # Pair and triple value memories: gated like ve, from the next slices of the stream
+            pair_v = F.embedding(pair_ids, pair_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
+            pair_gate_sig = torch.sigmoid(x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate] @ m.pair_gate.w[j].mT)
+            v = v + (3 * pair_gate_sig).unsqueeze(-1) * pair_v
+            triple_v = F.embedding(triple_ids, triple_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
+            triple_gate_sig = torch.sigmoid(x_biased_hat[..., 2 * cfg.d_ve_gate:3 * cfg.d_ve_gate] @ m.triple_gate.w[j].mT)
+            v = v + (3 * triple_gate_sig).unsqueeze(-1) * triple_v
 
         # RoPE
         q1, q2 = q[..., :half], q[..., half:]
@@ -590,6 +607,8 @@ def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scal
         # --- VE gate backward (ve and ve_gate_sig recomputed) ---
         j = cfg.ve_index[i]
         xb_biased_hat_ve = None
+        xb_biased_hat_pair = None
+        xb_biased_hat_triple = None
         if j >= 0:
             # Retrieve the value embeddings
             ve = F.embedding(idx, ve_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
@@ -612,6 +631,26 @@ def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scal
 
             xb_biased_hat_ve = ve_gateb_z @ m.ve_gate.w[j]
 
+            # --- pair value memory backward (pair_v and pair_gate_sig recomputed) ---
+            pair_v = F.embedding(pair_ids, pair_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
+            pair_gate_sig = torch.sigmoid(x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate] @ m.pair_gate.w[j].mT)
+            pair_gateb_z = (vb * pair_v).sum(dim=-1) * (3 * pair_gate_sig * (1 - pair_gate_sig))   # (T, n_kv_heads)
+            m.pair_gate.gbank[j].add_(pair_gateb_z.mT @ x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate])
+            pair_vb = (vb * (3 * pair_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
+            m.pair_values.gbank[j].add_(
+                torch.ops.aten.embedding_dense_backward(pair_vb.float(), pair_ids, cfg.d_pair_values, -1, False))
+            xb_biased_hat_pair = pair_gateb_z @ m.pair_gate.w[j]
+
+            # --- triple value memory backward (triple_v and triple_gate_sig recomputed) ---
+            triple_v = F.embedding(triple_ids, triple_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
+            triple_gate_sig = torch.sigmoid(x_biased_hat[..., 2 * cfg.d_ve_gate:3 * cfg.d_ve_gate] @ m.triple_gate.w[j].mT)
+            triple_gateb_z = (vb * triple_v).sum(dim=-1) * (3 * triple_gate_sig * (1 - triple_gate_sig))   # (T, n_kv_heads)
+            m.triple_gate.gbank[j].add_(triple_gateb_z.mT @ x_biased_hat[..., 2 * cfg.d_ve_gate:3 * cfg.d_ve_gate])
+            triple_vb = (vb * (3 * triple_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
+            m.triple_values.gbank[j].add_(
+                torch.ops.aten.embedding_dense_backward(triple_vb.float(), triple_ids, cfg.d_triple_values, -1, False))
+            xb_biased_hat_triple = triple_gateb_z @ m.triple_gate.w[j]
+
         # vb passes through the VE add unchanged: v = v0 + ve_gate_a*ve
         qb = qb.view(T, cfg.n_qo_heads * cfg.d_qk)
         kb = kb.view(T, cfg.n_kv_heads * cfg.d_qk)
@@ -624,6 +663,8 @@ def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scal
         xb_biased_hat = qb @ m.W_Q.w[i] + kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
         if xb_biased_hat_ve is not None:
             xb_biased_hat[:, :cfg.d_ve_gate] += xb_biased_hat_ve
+            xb_biased_hat[:, cfg.d_ve_gate:2 * cfg.d_ve_gate] += xb_biased_hat_pair
+            xb_biased_hat[:, 2 * cfg.d_ve_gate:3 * cfg.d_ve_gate] += xb_biased_hat_triple
         xb_biased = xb_attn_out + bf16(st.x_biased_inv_rms * (xb_biased_hat.float() - (x_biased_hat.float() * (x_biased_hat.float() * xb_biased_hat.float()).mean(dim=-1, keepdim=True))))
         # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0_gate*x0 + bigram_lambdas[i]*x_bigram,
         #     x0_gate = 2*sigmoid(x0_gates[i] * mean_c(x_in)) ---
@@ -950,6 +991,8 @@ value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_
                    .uniform_(-matrix_init_s, matrix_init_s))
 
 bigram_embeds = bf16_zeros(cfg.d_bigram, cfg.d_model)
+pair_values  = bf16_zeros(cfg.num_ves * cfg.d_pair_values, cfg.n_kv_heads * cfg.d_vo)
+triple_values = bf16_zeros(cfg.num_ves * cfg.d_triple_values, cfg.n_kv_heads * cfg.d_vo)
 
 ve_rows = cfg.num_ves * cfg.d_vocab
 
@@ -1050,6 +1093,98 @@ m.bigram_embeds = Param(
 
 
 # ------------------------------------------------------------------------------
+# Pair Value Memory
+# ------------------------------------------------------------------------------
+
+# Row-wise RMSProp like the bigram table's, at twice its lr; one second moment per row of every layer's table.
+peak_lr = 0.0368
+b2_grad = 0.005   # (1-Beta2)
+wd      = 0.001
+
+b2_mntm = 1 - b2_grad
+
+pair_values_grad = fp32_zeros(pair_values.shape)
+
+m.pair_values = Param(
+    # Weight
+    name         = "pair_values",
+    w            = pair_values,      # bf16 live, no fp32 master
+    mantissa     = None,
+
+    # Gradients
+    grad         = pair_values_grad,
+    gbank        = list(pair_values_grad.view(cfg.num_ves, cfg.d_pair_values, -1).unbind(0)),
+
+    # Momentum buffers
+    first_mntm   = None,
+    scnd_mntm    = fp32_zeros(cfg.num_ves * cfg.d_pair_values, 1),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+
+    # Weight decay schedule
+    wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+    mntm_b1_t    = None,
+    grad_b1_t    = None,
+
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),   # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+
+
+# ------------------------------------------------------------------------------
+# Triple Value Memory
+# ------------------------------------------------------------------------------
+
+# The same for the triple tables.
+peak_lr = 0.0368
+b2_grad = 0.005   # (1-Beta2)
+wd      = 0.001
+
+b2_mntm = 1 - b2_grad
+
+triple_values_grad = fp32_zeros(triple_values.shape)
+
+m.triple_values = Param(
+    # Weight
+    name         = "triple_values",
+    w            = triple_values,      # bf16 live, no fp32 master
+    mantissa     = None,
+
+    # Gradients
+    grad         = triple_values_grad,
+    gbank        = list(triple_values_grad.view(cfg.num_ves, cfg.d_triple_values, -1).unbind(0)),
+
+    # Momentum buffers
+    first_mntm   = None,
+    scnd_mntm    = fp32_zeros(cfg.num_ves * cfg.d_triple_values, 1),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+
+    # Weight decay schedule
+    wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+    mntm_b1_t    = None,
+    grad_b1_t    = None,
+
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),   # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+
+
+# ------------------------------------------------------------------------------
 # LM Head
 # ------------------------------------------------------------------------------
 
@@ -1114,6 +1249,11 @@ W_V =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_vo, cfg.d_model).uniform
 W_O =   fp32_zeros(cfg.n_layers,               cfg.d_model, cfg.n_qo_heads * cfg.d_vo)  # projections start at zero
 
 ve_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(0.0, 0.02)
+# The value memories' gates draw from their own generators, so the draws above keep their sequence.
+pair_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
+    0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 2))
+triple_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
+    0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 3))
 
 W_in  = fp32_empty(cfg.n_layers, cfg.d_mlp,   cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4)
 W_out = fp32_zeros(cfg.n_layers, cfg.d_model, cfg.d_mlp)             # projections start at zero
@@ -1146,7 +1286,9 @@ muon_configs = [
     ("W_O",     W_O,      0.02,      -2),
     ("W_in",    W_in,     0.04,      -1),
     ("W_out",   W_out,    0.02,      -2),
-    ("ve_gate", ve_gate,  0.02,      -1)
+    ("ve_gate", ve_gate,  0.02,      -1),
+    ("pair_gate", pair_gate,  0.02,      -1),
+    ("triple_gate", triple_gate,  0.02,      -1)
 ]
 
 # For each of the Muon-trained weight banks...
@@ -1199,7 +1341,7 @@ for (name, w, peak_lr, rdim) in muon_configs:
     setattr(m, name, p)
 
 # The Params own everything now: free the fp32 draws, drop the adopted names.
-del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, x0_gates, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, W_in, W_out
+del lm_head, input_embeds, value_embeds, bigram_embeds, pair_values, pair_values_grad, triple_values, triple_values_grad, resid_lambdas, x0_lambdas, x0_gates, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, pair_gate, triple_gate, W_in, W_out
 
 
 # ------------------------------------------------------------------------------
@@ -1463,17 +1605,22 @@ timed = []   # Length of each step in seconds, steps 0-10 excluded.
              # Total training time = np.sum(timed).
 warmup = []  # Those first 11 steps, where the compile lives.
 
-def bigram_rows(tokens):
-    """Hash each [prev, curr] token pair into a bigram slot, on the host (see data_generator)."""
-    rows = np.full_like(tokens, cfg.d_bigram - 1)
-    rows[1:] = np.bitwise_xor(36313 * tokens[1:],
-                              27191 * tokens[:-1]) % (cfg.d_bigram - 1)
+def table_rows(tokens):
+    """Hash each position's [prev, curr] pair into its bigram-table and pair-value rows, and its
+    [prev2, prev, curr] triple into its triple-value row, on the host (see data_generator).
+    A micro-batch's first position(s) take each table's last row."""
+    pair   = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
+    triple = np.bitwise_xor(pair[1:], 50021 * tokens[:-2])
+    rows = np.empty((3, tokens.size), dtype=tokens.dtype)
+    rows[0, :1], rows[0, 1:] = cfg.d_bigram - 1,        pair % (cfg.d_bigram - 1)
+    rows[1, :1], rows[1, 1:] = cfg.d_pair_values - 1,   pair % (cfg.d_pair_values - 1)
+    rows[2, :2], rows[2, 2:] = cfg.d_triple_values - 1, triple % (cfg.d_triple_values - 1)
     return rows
 
-train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens, bigram_rows,
+train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens, table_rows,
                               cfg.num_steps * cfg.grad_accum_steps)
 
-inputs, targets, bigram_ids, cu_seqlens = next(train_loader)   # kick off the first batch
+inputs, targets, rows, cu_seqlens = next(train_loader)   # kick off the first batch
 
 # Training loop
 for step in range(cfg.num_steps + 1):
@@ -1487,12 +1634,12 @@ for step in range(cfg.num_steps + 1):
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens, bigram_rows)
+        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens, table_rows)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
         for micro_i in range(cfg.val_steps):
-            v_inputs, v_targets, v_bigram_ids, v_cu_seqlens = next(val_loader)
-            loss_flat = forward_backward(v_inputs, v_targets, v_bigram_ids, v_cu_seqlens,
+            v_inputs, v_targets, v_rows, v_cu_seqlens = next(val_loader)
+            loss_flat = forward_backward(v_inputs, v_targets, v_rows, v_cu_seqlens,
                                          micro_step=micro_i, backward=False)
             num_bytes_flat = token_bytes[v_targets]
             total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
@@ -1525,23 +1672,27 @@ for step in range(cfg.num_steps + 1):
     for micro_i in range(cfg.grad_accum_steps):
 
         # Forward and Backward pass
-        loss = forward_backward(inputs, targets, bigram_ids, cu_seqlens,
+        loss = forward_backward(inputs, targets, rows, cu_seqlens,
                                 micro_step=micro_i,
                                 loss_scale=1.0 / (cfg.grad_accum_steps * inputs.size(0)))
 
         # Next training batch
-        inputs, targets, bigram_ids, cu_seqlens = next(train_loader)
+        inputs, targets, rows, cu_seqlens = next(train_loader)
 
     # Smooth gradients, update weights, zero the grads
 
     # Muon 
-    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate):
+    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate, m.pair_gate, m.triple_gate):
         muon_step_fused(p, p.grad, t_step)
         p.grad.zero_()
 
     # Row-wise RMSProp
     rmsprop_rows_step_fused(m.bigram_embeds, m.bigram_embeds.grad, t_step)
     m.bigram_embeds.grad.zero_()
+    rmsprop_rows_step_fused(m.pair_values, m.pair_values.grad, t_step)
+    m.pair_values.grad.zero_()
+    rmsprop_rows_step_fused(m.triple_values, m.triple_values.grad, t_step)
+    m.triple_values.grad.zero_()
 
     # AdamW
     for p in (m.lm_head, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
