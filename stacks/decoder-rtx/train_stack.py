@@ -94,11 +94,11 @@ class StackConfig:
     backout_layer: int = 6 # nanochat: n_layers // 2
 
     # Input
-    d_vocab:    int = 32768
+    d_vocab:         int = 32768
     d_bigram:        int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the residual stream.
     d_pair_values:   int = 16 * 32768 # 524,288 hashed [prev, curr] pairs, read into the attention values.
     d_triple_values: int = 8 * 32768  # 262,144 hashed [prev2, prev, curr] triples, likewise.
-    d_smr_gate: int = 24    # Gate input is first 24-dims of input embed.
+    d_smr_gate:      int = 24    # Gate input is first 24-dims of input embed.
 
     # Attention
     n_qo_heads: int = 6
@@ -246,8 +246,8 @@ class Model:
     W_K: Param
     W_V: Param
     W_O: Param
-    value_embeds: Param
-    ve_gate:      Param
+    value_embeds:  Param
+    ve_gate:       Param
     pair_values:   Param  # [prev, curr]-indexed value memory, one table per VE layer.
     pair_gate:     Param
     triple_values: Param  # [prev2, prev, curr]-indexed value memory, one table per VE layer.
@@ -991,7 +991,7 @@ value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_
                    .uniform_(-matrix_init_s, matrix_init_s))
 
 bigram_embeds = bf16_zeros(cfg.d_bigram, cfg.d_model)
-pair_values  = bf16_zeros(cfg.num_ves * cfg.d_pair_values, cfg.n_kv_heads * cfg.d_vo)
+pair_values   = bf16_zeros(cfg.num_ves * cfg.d_pair_values, cfg.n_kv_heads * cfg.d_vo)
 triple_values = bf16_zeros(cfg.num_ves * cfg.d_triple_values, cfg.n_kv_heads * cfg.d_vo)
 
 ve_rows = cfg.num_ves * cfg.d_vocab
@@ -1096,7 +1096,6 @@ m.bigram_embeds = Param(
 # Pair Value Memory
 # ------------------------------------------------------------------------------
 
-# Row-wise RMSProp like the bigram table's, at twice its lr; one second moment per row of every layer's table.
 peak_lr = 0.0368
 b2_grad = 0.005   # (1-Beta2)
 wd      = 0.001
@@ -1142,7 +1141,6 @@ m.pair_values = Param(
 # Triple Value Memory
 # ------------------------------------------------------------------------------
 
-# The same for the triple tables.
 peak_lr = 0.0368
 b2_grad = 0.005   # (1-Beta2)
 wd      = 0.001
@@ -1249,7 +1247,6 @@ W_V =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_vo, cfg.d_model).uniform
 W_O =   fp32_zeros(cfg.n_layers,               cfg.d_model, cfg.n_qo_heads * cfg.d_vo)  # projections start at zero
 
 ve_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(0.0, 0.02)
-# The value memories' gates draw from their own generators, so the draws above keep their sequence.
 pair_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
     0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 2))
 triple_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
@@ -1279,15 +1276,15 @@ muon_wd[1:] = 0.28 * (0.5 * (1.0 + np.cos(math.pi * (1.0 - run_frac))))
 # axis facing the residual stream: W_O and W_out live transposed -> -2; the
 # ve_gate rows read a d_ve_gate slice of the stream -> -1.
 muon_configs = [
-#    name,      weights,  peak lr,  rdim
-    ("W_Q",     W_Q,      0.02,      -1),
-    ("W_K",     W_K,      0.02,      -1),
-    ("W_V",     W_V,      0.02,      -1),
-    ("W_O",     W_O,      0.02,      -2),
-    ("W_in",    W_in,     0.04,      -1),
-    ("W_out",   W_out,    0.02,      -2),
-    ("ve_gate", ve_gate,  0.02,      -1),
-    ("pair_gate", pair_gate,  0.02,      -1),
+#    name,          weights,      peak lr,  rdim
+    ("W_Q",         W_Q,          0.02,      -1),
+    ("W_K",         W_K,          0.02,      -1),
+    ("W_V",         W_V,          0.02,      -1),
+    ("W_O",         W_O,          0.02,      -2),
+    ("W_in",        W_in,         0.04,      -1),
+    ("W_out",       W_out,        0.02,      -2),
+    ("ve_gate",     ve_gate,      0.02,      -1),
+    ("pair_gate",   pair_gate,    0.02,      -1),
     ("triple_gate", triple_gate,  0.02,      -1)
 ]
 
@@ -1606,9 +1603,7 @@ timed = []   # Length of each step in seconds, steps 0-10 excluded.
 warmup = []  # Those first 11 steps, where the compile lives.
 
 def table_rows(tokens):
-    """Hash each position's [prev, curr] pair into its bigram-table and pair-value rows, and its
-    [prev2, prev, curr] triple into its triple-value row, on the host (see data_generator).
-    A micro-batch's first position(s) take each table's last row."""
+    """Hash each position's [prev, curr] pair and [prev2, prev, curr] triple into the three tables' rows, on the host (see data_generator)."""
     pair   = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
     triple = np.bitwise_xor(pair[1:], 50021 * tokens[:-2])
     rows = np.empty((3, tokens.size), dtype=tokens.dtype)
