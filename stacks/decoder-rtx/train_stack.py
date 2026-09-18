@@ -132,7 +132,7 @@ class StackConfig:
     grad_accum_steps:   int
 
     # Training
-    num_steps: int = 2400
+    num_steps: int = 2200
 
     # Evaluation and logging
     val_loss_every:  int = 333
@@ -317,7 +317,7 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
+def forward_backward(idx, targets, bigram_ids, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
     """One micro-batch through the model. Use backward=False for validation."""
 
     # Direction naming:
@@ -380,11 +380,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # The smeared input embedding; also added back to the stream at every layer.
     x0 = torch.cat([x_embed_hat[:1], x_embed_hat[1:] + gate * x_embed_hat[:-1]], dim=0)  # appears as x0b in bwd
 
-    # Hash each [prev, curr] token pair into a bigram slot.
-    bigram_ids = idx.to(torch.int32).clone()
-    bigram_ids[0] = cfg.d_bigram - 1
-    bigram_ids[1:] = torch.bitwise_xor(36313 * bigram_ids[1:],
-                                       27191 * bigram_ids[:-1]) % (cfg.d_bigram - 1)
+    # Bigram embeddings, one row per [prev, curr] token pair (see bigram_rows)
     x_bigram = F.embedding(bigram_ids, m.bigram_embeds.w)  # appears as xb_bigram in bwd
 
     # The residual stream starts as the smeared embedding.
@@ -1467,10 +1463,17 @@ timed = []   # Length of each step in seconds, steps 0-10 excluded.
              # Total training time = np.sum(timed).
 warmup = []  # Those first 11 steps, where the compile lives.
 
-train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens,
+def bigram_rows(tokens):
+    """Hash each [prev, curr] token pair into a bigram slot, on the host (see data_generator)."""
+    rows = np.full_like(tokens, cfg.d_bigram - 1)
+    rows[1:] = np.bitwise_xor(36313 * tokens[1:],
+                              27191 * tokens[:-1]) % (cfg.d_bigram - 1)
+    return rows
+
+train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens, bigram_rows,
                               cfg.num_steps * cfg.grad_accum_steps)
 
-inputs, targets, cu_seqlens = next(train_loader)   # kick off the first batch
+inputs, targets, bigram_ids, cu_seqlens = next(train_loader)   # kick off the first batch
 
 # Training loop
 for step in range(cfg.num_steps + 1):
@@ -1484,12 +1487,13 @@ for step in range(cfg.num_steps + 1):
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens)
+        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens, bigram_rows)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
         for micro_i in range(cfg.val_steps):
-            v_inputs, v_targets, v_cu_seqlens = next(val_loader)
-            loss_flat = forward_backward(v_inputs, v_targets, v_cu_seqlens, micro_step=micro_i, backward=False)
+            v_inputs, v_targets, v_bigram_ids, v_cu_seqlens = next(val_loader)
+            loss_flat = forward_backward(v_inputs, v_targets, v_bigram_ids, v_cu_seqlens,
+                                         micro_step=micro_i, backward=False)
             num_bytes_flat = token_bytes[v_targets]
             total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
             total_bytes += num_bytes_flat.sum()
@@ -1521,12 +1525,12 @@ for step in range(cfg.num_steps + 1):
     for micro_i in range(cfg.grad_accum_steps):
 
         # Forward and Backward pass
-        loss = forward_backward(inputs, targets, cu_seqlens,
+        loss = forward_backward(inputs, targets, bigram_ids, cu_seqlens,
                                 micro_step=micro_i,
                                 loss_scale=1.0 / (cfg.grad_accum_steps * inputs.size(0)))
 
         # Next training batch
-        inputs, targets, cu_seqlens = next(train_loader)
+        inputs, targets, bigram_ids, cu_seqlens = next(train_loader)
 
     # Smooth gradients, update weights, zero the grads
 
