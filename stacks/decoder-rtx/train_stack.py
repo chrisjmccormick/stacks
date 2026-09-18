@@ -121,21 +121,21 @@ class StackConfig:
     d_mlp:      int = 4 * 768 # 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 412_090_861     # every trained weight (§ Weight Init & Schedule)
+    num_params:          int = 412_090_872     # every trained weight (§ Weight Init & Schedule)
     num_flops_per_token: int = 780_929_568     # 6 * 110,100,912 matmul params + attention
 
     # ---- Training ----
 
     # Batch Size
-    micro_batch_tokens: int = 2**18   # 256K tokens per micro-batch
-    total_batch_size:   int = 2**19   # 512K tokens per step
+    micro_batch_tokens: int = 96 * 2048   # 192K tokens per micro-batch
+    total_batch_size:   int = 96 * 2048   # 192K tokens per step
     grad_accum_steps:   int
 
     # Training
-    num_steps: int = 975
+    num_steps: int = 2400
 
     # Evaluation and logging
-    val_loss_every:  int = 125
+    val_loss_every:  int = 333
     val_tokens:      int = 10485760   # 10M tokens per val-bpb pass
     val_steps:       int              # Derived: val micro-batches per pass.
 
@@ -223,12 +223,12 @@ class Param(NamedTuple):
 
     # Schedules (Per-Step Coefficients)
     lr_bc_t:      Tensor    # bias-corrected learning rate
-    wd_t:         Tensor    # weight decay * non-corrected lr; AdamW stores 1 - that
+    wd_t:         Tensor    # weight decay * non-corrected lr; AdamW/RMSProp store 1 - that
     mntm_b1_t:    Tensor    # Beta1
     grad_b1_t:    Tensor    # 1 - Beta1
     mntm_b2_t:    Tensor    # Beta2
     grad_b2_t:    Tensor    # 1 - Beta2
-    eps_t:        Tensor    # AdamW only
+    eps_t:        Tensor    # AdamW and RMSProp
 
 class Model:
     """Container for the model's weights, plus RoPE buffers"""
@@ -253,6 +253,7 @@ class Model:
 
     # Cross-Layer
     x0_lambdas:     Param   # Per-layer coefficient for reading the input embedding.
+    x0_gates:       Param   # Per-layer scale on the channel-mean gate of that read.
     bigram_lambdas: Param   # Per-layer coefficient for reading the bigram embedding.
     resid_lambdas:  Param   # Per-layer gain on the residual stream.
     backout_lambda: Param
@@ -340,9 +341,9 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # *_inv_rms  - 1/rms, used by RMS norm fwd and bwd.
     # *_hat      - RMS-normed  (x_hat = x * inv_rms)
     #
-    # Activation naming -- the MLP and both gates share three stages:
+    # Activation naming -- the MLP and the gates share three stages:
     # *_z        - Pre-nonlinearity, the raw matmul output. Only ever named in
-    #              bwd (mlpb_z, ve_gateb_z, gateb_z); inlined in fwd.
+    #              bwd (mlpb_z, ve_gateb_z, gateb_z, x0_gateb_z); inlined in fwd.
     #              ('logit' is reserved for the lm_head's output.)
     # *_relu     - Post-relu, pre-square (MLP only; the stashed half of relu^2).
     # *_sig      - Post-sigmoid, in [0, 1] (gates only; recomputed in bwd).
@@ -396,8 +397,9 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     for i in range(cfg.n_layers):
         x_in = x
 
-        # Scale residual stream, add input and bigram embeddings
-        x_biased = (m.resid_lambdas.w[i] * x_in + m.x0_lambdas.w[i] * x0
+        # Scale residual stream, add gated input and bigram embeddings
+        x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
+        x_biased = (m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
                     + m.bigram_lambdas.w[i] * x_bigram)
         x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
@@ -521,7 +523,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
 
     # Scalar grads are collected, grad tensors updated at the end.
-    g_resid = []; g_x0 = []; g_bigram = []
+    g_resid = []; g_x0 = []; g_bigram = []; g_x0_gate = []
 
     # Each stream's cosine similarity to the vocab signal, divided by d_model.
     # (T, 1) = ((T, d_model) * (T, d_model)).mean()
@@ -627,22 +629,29 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         if xb_biased_hat_ve is not None:
             xb_biased_hat[:, :cfg.d_ve_gate] += xb_biased_hat_ve
         xb_biased = xb_attn_out + bf16(st.x_biased_inv_rms * (xb_biased_hat.float() - (x_biased_hat.float() * (x_biased_hat.float() * xb_biased_hat.float()).mean(dim=-1, keepdim=True))))
-        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0 + bigram_lambdas[i]*x_bigram ---
+        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0_gate*x0 + bigram_lambdas[i]*x_bigram,
+        #     x0_gate = 2*sigmoid(x0_gates[i] * mean_c(x_in)) ---
+        x_in_mean  = st.x_in.float().mean(dim=-1, keepdim=True)                         # (T, 1)
+        x0_gate    = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in_mean)                   # (T, 1)
+        x0_dot     = (xb_biased * x0).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
+        x0_gateb_z = x0_dot * m.x0_lambdas.w[i] * x0_gate * (1.0 - 0.5 * x0_gate)       # (T, 1)
         if is_last_micro:
             g_resid.append(sum32(xb_biased * st.x_in))
-            g_x0.append(sum32(xb_biased * x0))
+            g_x0.append((x0_dot * x0_gate).sum())
             g_bigram.append(sum32(xb_biased * x_bigram))
-        x0b = x0b + m.x0_lambdas.w[i] * xb_biased  # TRAP: x0 feeds every layer, accumulate
+            g_x0_gate.append((x0_gateb_z * x_in_mean).sum())
+        x0b = x0b + bf16(m.x0_lambdas.w[i] * x0_gate) * xb_biased  # TRAP: x0 feeds every layer, accumulate
         xb_bigram = xb_bigram + m.bigram_lambdas.w[i] * xb_biased  # TRAP: x_bigram feeds every layer, accumulate
-        xb = m.resid_lambdas.w[i] * xb_biased
+        xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
         stash[i] = None                          # free this layer's stash as we go
 
-    # Land the per-layer resid/x0/bigram scalar sums (collected in REVERSED
+    # Land the per-layer resid/x0/bigram/x0-gate scalar sums (collected in REVERSED
     # layer order) as one stacked add each.
     if is_last_micro:
         m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
         m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
         m.bigram_lambdas.grad.add_(torch.stack(g_bigram[::-1]))
+        m.x0_gates.grad.add_(torch.stack(g_x0_gate[::-1]))
 
     # xb is now the grad through layer 0's input, which IS x0 (same tensor), so
     # it folds into x0b to give the full grad wrt the smeared embedding.
@@ -664,7 +673,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     m.input_embeds.grad.add_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
     m.bigram_embeds.grad.add_(
-        torch.ops.aten.embedding_dense_backward(xb_bigram, bigram_ids, cfg.d_bigram, -1, False))
+        torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_ids, cfg.d_bigram, -1, False))
 
     return loss
 
@@ -722,6 +731,33 @@ def adamw_step_fused(
         writeback_master(master, p.w, p.mantissa)
     else:
         p.w.copy_(master)
+
+
+# ------------------------------------------------------------------------------
+# Row-wise RMSProp (the bigram table)
+# ------------------------------------------------------------------------------
+
+@torch.compile(dynamic=False, fullgraph=True)
+def rmsprop_rows_step_fused(
+    p: Param,
+    grad: Tensor,   # (rows, cols) fp32
+    t: Tensor,      # (1,) Current step for schedules
+) -> None:
+    """Row-wise RMSProp update of `p`."""
+
+    # ==== Buffer Update ====
+    p.scnd_mntm.mul_(p.mntm_b2_t[t]).add_(grad.square().mean(dim=-1, keepdim=True) * p.grad_b2_t[t])  # v = beta2*v + (1 - beta2)*mean_c(g^2)
+
+    # ==== Parameter Update ====
+    master = p.w.float()
+
+    # Apply weight decay inplace
+    master.mul_(p.wd_t[t])
+
+    # Apply RMSProp's update inplace, w = w + lr * (g / (sqrt(v) + eps))
+    master.add_(p.lr_bc_t[t] * (grad / (p.scnd_mntm.sqrt() + p.eps_t[t])))
+
+    p.w.copy_(master)
 
 
 # ------------------------------------------------------------------------------
@@ -796,7 +832,7 @@ def muon_step_fused(
 # ------------------------------------------------------------------------------
 
 # Learning rate schedule as a per-step multiplier.
-# Shared by Muon and AdamW. No warmup: peak from step 0.
+# Shared by Muon, AdamW and RMSProp. No warmup: peak from step 0.
 lr_mult_t = np.ones(cfg.num_steps)
 
 steps_0idx = np.arange(cfg.num_steps, dtype=np.float64)  # 0-based, the way the loop counts
@@ -841,6 +877,7 @@ dev = lambda a: torch.tensor(a, dtype=torch.float32, device=device)
 
 resid_lambdas  = torch.linspace(1.15, 1.05, cfg.n_layers, dtype=torch.float32, device=device)
 x0_lambdas     = torch.linspace(0.20, 0.05, cfg.n_layers, dtype=torch.float32, device=device)
+x0_gates       = fp32_zeros(cfg.n_layers)
 bigram_lambdas = fp32_empty(cfg.n_layers).fill_(0.1)
 smear_lambda   = fp32_zeros(1)
 backout_lambda = fp32_empty(1).fill_(0.2)
@@ -855,6 +892,7 @@ scalar_configs = [
 #   name,               weights,       peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,   0.005,    0.2,        0.05,   0.05),
     ("x0_lambdas",      x0_lambdas,      0.1,      0.04,       0.05,   0.0),
+    ("x0_gates",        x0_gates,        0.1,      0.04,       0.05,   0.0),
     ("bigram_lambdas",  bigram_lambdas,  0.1,      0.04,       0.05,   0.0),
     ("smear_gate",      smear_gate,      0.2,      0.2,        0.05,   0.0),
     ("smear_lambda",    smear_lambda,    0.2,      0.2,        0.05,   0.0),
@@ -921,9 +959,8 @@ ve_rows = cfg.num_ves * cfg.d_vocab
 
 embed_configs = [
 #   name,             weights,       peak lr,  b1_grad,  b2_grad,  wd,       slots
-    ("input_embeds",  input_embeds,  0.3,      0.2,      0.005,    0.001,   1),
-    ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves),
-    ("bigram_embeds", bigram_embeds, 0.03,     0.2,      0.005,    0.001,   1)
+    ("input_embeds",  input_embeds,  0.1837,   0.2,      0.005,    0.001,   1),
+    ("value_embeds",  value_embeds,  0.0919,   0.2,      0.005,    0.01,   cfg.num_ves)
 ]
 
 # For each of the embedding tables...
@@ -973,6 +1010,50 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd, slots) in embed_configs:
 
 
 # ------------------------------------------------------------------------------
+# Bigram Table
+# ------------------------------------------------------------------------------
+
+peak_lr = 0.0184
+b2_grad = 0.005   # (1-Beta2)
+wd      = 0.001
+
+# Derive the momentum buffer's decay.
+b2_mntm = 1 - b2_grad
+
+m.bigram_embeds = Param(
+    # Weight
+    name         = "bigram_embeds",
+    w            = bigram_embeds,      # bf16 live, no fp32 master
+    mantissa     = None,
+
+    # Gradients
+    grad         = fp32_zeros(bigram_embeds.shape),
+    gbank        = None,
+
+    # Momentum buffers
+    first_mntm   = None,
+    scnd_mntm    = fp32_zeros(cfg.d_bigram, 1),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+
+    # Weight decay schedule
+    wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+    mntm_b1_t    = None,
+    grad_b1_t    = None,
+
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),   # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+
+
+# ------------------------------------------------------------------------------
 # LM Head
 # ------------------------------------------------------------------------------
 
@@ -981,7 +1062,7 @@ lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001)  # +
 # Per-step multiplier on the head's grad mix-ins (1-beta). Constant: no warmup ramp.
 lm_grad_mult_t = np.ones(cfg.num_steps)
 
-peak_lr = 0.008
+peak_lr = 0.0049
 b1_grad = 0.2    # (1-Beta1)
 b2_grad = 0.04   # (1-Beta2)
 wd      = 0.01
@@ -1122,7 +1203,7 @@ for (name, w, peak_lr, rdim) in muon_configs:
     setattr(m, name, p)
 
 # The Params own everything now: free the fp32 draws, drop the adopted names.
-del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, W_in, W_out
+del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, x0_gates, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, W_in, W_out
 
 
 # ------------------------------------------------------------------------------
@@ -1454,9 +1535,13 @@ for step in range(cfg.num_steps + 1):
         muon_step_fused(p, p.grad, t_step)
         p.grad.zero_()
 
+    # Row-wise RMSProp
+    rmsprop_rows_step_fused(m.bigram_embeds, m.bigram_embeds.grad, t_step)
+    m.bigram_embeds.grad.zero_()
+
     # AdamW
-    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.bigram_embeds, m.resid_lambdas, m.x0_lambdas, \
-              m.bigram_lambdas, m.smear_gate, m.smear_lambda, m.backout_lambda):
+    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
+              m.x0_gates, m.bigram_lambdas, m.smear_gate, m.smear_lambda, m.backout_lambda):
         # Run AdamW
         adamw_step_fused(p, p.grad, t_step)
         p.grad.zero_()
