@@ -64,10 +64,6 @@ from utils import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dat
                    flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
 
 dynamo.config.recompile_limit = 64
-# Benchmark the matmul backends per shape rather than take cuBLAS's heuristic pick.
-torch._inductor.config.max_autotune_gemm = True
-torch._inductor.config.autotune_in_subproc = True
-
 # Confirm Ampere or newer
 assert torch.cuda.is_available(), "no GPU -- Runtime > Change runtime type > A100"
 
@@ -298,8 +294,8 @@ class LayerStash(NamedTuple):
     v:                  Tensor    # (L,  T, n_kv, d_vo)        4.5GB
     y:                  Tensor    # (L,  T, n_qo, d_vo)        4.5GB
     lse:                Tensor    # (L,  n_qo,  T)        fp32         (18MB)
-    x_attn_out:         Tensor    # (L,  T,     D)             4.5GB
-    #x_attn_out_hat:    Tensor    # (L,  T,     D)                              4.5GB
+    x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
+    x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
     mlp_a:              Tensor    # (L,  T, d_mlp)              18GB
     #mlp_a:             Tensor    # (L,  T, d_mlp)                               18GB
     #                                                         ------           ------
@@ -453,9 +449,10 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
         # Write back to the stream.
         x_attn_out = x_biased + attn_out
 
-        # MLP input norm
-        # Recomputed in backward pass to save memory.
-        x_attn_out_hat = bf16(x_attn_out.float() * (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt())
+        # MLP input norm. Stashed rather than recomputed: the normed tensor is the
+        # same size as x_attn_out and is all the backward wants from it.
+        x_attn_out_inv_rms = (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        x_attn_out_hat = bf16(x_attn_out.float() * x_attn_out_inv_rms)
 
         # MLP
         mlp_a = F.relu(x_attn_out_hat @ m.W_in.w[i].mT).square()   # (T, d_mlp) - (64K, 3K) stashed
@@ -472,7 +469,8 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
         if backward:
             stash.append(LayerStash(x_in=x_in, x_biased_hat=x_biased_hat, x_biased_inv_rms=x_biased_inv_rms,
                                     q_hat=q_hat, k_hat=k_hat, q_inv_rms=q_inv_rms, k_inv_rms=k_inv_rms,
-                                    v=v, y=y, lse=lse, x_attn_out=x_attn_out, mlp_a=mlp_a))
+                                    v=v, y=y, lse=lse, x_attn_out_hat=x_attn_out_hat,
+                                    x_attn_out_inv_rms=x_attn_out_inv_rms, mlp_a=mlp_a))
 
     x_final = x - bf16(m.backout_lambda.w) * x_backout # TODO - backout lambda could be bf16 instead.
 
@@ -595,9 +593,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
         # Grad w.r.t. the pre-relu matmul output (mlpb_a = xb @ W_out is inline)
         mlpb_z = 2.0 * st.mlp_a.sqrt() * (xb @ m.W_out.w[i])
 
-        # Recompute the MLP input norm
-        x_attn_out_inv_rms = (st.x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
-        x_attn_out_hat = bf16(st.x_attn_out.float() * x_attn_out_inv_rms)
+        x_attn_out_inv_rms, x_attn_out_hat = st.x_attn_out_inv_rms, st.x_attn_out_hat
 
         # Grad w.r.t. W_in
         m.W_in.gbank[i].copy_(mlpb_z.mT @ x_attn_out_hat) # (d_mlp, T) @ (T, d_model)
@@ -658,6 +654,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
             m.pair_gate.gbank[j].copy_(pair_gateb_z.mT @ x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate])
             pair_vb = (vb * (3 * pair_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
             pair_code_vb = pair_code_vb + pair_vb
+
             # Row-wise RMSProp on this slot, at its gradient. v = beta2*v +
             # (1 - beta2)*mean_c(g^2); w = w*wd + lr * g / (sqrt(v) + eps), with the
             # wd carried in pair_w_scale so untouched rows need no write.
@@ -731,6 +728,8 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
     xb_embed = bf16(x_embed_inv_rms * (xb_embed_hat.float() - (x_embed_hat.float() * (x_embed_hat.float() * xb_embed_hat.float()).mean(dim=-1, keepdim=True))))
     m.input_embeds.grad.copy_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
+
+    # Row-wise RMSProp on the bigram table, same shape as the pair slots' above.
     bigram_grad = torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_inverse, T, -1, False)
     m.bigram_embeds.scnd_mntm.mul_(m.bigram_embeds.mntm_b2_t[t_step])
     bigram_mntm = (m.bigram_embeds.scnd_mntm.index_select(0, bigram_rows)
