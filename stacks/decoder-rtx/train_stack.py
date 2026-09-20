@@ -95,8 +95,8 @@ class StackConfig:
 
     # Input
     d_vocab:         int = 32768
-    d_bigram:        int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the residual stream.
-    d_pair_values:   int = 16 * 32768 # 524,288 hashed [prev, curr] pairs, read into the attention values.
+    d_bigram:        int = 64 * 32768 # 2,097,152 hashed [prev, curr] pairs, read into the residual stream.
+    d_pair_values:   int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the attention values.
     d_pair_code:     int = 64 * 32768 # 2,097,152 frequent [prev, curr] pairs with a frozen corpus code, likewise.
     d_smr_gate:      int = 24    # Gate input is first 24-dims of input embed.
 
@@ -130,10 +130,10 @@ class StackConfig:
 
     # Batch Size
     micro_batch_tokens: int = 96 * 2048   # 192K tokens per micro-batch
-    total_batch_size:   int = 96 * 2048   # 192K tokens per step -- one micro-batch, see below
+    total_batch_size:   int = 96 * 2048   # 192K tokens per step
 
     # Training
-    num_steps: int = 1760
+    num_steps: int = 1717
 
     # Evaluation and logging
     val_loss_every:  int = 333
@@ -142,7 +142,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "baseline"  # both wandb and log files
+    run_name:        str = "baseline4"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -181,10 +181,8 @@ cfg.window_sizes = [(cfg.short_win_size, 0)] * cfg.n_layers  # All short, ...
 for i in cfg.full_ctxt_layers:
     cfg.window_sizes[i] = (cfg.seq_len, 0)                   # ... then overwrite with full.
 
-# One micro-batch per step is wired into the script: every gradient buffer is written
-# exactly once per step, so the writes are copy_ and there is no zeroing pass.
-assert cfg.total_batch_size == cfg.micro_batch_tokens, "the step is one micro-batch"
-cfg.val_steps =        cfg.val_tokens       // EVAL_BUFFER_TOKENS
+assert cfg.total_batch_size == cfg.micro_batch_tokens, "one micro-batch per step"
+cfg.val_steps = cfg.val_tokens // EVAL_BUFFER_TOKENS
 
 VAL_BPB_TARGET = 0.900
 
@@ -280,7 +278,7 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=256K  -->  Held: 49.5GB,  Recomputed:  24.75GB
+    For T=256K  -->  Held: 49.5GB,  Recomputed:   2.25GB
     """
     #                                                            Stash (Tiny) Recompute
     x_in:               Tensor    # (L,  T,    D)              4.5GB
@@ -298,9 +296,8 @@ class LayerStash(NamedTuple):
     x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
     x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
     mlp_a:              Tensor    # (L,  T, d_mlp)              18GB
-    #mlp_a:             Tensor    # (L,  T, d_mlp)                               18GB
     #                                                         ------           ------
-    #                                                 TOTAL:  49.5GB          24.75GB
+    #                                                 TOTAL:  49.5GB           2.25GB
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          384MB    layer-blend + smear backward
@@ -352,9 +349,8 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # *_z        - Pre-nonlinearity, the raw matmul output. Only ever named in
     #              bwd (mlpb_z, ve_gateb_z, gateb_z, x0_gateb_z); inlined in fwd.
     #              ('logit' is reserved for the lm_head's output.)
-    # *_relu     - Post-relu, pre-square (MLP only; the stashed half of relu^2).
     # *_sig      - Post-sigmoid, in [0, 1] (gates only; recomputed in bwd).
-    # *_a        - The final activation handed onward: mlp_a = mlp_relu^2,
+    # *_a        - The final activation handed onward: mlp_a = relu(z)^2,
     #              ve_gate_a = 3*ve_gate_sig. The smear gate's is just 'gate'.
 
     assert idx.ndim == 1
@@ -450,8 +446,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         # Write back to the stream.
         x_attn_out = x_biased + attn_out
 
-        # MLP input norm. Stashed rather than recomputed: the normed tensor is the
-        # same size as x_attn_out and is all the backward wants from it.
+        # MLP input norm. Stashed, not recomputed.
         x_attn_out_inv_rms = (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         x_attn_out_hat = bf16(x_attn_out.float() * x_attn_out_inv_rms)
 
@@ -531,9 +526,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # -----------------------------
     #           Backward
     # -----------------------------
-    # Compact each table's rows: sorting the ids numbers the distinct ones, so the
-    # gradient accumulates over T rows rather than the table's. Slots past the last
-    # distinct row point at the table's scratch row and land a zero update.
+    # Compact each table's rows; padding points at the table's scratch row.
     def compact_rows(ids, scratch_row):
         order = ids.argsort()
         ids_sorted = ids[order]
@@ -548,7 +541,6 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     pair_inverse, pair_rows = compact_rows(pair_ids, cfg.d_pair_values)
     bigram_inverse, bigram_rows = compact_rows(bigram_ids, cfg.d_bigram)
 
-    # This step's decay, applied to the scale rather than to the tables.
     pair_w_scale_next = pair_w_scale * m.pair_values.wd_t[t_step]
     bigram_w_scale_next = bigram_w_scale * m.bigram_embeds.wd_t[t_step]
 
@@ -581,7 +573,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
             # TRAP: x_backout gets an EXTRA contribution when the sweep passes num_layers//2
             xb = xb - bf16(m.backout_lambda.w) * xb_final
 
-        # --- MLP backward (relu^2: mlpb_z = 2*mlp_relu*mlpb_a, self-masking
+        # --- MLP backward (relu^2: mlpb_z = 2*sqrt(mlp_a)*mlpb_a, self-masking
         #     since sqrt(mlp_a) is already 0 where z < 0) ---
 
         # Grad w.r.t. W_out
@@ -652,11 +644,9 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
             pair_vb = (vb * (3 * pair_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
             pair_code_vb = pair_code_vb + pair_vb
 
-            # Row-wise RMSProp on this slot, at its gradient. v = beta2*v +
-            # (1 - beta2)*mean_c(g^2); w = w*wd + lr * g / (sqrt(v) + eps), with the
-            # wd carried in pair_w_scale so untouched rows need no write.
+            # Row-wise RMSProp on this slot, fused in at its gradient.
             pair_grad = torch.ops.aten.embedding_dense_backward(pair_vb.float(), pair_inverse, T, -1, False)
-            pair_vbank[j].mul_(m.pair_values.mntm_b2_t[t_step])   # (rows, 1) fp32, 2 MB -- dense is free
+            pair_vbank[j].mul_(m.pair_values.mntm_b2_t[t_step])   # (rows, 1) fp32
             pair_slot_mntm = (pair_vbank[j].index_select(0, pair_rows)
                               + pair_grad.square().mean(dim=-1, keepdim=True) * m.pair_values.grad_b2_t[t_step])
             pair_vbank[j].index_copy_(0, pair_rows, pair_slot_mntm)
@@ -724,7 +714,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     m.input_embeds.grad.copy_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
 
-    # Row-wise RMSProp on the bigram table, same shape as the pair slots' above.
+    # Row-wise RMSProp on the bigram table.
     bigram_grad = torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_inverse, T, -1, False)
     m.bigram_embeds.scnd_mntm.mul_(m.bigram_embeds.mntm_b2_t[t_step])
     bigram_mntm = (m.bigram_embeds.scnd_mntm.index_select(0, bigram_rows)
@@ -1089,8 +1079,7 @@ m.bigram_embeds = Param(
     eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
 )
 
-# The cumulative weight decay the rows have not had applied to them: the live weight
-# is the stored row times this.
+# The weight decay the rows have not had applied: the live weight is the row times this.
 bigram_w_scale = fp32_empty(1).fill_(1.0)
 
 
@@ -1136,13 +1125,11 @@ m.pair_values = Param(
     eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
 )
 
-# The table's five slots as standalone tensors: the fused RMSProp writes one whole,
-# where a write through a (slots, rows, cols) view lowers to a whole-table scatter.
+# The table's five slots as standalone tensors, so each update writes a whole one.
 pair_wbank = list(pair_values.view(cfg.num_ves, cfg.d_pair_values + 1, -1).unbind(0))
 pair_vbank = list(m.pair_values.scnd_mntm.view(cfg.num_ves, cfg.d_pair_values + 1, 1).unbind(0))
 
-# The cumulative weight decay the rows have not had applied to them: the live weight
-# is the stored row times this.
+# The weight decay the rows have not had applied: the live weight is the row times this.
 pair_w_scale = fp32_empty(1).fill_(1.0)
 
 
@@ -1668,7 +1655,7 @@ for step in range(cfg.num_steps + 1):
     # Next training batch
     inputs, targets, rows, cu_seqlens = next(train_loader)
 
-    # Smooth gradients, update weights, zero the grads
+    # Smooth gradients, update weights
 
     # Muon 
     for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate, m.pair_gate, m.pair_decoder):
