@@ -60,10 +60,15 @@ import torch._dynamo as dynamo
 import torch.nn.functional as F
 from torch import Tensor
 
+from torch._inductor.codecache import CacheBase
+
 from utils import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dataset,
                    flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
 
 dynamo.config.recompile_limit = 64
+# Matmul backend chosen per shape, read from the cache shipped beside this script.
+torch._inductor.config.max_autotune_gemm = True
+torch._inductor.config.autotune_in_subproc = False
 # Confirm Ampere or newer
 assert torch.cuda.is_available(), "no GPU -- Runtime > Change runtime type > A100"
 
@@ -73,6 +78,13 @@ assert props.major >= 8, f"needs Ampere or newer (got sm{props.major}{props.mino
 
 device = torch.device("cuda", 0)
 torch.cuda.set_device(device)
+
+# Install the shipped autotune cache, if it was measured on this GPU, triton and CUDA.
+autotune_cache = Path(CacheBase.get_local_cache_path())
+shipped_cache = json.loads((Path(sys.argv[0]).resolve().parent / "autotune_cache.json").read_text())
+if not autotune_cache.is_file() and shipped_cache["system"] == CacheBase.get_system():
+    autotune_cache.parent.mkdir(parents=True, exist_ok=True)
+    autotune_cache.write_text(json.dumps(shipped_cache))
 
 # ==============================================================================
 # § Configuration
@@ -129,11 +141,10 @@ class StackConfig:
     # ---- Training ----
 
     # Batch Size
-    micro_batch_tokens: int = 96 * 2048   # 192K tokens per micro-batch
-    total_batch_size:   int = 96 * 2048   # 192K tokens per step
+    train_batch_tokens: int = 96 * 2048   # 192K tokens per step
 
     # Training
-    num_steps: int = 1717
+    num_steps: int = 1740
 
     # Evaluation and logging
     val_loss_every:  int = 333
@@ -181,7 +192,6 @@ cfg.window_sizes = [(cfg.short_win_size, 0)] * cfg.n_layers  # All short, ...
 for i in cfg.full_ctxt_layers:
     cfg.window_sizes[i] = (cfg.seq_len, 0)                   # ... then overwrite with full.
 
-assert cfg.total_batch_size == cfg.micro_batch_tokens, "one micro-batch per step"
 cfg.val_steps = cfg.val_tokens // EVAL_BUFFER_TOKENS
 
 VAL_BPB_TARGET = 0.900
@@ -1332,7 +1342,7 @@ head_prior = torch.linalg.solve((xe_prior.T @ (context_weight ** 2 * xe_prior)).
 del raw_target, xe_prior, context_weight, next_unigram
 
 # Halve the head's log-frequency component.
-occurrences_per_step = context_counts / context_counts.sum() * cfg.total_batch_size               # (V, 1)
+occurrences_per_step = context_counts / context_counts.sum() * cfg.train_batch_tokens               # (V, 1)
 freq_weight = occurrences_per_step.clamp_min(1e-3)
 log_freq = (occurrences_per_step + 1e-3).log()
 log_freq -= (freq_weight * log_freq).sum() / freq_weight.sum()                                    # centred
@@ -1388,7 +1398,7 @@ del covariance, code_rows, eigenvalues, eigenvectors, whitening
 # §§ Rotary Cache
 # ------------------------------------------------------------------------------
 
-rotary_seq_len = cfg.micro_batch_tokens
+rotary_seq_len = cfg.train_batch_tokens
 channel_range = torch.arange(0, cfg.d_qk, 2, dtype=torch.float32, device=device)  # stride the channels
 inv_freq = 1.0 / (100000 ** (channel_range / cfg.d_qk))
 t_pos = torch.arange(rotary_seq_len, dtype=torch.float32, device=device)          # stride the time steps
@@ -1452,7 +1462,7 @@ class RunResult:
     # Identity, for the JSON; wandb has these from the run name and config
     run_name:         str          = ""
     num_steps:        int          = 0
-    total_batch_size: int          = 0
+    train_batch_tokens: int        = 0
 
     # The result
     val_bpb:          float | None = None
@@ -1471,7 +1481,7 @@ class RunResult:
     peak_mem_gb:      float        = 0.0
 
 
-FINAL_IDENTITY = ("run_name", "num_steps", "total_batch_size")
+FINAL_IDENTITY = ("run_name", "num_steps", "train_batch_tokens")
 
 
 # ------------------------------------------------------------------------------
@@ -1511,7 +1521,7 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 
 print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token: {cfg.num_flops_per_token:e}", console=True)
 print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", console=True)
-print0(f"Total batch size: {cfg.total_batch_size:,} tokens, one micro-batch per step", console=True)
+print0(f"Batch size: {cfg.train_batch_tokens:,} tokens per step", console=True)
 
 # A flat row per step and the result, for analysis without wandb.
 metrics_path = f"logs/{cfg.run_name}_metrics.csv"
@@ -1597,7 +1607,7 @@ def table_rows(tokens):
     rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(pair_code_keys[code_row] == pair_key, code_row, cfg.d_pair_code)
     return rows
 
-train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens, table_rows,
+train_loader = data_generator("train", cfg.seq_len, cfg.train_batch_tokens, table_rows,
                               cfg.num_steps)
 
 inputs, targets, rows, cu_seqlens = next(train_loader)   # kick off the first batch
@@ -1614,7 +1624,7 @@ for step in range(cfg.num_steps + 1):
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens, table_rows)
+        val_loader = data_generator("val", cfg.seq_len, cfg.train_batch_tokens, table_rows)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
         for _ in range(cfg.val_steps):
@@ -1689,8 +1699,8 @@ for step in range(cfg.num_steps + 1):
         warmup.append(dt)
         eta_str = ""
 
-    tok_per_sec = int(cfg.total_batch_size / dt)
-    mfu = 100 * cfg.num_flops_per_token * cfg.total_batch_size / dt / gpu_peak_flops
+    tok_per_sec = int(cfg.train_batch_tokens / dt)
+    mfu = 100 * cfg.num_flops_per_token * cfg.train_batch_tokens / dt / gpu_peak_flops
 
     print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lr_mult_t: {lr_mult_t[step]:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
 
@@ -1739,7 +1749,7 @@ compile_time = max(0.0, np.sum(warmup) - len(warmup) * avg_step_time)
 result = RunResult(
     run_name         = cfg.run_name,
     num_steps        = cfg.num_steps,
-    total_batch_size = cfg.total_batch_size,
+    train_batch_tokens = cfg.train_batch_tokens,
 
     train_time       = float(np.sum(timed)) / 60,
     val_time         = total_val_time / 60,
@@ -1747,7 +1757,7 @@ result = RunResult(
     wall_time        = (time.perf_counter() - run_wall_t0) / 60,
 
     avg_step_time    = avg_step_time,
-    avg_mfu          = (100 * cfg.num_flops_per_token * cfg.total_batch_size
+    avg_mfu          = (100 * cfg.num_flops_per_token * cfg.train_batch_tokens
                         / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
     peak_mem_gb      = torch.cuda.max_memory_reserved() / 2**30,
 )
@@ -1767,7 +1777,7 @@ if result.val_bpb is not None:
     print0(f"  val_bpb {result.val_bpb:.6f} | min {result.min_val_bpb:.6f} | slack {result.slack:+,} vs {VAL_BPB_TARGET:.3f}", console=True)
 print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
-    print0(f"  {cfg.total_batch_size:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.total_batch_size / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
+    print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
 print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
 
 for _f in (logfile, metrics_path, result_path):
