@@ -250,7 +250,7 @@ class Model:
     ve_gate:       Param
     pair_values:   Param  # [prev, curr]-indexed value memory, one table per VE layer.
     pair_gate:     Param
-    pair_code:     Tensor # Frozen: each frequent pair's corpus code; its last row, zeros, is every other pair's.
+    pair_code:     Tensor # Frozen corpus code per frequent [prev, curr] pair; last row is zeros.
     pair_decoder:  Param  # Reads a pair's code into the value space, once for all VE layers.
 
     # MLP
@@ -365,10 +365,10 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
 
     cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, half)
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
-    pair_table   = m.pair_values.w.view(cfg.num_ves, cfg.d_pair_values, -1)
+    pair_table = m.pair_values.w.view(cfg.num_ves, cfg.d_pair_values, -1)
     bigram_ids, pair_ids, pair_code_ids = rows   # each table's rows, computed on the host (see table_rows)
     pair_code = F.embedding(pair_code_ids, m.pair_code)
-    pair_code_v = pair_code @ m.pair_decoder.w[0].mT   # decoded once, added to every VE layer's pair row
+    pair_code_v = pair_code @ m.pair_decoder.w[0].mT
     x_backout = None
 
     # -----------------------------
@@ -551,7 +551,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
     xb = xb_final                       # grad wrt layer num_layers-1's output
     x0b = torch.zeros_like(x0)          # accumulates over layers
     xb_bigram = torch.zeros_like(x0)    # accumulates over layers
-    pair_code_vb = torch.zeros_like(x0) # likewise, over the VE layers
+    pair_code_vb = torch.zeros_like(pair_code_v)  # accumulates over VE layers
 
     # For each layer in reverse order,
     for i in reversed(range(cfg.n_layers)):
@@ -670,6 +670,8 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
         xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
         stash[i] = None                          # free this layer's stash as we go
 
+    m.pair_decoder.gbank[0].add_(pair_code_vb.mT @ pair_code)
+
     # Land the per-layer resid/x0/bigram/x0-gate scalar sums (collected in REVERSED
     # layer order) as one stacked add each.
     if is_last_micro:
@@ -697,7 +699,6 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
     xb_embed = bf16(x_embed_inv_rms * (xb_embed_hat.float() - (x_embed_hat.float() * (x_embed_hat.float() * xb_embed_hat.float()).mean(dim=-1, keepdim=True))))
     m.input_embeds.grad.add_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
-    m.pair_decoder.gbank[0].add_(pair_code_vb.mT @ pair_code)
     m.bigram_embeds.grad.add_(
         torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_ids, cfg.d_bigram, -1, False))
 
@@ -1192,7 +1193,7 @@ W_O =   fp32_zeros(cfg.n_layers,               cfg.d_model, cfg.n_qo_heads * cfg
 ve_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(0.0, 0.02)
 pair_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
     0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 2))
-pair_decoder = fp32_zeros(1, cfg.n_kv_heads * cfg.d_vo, cfg.d_model)  # starts at zero, like the projections
+pair_decoder = fp32_zeros(1, cfg.n_kv_heads * cfg.d_vo, cfg.d_model)  # starts at zero
 
 W_in  = fp32_empty(cfg.n_layers, cfg.d_mlp,   cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4)
 W_out = fp32_zeros(cfg.n_layers, cfg.d_model, cfg.d_mlp)             # projections start at zero
@@ -1216,18 +1217,18 @@ muon_wd[1:] = 0.28 * (0.5 * (1.0 + np.cos(math.pi * (1.0 - run_frac))))
 # Muon peak lr is 0.02, scaled up for tall matrices by their sqrt(fan_out/fan_in)
 # aspect ratio -- at d12 only W_in (the 4x MLP expansion -> 2.0). rdim is the
 # axis facing the residual stream: W_O and W_out live transposed -> -2; the
-# ve_gate rows read a d_ve_gate slice of the stream -> -1.
+# ve_gate rows read a d_ve_gate slice of the stream -> -1, pair_decoder the pair code -> -1.
 muon_configs = [
-#    name,          weights,      peak lr,  rdim
-    ("W_Q",         W_Q,          0.02,      -1),
-    ("W_K",         W_K,          0.02,      -1),
-    ("W_V",         W_V,          0.02,      -1),
-    ("W_O",         W_O,          0.02,      -2),
-    ("W_in",        W_in,         0.04,      -1),
-    ("W_out",       W_out,        0.02,      -2),
-    ("ve_gate",     ve_gate,      0.02,      -1),
-    ("pair_gate",   pair_gate,    0.02,      -1),
-    ("pair_decoder", pair_decoder, 0.02,     -1)
+#    name,           weights,       peak lr,  rdim
+    ("W_Q",          W_Q,           0.02,      -1),
+    ("W_K",          W_K,           0.02,      -1),
+    ("W_V",          W_V,           0.02,      -1),
+    ("W_O",          W_O,           0.02,      -2),
+    ("W_in",         W_in,          0.04,      -1),
+    ("W_out",        W_out,         0.02,      -2),
+    ("ve_gate",      ve_gate,       0.02,      -1),
+    ("pair_gate",    pair_gate,     0.02,      -1),
+    ("pair_decoder", pair_decoder,  0.02,      -1)
 ]
 
 # For each of the Muon-trained weight banks...
@@ -1345,23 +1346,23 @@ del embed_prior, head_prior, head_master
 # Pair Code
 # ------------------------------------------------------------------------------
 
-# Corpus trigram statistics (all 91 train shards) of the 2,097,152 most frequent [prev, curr] pairs: each pair's 64
-# next tokens with the largest log1p(count / (1,000 * bigram probability)), and those log-ratios.
+# Corpus trigram statistics (all 91 train shards): each frequent [prev, curr] pair's 64 next tokens with the largest
+# log1p(count / (1,000 * bigram probability)), and those log-ratios.
 pair_next = np.load(os.path.join(DATASET_DIR, "tokenizer/pair_next_tokens.npz"))
-pair_code_keys = pair_next["keys"]                   # prev * d_vocab + curr, ascending; stays on the host for table_rows
+pair_code_keys = pair_next["keys"]  # prev * d_vocab + curr, ascending
 pair_next_ids, pair_log_ratios, pair_counts = pair_next["next_ids"], pair_next["log_ratios"], pair_next["counts"]
 del pair_next
 
-# A pair's code: its log-ratios summed through the head's centred rows, priors included.
-head_rows = rebuild_master(m.lm_head.w, m.lm_head.mantissa)
-head_rows -= head_rows.mean(dim=0, keepdim=True)
+# Each pair's code: the log-ratio-weighted sum of the head's centred rows.
+centred_head = rebuild_master(m.lm_head.w, m.lm_head.mantissa)
+centred_head -= centred_head.mean(dim=0, keepdim=True)
 pair_code = fp32_zeros(cfg.d_pair_code + 1, cfg.d_model)
 for start in range(0, cfg.d_pair_code, 16384):
     next_ids   = torch.from_numpy(pair_next_ids[start:start + 16384].astype(np.int64)).to(device)
     log_ratios = torch.from_numpy(pair_log_ratios[start:start + 16384].astype(np.float32)).to(device)
-    pair_code[start:start + 16384] = (log_ratios.unsqueeze(-1) * head_rows[next_ids]).sum(dim=1)
+    pair_code[start:start + 16384] = (log_ratios.unsqueeze(-1) * centred_head[next_ids]).sum(dim=1)
 
-# Centre and whiten over positions, so every direction arrives at unit scale.
+# Centre and whiten, weighted by each pair's share of positions.
 position_share = torch.from_numpy(pair_counts / pair_counts.sum()).float().unsqueeze(1).to(device)
 pair_code[:-1] -= (pair_code[:-1] * position_share).sum(dim=0, keepdim=True)
 covariance = torch.zeros(cfg.d_model, cfg.d_model, dtype=torch.float64, device=device)
@@ -1369,11 +1370,11 @@ for start in range(0, cfg.d_pair_code, 65536):
     code_rows = pair_code[start:start + 65536].double()
     covariance += code_rows.T @ (code_rows * position_share[start:start + 65536].double())
 eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
-whiten = (eigenvectors * (eigenvalues.clamp_min(0.0) + 1e-3 * eigenvalues.mean()).rsqrt()) @ eigenvectors.T
-pair_code[:-1] = pair_code[:-1] @ whiten.float()
+whitening = (eigenvectors * (eigenvalues.clamp_min(0.0) + 1e-3 * eigenvalues.mean()).rsqrt()) @ eigenvectors.T
+pair_code[:-1] = pair_code[:-1] @ whitening.float()
 m.pair_code = pair_code.bfloat16()
-del pair_next_ids, pair_log_ratios, pair_counts, head_rows, pair_code, next_ids, log_ratios, position_share
-del covariance, code_rows, eigenvalues, eigenvectors, whiten
+del pair_next_ids, pair_log_ratios, pair_counts, centred_head, pair_code, next_ids, log_ratios, position_share
+del covariance, code_rows, eigenvalues, eigenvectors, whitening
 
 
 # ------------------------------------------------------------------------------
@@ -1581,13 +1582,13 @@ warmup = []  # Those first 11 steps, where the compile lives.
 
 def table_rows(tokens):
     """Each position's [prev, curr] pair as a row of the three pair-indexed tables, on the host (see data_generator)."""
-    pair = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
-    key  = cfg.d_vocab * tokens[:-1] + tokens[1:]
-    code = np.minimum(np.searchsorted(pair_code_keys, key), cfg.d_pair_code - 1)
+    pair     = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
+    pair_key = cfg.d_vocab * tokens[:-1] + tokens[1:]
+    code_row = np.minimum(np.searchsorted(pair_code_keys, pair_key), cfg.d_pair_code - 1)
     rows = np.empty((3, tokens.size), dtype=tokens.dtype)
     rows[0, :1], rows[0, 1:] = cfg.d_bigram - 1,      pair % (cfg.d_bigram - 1)
     rows[1, :1], rows[1, 1:] = cfg.d_pair_values - 1, pair % (cfg.d_pair_values - 1)
-    rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(pair_code_keys[code] == key, code, cfg.d_pair_code)
+    rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(pair_code_keys[code_row] == pair_key, code_row, cfg.d_pair_code)
     return rows
 
 train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens, table_rows,
