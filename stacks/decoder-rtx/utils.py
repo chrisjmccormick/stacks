@@ -35,11 +35,20 @@ def flash_attn_varlen_fwd_lse(q, k, v, cu_seqlens, max_seqlen, window_size):
     return out, softmax_lse
 
 
-def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqlen, window_size):
+def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqlen, window_size,
+                          dq=None, dk=None, dv=None):
     """Attention backward for flash_attn_varlen_fwd_lse: returns (dq, dk, dv).
     FA2's varlen backward writes the grads into pre-allocated dq/dk/dv (they
-    sit right after the saved tensors) and returns softmax_d."""
-    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    sit right after the saved tensors) and returns softmax_d.
+
+    Pass dq/dk/dv to have it write into buffers the caller owns. The kernel takes its
+    strides as arguments and only needs the head dimension contiguous, so a slice of a
+    wider tensor works -- which is how train_stack.py gets the three backward streams to
+    come out side by side in one (T, 3 * d_model) buffer, so their input-gradient matmul
+    is a single K = 3 * d_model reduction instead of three K = d_model ones."""
+    dq = torch.empty_like(q) if dq is None else dq
+    dk = torch.empty_like(k) if dk is None else dk
+    dv = torch.empty_like(v) if dv is None else dv
     fa2._flash_attn_varlen_backward(
         dout, q, k, v, out, softmax_lse,
         dq, dk, dv,
