@@ -130,8 +130,7 @@ class StackConfig:
 
     # Batch Size
     micro_batch_tokens: int = 96 * 2048   # 192K tokens per micro-batch
-    total_batch_size:   int = 96 * 2048   # 192K tokens per step
-    grad_accum_steps:   int
+    total_batch_size:   int = 96 * 2048   # 192K tokens per step -- one micro-batch, see below
 
     # Training
     num_steps: int = 1760
@@ -182,7 +181,9 @@ cfg.window_sizes = [(cfg.short_win_size, 0)] * cfg.n_layers  # All short, ...
 for i in cfg.full_ctxt_layers:
     cfg.window_sizes[i] = (cfg.seq_len, 0)                   # ... then overwrite with full.
 
-cfg.grad_accum_steps = cfg.total_batch_size // cfg.micro_batch_tokens
+# One micro-batch per step is wired into the script: every gradient buffer is written
+# exactly once per step, so the writes are copy_ and there is no zeroing pass.
+assert cfg.total_batch_size == cfg.micro_batch_tokens, "the step is one micro-batch"
 cfg.val_steps =        cfg.val_tokens       // EVAL_BUFFER_TOKENS
 
 VAL_BPB_TARGET = 0.900
@@ -323,7 +324,7 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
+def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=True):
     """One micro-batch through the model. Use backward=False for validation."""
 
     # Direction naming:
@@ -530,9 +531,6 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
     # -----------------------------
     #           Backward
     # -----------------------------
-    # Only compute some grads on the last micro batch.
-    is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
-
     # Compact each table's rows: sorting the ids numbers the distinct ones, so the
     # gradient accumulates over T rows rather than the table's. Slots past the last
     # distinct row point at the table's scratch row and land a zero update.
@@ -565,8 +563,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
     xb_final = bf16(x_final_inv_rms * (xb_final_hat.float() - (x_final_hat.float() * res_ms)))
 
     # Dot product between final vs. backout streams.
-    if is_last_micro:
-        m.backout_lambda.grad.copy_(-sum32(xb_final * x_backout))  # (T, d_model)
+    m.backout_lambda.grad.copy_(-sum32(xb_final * x_backout))  # (T, d_model)
 
     # xb updates every layer, keep xb_final for backout layer.
     xb = xb_final                       # grad wrt layer num_layers-1's output
@@ -689,11 +686,10 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
         x0_gate    = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in_mean)                   # (T, 1)
         x0_dot     = (xb_biased * x0).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
         x0_gateb_z = x0_dot * m.x0_lambdas.w[i] * x0_gate * (1.0 - 0.5 * x0_gate)       # (T, 1)
-        if is_last_micro:
-            g_resid.append(sum32(xb_biased * st.x_in))
-            g_x0.append((x0_dot * x0_gate).sum())
-            g_bigram.append(sum32(xb_biased * x_bigram))
-            g_x0_gate.append((x0_gateb_z * x_in_mean).sum())
+        g_resid.append(sum32(xb_biased * st.x_in))
+        g_x0.append((x0_dot * x0_gate).sum())
+        g_bigram.append(sum32(xb_biased * x_bigram))
+        g_x0_gate.append((x0_gateb_z * x_in_mean).sum())
         x0b = x0b + bf16(m.x0_lambdas.w[i] * x0_gate) * xb_biased  # TRAP: x0 feeds every layer, accumulate
         xb_bigram = xb_bigram + m.bigram_lambdas.w[i] * xb_biased  # TRAP: x_bigram feeds every layer, accumulate
         xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
@@ -703,11 +699,10 @@ def forward_backward(idx, targets, rows, cu_seqlens, micro_step, loss_scale=1.0,
 
     # Land the per-layer resid/x0/bigram/x0-gate scalar sums (collected in REVERSED
     # layer order) as one stacked add each.
-    if is_last_micro:
-        m.resid_lambdas.grad.copy_(torch.stack(g_resid[::-1]))
-        m.x0_lambdas.grad.copy_(torch.stack(g_x0[::-1]))
-        m.bigram_lambdas.grad.copy_(torch.stack(g_bigram[::-1]))
-        m.x0_gates.grad.copy_(torch.stack(g_x0_gate[::-1]))
+    m.resid_lambdas.grad.copy_(torch.stack(g_resid[::-1]))
+    m.x0_lambdas.grad.copy_(torch.stack(g_x0[::-1]))
+    m.bigram_lambdas.grad.copy_(torch.stack(g_bigram[::-1]))
+    m.x0_gates.grad.copy_(torch.stack(g_x0_gate[::-1]))
 
     # xb is now the grad through layer 0's input, which IS x0 (same tensor), so
     # it folds into x0b to give the full grad wrt the smeared embedding.
@@ -1529,8 +1524,7 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 
 print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token: {cfg.num_flops_per_token:e}", console=True)
 print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", console=True)
-print0(f"Total batch size: {cfg.total_batch_size:,} tokens = {cfg.micro_batch_tokens:,} tokens/micro "
-       f"x {cfg.grad_accum_steps} grad accum", console=True)
+print0(f"Total batch size: {cfg.total_batch_size:,} tokens, one micro-batch per step", console=True)
 
 # A flat row per step and the result, for analysis without wandb.
 metrics_path = f"logs/{cfg.run_name}_metrics.csv"
@@ -1617,7 +1611,7 @@ def table_rows(tokens):
     return rows
 
 train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens, table_rows,
-                              cfg.num_steps * cfg.grad_accum_steps)
+                              cfg.num_steps)
 
 inputs, targets, rows, cu_seqlens = next(train_loader)   # kick off the first batch
 
@@ -1636,10 +1630,10 @@ for step in range(cfg.num_steps + 1):
         val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens, table_rows)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
-        for micro_i in range(cfg.val_steps):
+        for _ in range(cfg.val_steps):
             v_inputs, v_targets, v_rows, v_cu_seqlens = next(val_loader)
             loss_flat = forward_backward(v_inputs, v_targets, v_rows, v_cu_seqlens,
-                                         micro_step=micro_i, backward=False)
+                                         backward=False)
             num_bytes_flat = token_bytes[v_targets]
             total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
             total_bytes += num_bytes_flat.sum()
@@ -1667,16 +1661,12 @@ for step in range(cfg.num_steps + 1):
     torch.cuda.synchronize()
     step_t0 = time.perf_counter()
 
-    # Gradient Accumulation Loop
-    for micro_i in range(cfg.grad_accum_steps):
+    # Forward and Backward pass
+    loss = forward_backward(inputs, targets, rows, cu_seqlens,
+                            loss_scale=1.0 / inputs.size(0))
 
-        # Forward and Backward pass
-        loss = forward_backward(inputs, targets, rows, cu_seqlens,
-                                micro_step=micro_i,
-                                loss_scale=1.0 / (cfg.grad_accum_steps * inputs.size(0)))
-
-        # Next training batch
-        inputs, targets, rows, cu_seqlens = next(train_loader)
+    # Next training batch
+    inputs, targets, rows, cu_seqlens = next(train_loader)
 
     # Smooth gradients, update weights, zero the grads
 
