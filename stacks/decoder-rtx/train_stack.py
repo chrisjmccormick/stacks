@@ -66,9 +66,11 @@ from utils import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dat
                    flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
 
 dynamo.config.recompile_limit = 64
+
 # Matmul backend chosen per shape, read from the cache shipped beside this script.
 torch._inductor.config.max_autotune_gemm = True
 torch._inductor.config.autotune_in_subproc = False
+
 # Confirm Ampere or newer
 assert torch.cuda.is_available(), "no GPU -- Runtime > Change runtime type > A100"
 
@@ -110,6 +112,7 @@ class StackConfig:
     d_bigram:        int = 64 * 32768 # 2,097,152 hashed [prev, curr] pairs, read into the residual stream.
     d_pair_values:   int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the attention values.
     d_pair_code:     int = 64 * 32768 # 2,097,152 frequent [prev, curr] pairs with a frozen corpus code, likewise.
+    touched_rows:    int = 120_000    # Bound on the distinct rows of one table a batch touches (measured max: 114,895).
     d_smr_gate:      int = 24    # Gate input is first 24-dims of input embed.
 
     # Attention
@@ -135,7 +138,7 @@ class StackConfig:
     d_mlp:      int = 4 * 768 # 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 3_105_424_224     # every trained weight (§ Weight Init & Schedule)
+    num_params:          int = 5_891_757_334     # every trained weight (§ Weight Init & Schedule)
     num_flops_per_token: int = 780_929_568     # 6 * 110,100,912 matmul params + attention
 
     # ---- Training ----
@@ -144,7 +147,7 @@ class StackConfig:
     train_batch_tokens: int = 96 * 2048   # 192K tokens per step
 
     # Training
-    num_steps: int = 1740
+    num_steps: int = 1760
 
     # Evaluation and logging
     val_loss_every:  int = 333
@@ -540,6 +543,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # -----------------------------
     # The trained tables' rows, compacted for the sparse updates (see table_rows).
     bigram_inverse, bigram_rows, pair_inverse, pair_rows = rows[3:]
+    bigram_rows, pair_rows = bigram_rows[:cfg.touched_rows], pair_rows[:cfg.touched_rows]
 
     pair_w_scale_next = pair_w_scale * m.pair_values.wd_t[t_step]
     bigram_w_scale_next = bigram_w_scale * m.bigram_embeds.wd_t[t_step]
@@ -580,7 +584,8 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         m.W_out.gbank[i].copy_(xb.mT @ st.mlp_a) # (d_model, T) @ (T, d_mlp)
 
         # Grad w.r.t. the pre-relu matmul output (mlpb_a = xb @ W_out is inline)
-        mlpb_z = 2.0 * st.mlp_a.sqrt() * (xb @ m.W_out.w[i])   # mlp_relu = mlp_a.sqrt()
+        mlp_relu = st.mlp_a * (st.mlp_a + 1e-30).rsqrt()   # = mlp_a.sqrt()
+        mlpb_z = 2.0 * mlp_relu * (xb @ m.W_out.w[i])
 
         x_attn_out_inv_rms, x_attn_out_hat = st.x_attn_out_inv_rms, st.x_attn_out_hat
 
@@ -645,7 +650,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
             pair_code_vb = pair_code_vb + pair_vb
 
             # Sparse update: row-wise RMSProp on this slot's touched rows (pair_rows), fused in at its gradient.
-            pair_grad = torch.ops.aten.embedding_dense_backward(pair_vb.float(), pair_inverse, T, -1, False)
+            pair_grad = torch.ops.aten.embedding_dense_backward(pair_vb.float(), pair_inverse, cfg.touched_rows, -1, False)
             pair_vbank[j].mul_(m.pair_values.mntm_b2_t[t_step])   # (rows, 1) fp32
             pair_slot_mntm = (pair_vbank[j].index_select(0, pair_rows)
                               + pair_grad.square().mean(dim=-1, keepdim=True) * m.pair_values.grad_b2_t[t_step])
@@ -688,7 +693,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     m.pair_decoder.gbank[0].copy_(pair_code_vb.mT @ pair_code)
 
     # Land the per-layer resid/x0/bigram/x0-gate scalar sums (collected in REVERSED
-    # layer order) as one stacked add each.
+    # layer order) as one stacked copy each.
     m.resid_lambdas.grad.copy_(torch.stack(g_resid[::-1]))
     m.x0_lambdas.grad.copy_(torch.stack(g_x0[::-1]))
     m.bigram_lambdas.grad.copy_(torch.stack(g_bigram[::-1]))
@@ -715,7 +720,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
 
     # Sparse update: row-wise RMSProp on the bigram table's touched rows (bigram_rows).
-    bigram_grad = torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_inverse, T, -1, False)
+    bigram_grad = torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_inverse, cfg.touched_rows, -1, False)
     m.bigram_embeds.scnd_mntm.mul_(m.bigram_embeds.mntm_b2_t[t_step])
     bigram_mntm = (m.bigram_embeds.scnd_mntm.index_select(0, bigram_rows)
                    + bigram_grad.square().mean(dim=-1, keepdim=True) * m.bigram_embeds.grad_b2_t[t_step])
@@ -1332,7 +1337,7 @@ head_prior = torch.linalg.solve((xe_prior.T @ (context_weight ** 2 * xe_prior)).
 del raw_target, xe_prior, context_weight, next_unigram
 
 # Halve the head's log-frequency component.
-occurrences_per_step = context_counts / context_counts.sum() * cfg.train_batch_tokens               # (V, 1)
+occurrences_per_step = context_counts / context_counts.sum() * cfg.train_batch_tokens             # (V, 1)
 freq_weight = occurrences_per_step.clamp_min(1e-3)
 log_freq = (occurrences_per_step + 1e-3).log()
 log_freq -= (freq_weight * log_freq).sum() / freq_weight.sum()                                    # centred
@@ -1450,25 +1455,25 @@ class RunResult:
     """The run in one row: the results panel, the result JSON, the runs table."""
 
     # Identity, for the JSON; wandb has these from the run name and config
-    run_name:         str          = ""
-    num_steps:        int          = 0
-    train_batch_tokens: int        = 0
+    run_name:           str          = ""
+    num_steps:          int          = 0
+    train_batch_tokens: int          = 0
 
     # The result
-    val_bpb:          float | None = None
-    min_val_bpb:      float | None = None
-    slack:            int   | None = None   # micro-bpb under VAL_BPB_TARGET
+    val_bpb:            float | None = None
+    min_val_bpb:        float | None = None
+    slack:              int   | None = None   # micro-bpb under VAL_BPB_TARGET
 
     # The cost, in minutes
-    train_time:       float        = 0.0
-    val_time:         float        = 0.0
-    compile_time:     float        = 0.0
-    wall_time:        float        = 0.0
+    train_time:         float        = 0.0
+    val_time:           float        = 0.0
+    compile_time:       float        = 0.0
+    wall_time:          float        = 0.0
 
     # The rate
-    avg_step_time:    float        = 0.0    # seconds
-    avg_mfu:          float        = 0.0    # percent of BF16 peak
-    peak_mem_gb:      float        = 0.0
+    avg_step_time:      float        = 0.0    # seconds
+    avg_mfu:            float        = 0.0    # percent of BF16 peak
+    peak_mem_gb:        float        = 0.0
 
 
 FINAL_IDENTITY = ("run_name", "num_steps", "train_batch_tokens")
@@ -1598,6 +1603,7 @@ def table_rows(tokens):
     # Compact each trained table's rows; padding points at the table's scratch row.
     bigram_touched, rows[3] = np.unique(rows[0], return_inverse=True)
     pair_touched,   rows[5] = np.unique(rows[1], return_inverse=True)
+    assert max(bigram_touched.size, pair_touched.size) <= cfg.touched_rows
     rows[4], rows[4, :bigram_touched.size] = cfg.d_bigram,      bigram_touched
     rows[6], rows[6, :pair_touched.size]   = cfg.d_pair_values, pair_touched
     return rows
@@ -1742,19 +1748,19 @@ avg_step_time = float(np.mean(timed)) if timed else 0.0
 compile_time = max(0.0, np.sum(warmup) - len(warmup) * avg_step_time)
 
 result = RunResult(
-    run_name         = cfg.run_name,
-    num_steps        = cfg.num_steps,
+    run_name           = cfg.run_name,
+    num_steps          = cfg.num_steps,
     train_batch_tokens = cfg.train_batch_tokens,
 
-    train_time       = float(np.sum(timed)) / 60,
-    val_time         = total_val_time / 60,
-    compile_time     = compile_time / 60,
-    wall_time        = (time.perf_counter() - run_wall_t0) / 60,
+    train_time         = float(np.sum(timed)) / 60,
+    val_time           = total_val_time / 60,
+    compile_time       = compile_time / 60,
+    wall_time          = (time.perf_counter() - run_wall_t0) / 60,
 
-    avg_step_time    = avg_step_time,
-    avg_mfu          = (100 * cfg.num_flops_per_token * cfg.train_batch_tokens
-                        / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
-    peak_mem_gb      = torch.cuda.max_memory_reserved() / 2**30,
+    avg_step_time      = avg_step_time,
+    avg_mfu            = (100 * cfg.num_flops_per_token * cfg.train_batch_tokens
+                          / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
+    peak_mem_gb        = torch.cuda.max_memory_reserved() / 2**30,
 )
 if val_bpb is not None:
     result.val_bpb, result.min_val_bpb = val_bpb, min_val_bpb
