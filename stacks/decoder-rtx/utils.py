@@ -199,7 +199,7 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
     `tokens_per_micro` tokens for "train" and EVAL_BUFFER_TOKENS for "val", as
     (inputs, targets, rows, cu_seqlens) device tensors -- the packed varlen
     layout the forward passes consume. `table_rows` maps a micro-batch's input
-    ids to its lookup tables' rows, a (tables, tokens) int32 array, on the host.
+    ids to its lookup tables' rows, a (7, tokens) int32 array, on the host.
     "train" plans and stages all `total_micro_steps` + 1 micro-batches up front,
     placing each document's first cap(i) tokens (see CAP0) and cutting at most
     one document per micro-batch to fill it exactly.
@@ -224,7 +224,7 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
 
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
         targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)
-        rows = torch.empty((num_micro, 3, num_tokens), dtype=torch.int32, pin_memory=True)
+        rows = torch.empty((num_micro, 7, num_tokens), dtype=torch.int32, pin_memory=True)
         inp_np, tgt_np, rows_np = inputs.numpy(), targets.numpy(), rows.numpy()  # views: write straight into pinned memory
         starts = [[] for _ in range(num_micro)]
 

@@ -288,7 +288,7 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=256K  -->  Held: 49.5GB,  Recomputed:   2.25GB
+    For T=256K  -->  Held: 49.5GB,  Recomputed:  20.25GB
     """
     #                                                            Stash (Tiny) Recompute
     x_in:               Tensor    # (L,  T,    D)              4.5GB
@@ -306,8 +306,9 @@ class LayerStash(NamedTuple):
     x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
     x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
     mlp_a:              Tensor    # (L,  T, d_mlp)              18GB
+    #mlp_relu:          Tensor    # (L,  T, d_mlp)                               18GB
     #                                                         ------           ------
-    #                                                 TOTAL:  49.5GB           2.25GB
+    #                                                 TOTAL:  49.5GB          20.25GB
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          384MB    layer-blend + smear backward
@@ -359,8 +360,9 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # *_z        - Pre-nonlinearity, the raw matmul output. Only ever named in
     #              bwd (mlpb_z, ve_gateb_z, gateb_z, x0_gateb_z); inlined in fwd.
     #              ('logit' is reserved for the lm_head's output.)
+    # *_relu     - Post-relu, pre-square (MLP only; recomputed in bwd).
     # *_sig      - Post-sigmoid, in [0, 1] (gates only; recomputed in bwd).
-    # *_a        - The final activation handed onward: mlp_a = relu(z)^2,
+    # *_a        - The final activation handed onward: mlp_a = mlp_relu^2,
     #              ve_gate_a = 3*ve_gate_sig. The smear gate's is just 'gate'.
 
     assert idx.ndim == 1
@@ -372,7 +374,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
 
     cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, half)
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
-    bigram_ids, pair_ids, pair_code_ids = rows   # each table's rows, computed on the host (see table_rows)
+    bigram_ids, pair_ids, pair_code_ids = rows[:3]   # each table's rows, computed on the host (see table_rows)
     pair_code = F.embedding(pair_code_ids, m.pair_code)
     pair_code_v = pair_code @ m.pair_decoder.w[0].mT
     x_backout = None
@@ -536,20 +538,8 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # -----------------------------
     #           Backward
     # -----------------------------
-    # Compact each table's rows; padding points at the table's scratch row.
-    def compact_rows(ids, scratch_row):
-        order = ids.argsort()
-        ids_sorted = ids[order]
-        segment = torch.cat([ids_sorted.new_ones(1, dtype=torch.bool),
-                             ids_sorted[1:] != ids_sorted[:-1]]).cumsum(0) - 1   # (T,) compacted row of each id
-        inverse = torch.empty_like(segment)
-        inverse[order] = segment
-        touched = torch.full((T,), scratch_row, dtype=torch.int64, device=device)
-        touched[segment] = ids_sorted.long()
-        return inverse, touched
-
-    pair_inverse, pair_rows = compact_rows(pair_ids, cfg.d_pair_values)
-    bigram_inverse, bigram_rows = compact_rows(bigram_ids, cfg.d_bigram)
+    # The trained tables' rows, compacted for the sparse updates (see table_rows).
+    bigram_inverse, bigram_rows, pair_inverse, pair_rows = rows[3:]
 
     pair_w_scale_next = pair_w_scale * m.pair_values.wd_t[t_step]
     bigram_w_scale_next = bigram_w_scale * m.bigram_embeds.wd_t[t_step]
@@ -583,14 +573,14 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
             # TRAP: x_backout gets an EXTRA contribution when the sweep passes num_layers//2
             xb = xb - bf16(m.backout_lambda.w) * xb_final
 
-        # --- MLP backward (relu^2: mlpb_z = 2*sqrt(mlp_a)*mlpb_a, self-masking
-        #     since sqrt(mlp_a) is already 0 where z < 0) ---
+        # --- MLP backward (relu^2: mlpb_z = 2*mlp_relu*mlpb_a, self-masking
+        #     since mlp_relu is already 0 where z < 0) ---
 
         # Grad w.r.t. W_out
         m.W_out.gbank[i].copy_(xb.mT @ st.mlp_a) # (d_model, T) @ (T, d_mlp)
 
         # Grad w.r.t. the pre-relu matmul output (mlpb_a = xb @ W_out is inline)
-        mlpb_z = 2.0 * st.mlp_a.sqrt() * (xb @ m.W_out.w[i])
+        mlpb_z = 2.0 * st.mlp_a.sqrt() * (xb @ m.W_out.w[i])   # mlp_relu = mlp_a.sqrt()
 
         x_attn_out_inv_rms, x_attn_out_hat = st.x_attn_out_inv_rms, st.x_attn_out_hat
 
@@ -654,7 +644,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
             pair_vb = (vb * (3 * pair_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
             pair_code_vb = pair_code_vb + pair_vb
 
-            # Row-wise RMSProp on this slot, fused in at its gradient.
+            # Sparse update: row-wise RMSProp on this slot's touched rows (pair_rows), fused in at its gradient.
             pair_grad = torch.ops.aten.embedding_dense_backward(pair_vb.float(), pair_inverse, T, -1, False)
             pair_vbank[j].mul_(m.pair_values.mntm_b2_t[t_step])   # (rows, 1) fp32
             pair_slot_mntm = (pair_vbank[j].index_select(0, pair_rows)
@@ -724,7 +714,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     m.input_embeds.grad.copy_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
 
-    # Row-wise RMSProp on the bigram table.
+    # Sparse update: row-wise RMSProp on the bigram table's touched rows (bigram_rows).
     bigram_grad = torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_inverse, T, -1, False)
     m.bigram_embeds.scnd_mntm.mul_(m.bigram_embeds.mntm_b2_t[t_step])
     bigram_mntm = (m.bigram_embeds.scnd_mntm.index_select(0, bigram_rows)
@@ -1597,14 +1587,19 @@ timed = []   # Length of each step in seconds, steps 0-10 excluded.
 warmup = []  # Those first 11 steps, where the compile lives.
 
 def table_rows(tokens):
-    """Each position's [prev, curr] pair as a row of the three pair-indexed tables, on the host (see data_generator)."""
+    """Each position's [prev, curr] pair as a row of the three pair-indexed tables, plus the two trained tables' compacted rows, on the host (see data_generator)."""
     pair     = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
     pair_key = cfg.d_vocab * tokens[:-1] + tokens[1:]
     code_row = np.minimum(np.searchsorted(pair_code_keys, pair_key), cfg.d_pair_code - 1)
-    rows = np.empty((3, tokens.size), dtype=tokens.dtype)
+    rows = np.empty((7, tokens.size), dtype=tokens.dtype)
     rows[0, :1], rows[0, 1:] = cfg.d_bigram - 1,      pair % (cfg.d_bigram - 1)
     rows[1, :1], rows[1, 1:] = cfg.d_pair_values - 1, pair % (cfg.d_pair_values - 1)
     rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(pair_code_keys[code_row] == pair_key, code_row, cfg.d_pair_code)
+    # Compact each trained table's rows; padding points at the table's scratch row.
+    bigram_touched, rows[3] = np.unique(rows[0], return_inverse=True)
+    pair_touched,   rows[5] = np.unique(rows[1], return_inverse=True)
+    rows[4], rows[4, :bigram_touched.size] = cfg.d_bigram,      bigram_touched
+    rows[6], rows[6, :pair_touched.size]   = cfg.d_pair_values, pair_touched
     return rows
 
 train_loader = data_generator("train", cfg.seq_len, cfg.train_batch_tokens, table_rows,
