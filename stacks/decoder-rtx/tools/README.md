@@ -109,4 +109,4 @@ Two structural facts worth knowing before you read a strip:
 `agent-ops-stacks/decoder-rtx/2026-09-20_1233pm_headroom-and-step-time/` and
 `2026-09-20_0323pm_trace-strip-kernel-map/`; `kernel_totals.py` in
 `2026-09-20_0927am_gpu-fusion-opts/`. The map was rebuilt for baseline 5 in
-`2026-09-22_0136pm_promote-trace-tools/`.
+`2026-09-22_0144pm_promote-trace-tools/`.
