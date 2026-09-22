@@ -14,6 +14,11 @@ is imported by it.
 | `trace_strip.py` | *What is the step actually doing, in order?* The kernel strip drawn to scale, coloured by what each kernel computes, several traces stacked on one time axis. |
 | `kernel_map.json` | The map `trace_strip.py` colours from — which part of the model each kernel belongs to. |
 
+The palette also has three optimizer roles — `muon` (momentum, norm, variance reduction, the
+update), `muon_pe` (its Polar Express GEMMs) and `adam` — for the optimizer's calls and for
+optimizer steps moved into the backward; `agent-ops-stacks/decoder-rtx/2026-09-22_0102pm_inline-muon-backward/label_map.py`
+derives a map with them from a trace, on top of this one.
+
 ```bash
 python kernel_totals.py control.json.gz arm.json.gz
 
@@ -24,8 +29,12 @@ python trace_strip.py base.json.gz arm.json.gz --map kernel_map.json \
 
 Each `trace_strip.py` call writes an `.html` (hover for a kernel's name, role and duration,
 plus a per-kernel delta table) and a `.png`. **The PNG carries its own text** — title, axis,
-region band and legend, in a 5x7 bitmap font — because it is the only form an agent can read
-over ssh.
+region band, legend, and the role and duration on every bar wide enough to hold them — because
+it is the only form an agent can read over ssh. With Pillow importable (`pip install pillow`,
+optional) the text is set in a real face; without it, a built-in 5x7 bitmap font, so the tool
+still runs on a box with nothing installed. cuBLAS kernels keep their config string in the
+kernel name (`cutlass::Kernel2 cutlass_80_..._256x64_32x4_tn_align8`), since that is what tells
+one GEMM from another; the `expect` guards can be written against it.
 
 ## The map, and why it is positional
 

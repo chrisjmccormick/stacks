@@ -126,7 +126,13 @@ def load_trace(path):
 
 
 def short_name(name):
-    """Drop template arguments and the `void` return so kernels stay recognisable."""
+    """Drop template arguments and the `void` return so kernels stay recognisable -- except a
+    cuBLAS kernel's config, which IS its identity: every GEMM cuBLAS runs is `cutlass::Kernel2`,
+    and only the `cutlass_80_..._256x64_32x4_tn_align8` inside the brackets tells a 21 us Gram
+    product from a 4 ms gradient GEMM (an `expect` written against one must not match the other)."""
+    m = re.search(r"cutlass::Kernel2?<(cutlass_80_[A-Za-z0-9_]+)", name)
+    if m:
+        return "cutlass::Kernel2 " + m.group(1)
     for _ in range(4):
         name = re.sub(r"<[^<>]*>", "", name)
     name = re.sub(r"^void\s+", "", name)
@@ -348,12 +354,54 @@ def text_w(s, scale=1):
     return len(str(s)) * GLYPH_W * scale
 
 
-def write_png(path, width, height, fills):
-    """Paint `fills` -- (x0, y0, x1, y1, rgb) in pixels, in order -- and write an RGB PNG.
+# Text in the PNG: a real face through Pillow when it is importable (its embedded TrueType, so
+# no font file is needed), the 5x7 bitmap font above otherwise. Pillow is optional on purpose --
+# the tool stays stdlib-runnable on a box with nothing installed; `pip install pillow` is the
+# one line that upgrades the picture's text.
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont as _PILFont
+    _FONT = {size: _PILFont.load_default(size=size) for size in (10, 11, 12, 13)}
+except Exception:                       # no Pillow, or one too old to embed a scalable face
+    _FONT = None
+
+TEXT_SIZE = 11                          # the size everything but the title is set in
+
+
+def text_width(s, size=TEXT_SIZE):
+    """Pixels `s` takes at `size`, in whichever face the PNG will use."""
+    if _FONT:
+        return _FONT[size].getlength(str(s))
+    return text_w(s)
+
+
+def ink_on(rgb):
+    """Dark ink on a light fill, light ink on a dark one."""
+    r, g, b = rgb
+    return (22, 24, 28) if 0.299 * r + 0.587 * g + 0.114 * b > 140 else INK
+
+
+def write_png(path, width, height, fills, texts=()):
+    """Paint `fills` -- (x0, y0, x1, y1, rgb) in pixels, in order -- then `texts` --
+    (s, x, y, rgb, size), top-left anchored -- and write an RGB PNG.
 
     Hand-rolled on zlib so the tool needs nothing installed: the agent reading the picture
-    on a GPU box has no browser and no display.
+    on a GPU box has no browser and no display. With Pillow importable the text is set in a
+    real face instead of the bitmap font.
     """
+    if _FONT:
+        im = _PILImage.new("RGB", (width, height), BG)
+        draw = _PILDraw.Draw(im)
+        for x0, y0, x1, y1, rgb in fills:
+            x0, x1 = max(0, int(x0)), min(width, int(math.ceil(x1)))
+            if x1 <= x0:
+                x0, x1 = min(max(x0, 0), width - 1), min(max(x0, 0) + 1, width)
+            draw.rectangle([x0, max(0, int(y0)), x1 - 1, min(height, int(y1)) - 1], fill=tuple(rgb))
+        for s, tx, ty, rgb, size in texts:
+            draw.text((tx, ty), str(s), fill=tuple(rgb), font=_FONT[size])
+        im.save(path)
+        return
+    for s, tx, ty, rgb, size in texts:
+        fills = fills + text_fills(s, tx, ty, rgb)
     rows = [bytearray(bytes(BG) * width) for _ in range(height)]
     for x0, y0, x1, y1, rgb in fills:
         x0, x1 = max(0, int(x0)), min(width, int(math.ceil(x1)))
@@ -520,13 +568,14 @@ def main():
     TITLE_H, AXIS_H, BAND_H, LABEL_H, LANE_H, ROW_GAP, PAD = 22, 24, 13, 16, 34, 24, 14
     svg, legend, used_roles = [], {}, {}
     fills, guide_fills, over_fills = [], [], []      # under the strips / strips / over them
+    texts = []                                       # (s, x, y, rgb, size), painted last
     y = TITLE_H + AXIS_H + PAD
     n_drawn = 0
 
     for r in rows:
         svg.append(f'<text class="lbl" x="0" y="{y + 11}">{html.escape(r["label"])}'
                    f'<tspan class="dim"> &#183; step {r["step"]}</tspan></text>')
-        over_fills += text_fills(r["label"], 0, y + 3, INK)
+        texts.append((r["label"], 0, y + 1, INK, 12))
         y += LABEL_H
 
         # The region band: one cell per region, with the layer's own features named.
@@ -553,8 +602,8 @@ def main():
                         + ("+FULL" if n_layer in model.get("full_ctxt_layers", []) else "") \
                         + ("+BKOUT" if n_layer == model.get("backout_layer") else "")
                 tag = label + (" " + feats if feats else "")
-            if not clipped and text_w(tag) + 6 < rx1 - rx0:
-                over_fills += text_fills(tag, rx0 + 4, y + 2, INK_DIM)
+            if not clipped and text_width(tag, 10) + 6 < rx1 - rx0:
+                texts.append((tag, rx0 + 4, y - 1, INK_DIM, 10))
             svg.append(f'<rect x="{rx0:.1f}" y="{y}" width="{max(rx1 - rx0, 1):.1f}" '
                        f'height="{BAND_H - 3}" fill="{"#262a32" if major else "#1c1f25"}"/>'
                        f'<rect x="{rx0:.1f}" y="{y}" width="{2 if major else 1}" '
@@ -596,6 +645,16 @@ def main():
                            f'<title>{html.escape(sname)}\n{titles}\n'
                            f'{dur * 1000:.1f} us @ {t:.3f} ms &#183; #{i} &#183; {phase}</title></rect>')
                 used_roles.setdefault(role, phase)
+            # The label on the bar itself, when the bar has room: the role, and its duration when
+            # that fits too. Ink chosen against the top band's colour; the bar is one kernel either way.
+            label_size = 10 if len(these) > 1 else TEXT_SIZE
+            label = next((cand for cand in (f"{titles} {dur * 1000:.0f} us", titles)
+                          if text_width(cand, label_size) + 8 < w), None)
+            if label:
+                ink = ink_on(rgb_of(these[0], phase))
+                texts.append((label, x0 + 4, y + (LANE_H - label_size) / 2 - 2, ink, label_size))
+                svg.append(f'<text class="bar" x="{x0 + 4:.1f}" y="{y + LANE_H / 2 + 4:.1f}" '
+                           f'fill="rgb{ink}" font-size="{label_size}">{html.escape(label)}</text>')
             key = (sname, tuple(these))
             legend.setdefault(key, {"roles": these, "family": titles, "t": defaultdict(float)})
             legend[key]["t"][r["label"]] += min(t + dur, t_end) - max(t, t_start)
@@ -614,7 +673,7 @@ def main():
         cy = legend_y + (k // 6) * 15
         for j, phase in enumerate(("fwd", "bwd")):
             over_fills.append((cx + j * 9, cy, cx + j * 9 + 8, cy + 8, rgb_of(role, phase)))
-        over_fills += text_fills(ROLES[role][0], cx + 23, cy + 1, INK_DIM)
+        texts.append((ROLES[role][0], cx + 23, cy - 2, INK_DIM, TEXT_SIZE))
         svg.append(f'<rect x="{cx}" y="{cy}" width="8" height="8" fill="rgb{rgb_of(role, "fwd")}"/>'
                    f'<rect x="{cx + 9}" y="{cy}" width="8" height="8" fill="rgb{rgb_of(role, "bwd")}"/>'
                    f'<text class="band" x="{cx + 22}" y="{cy + 8}">'
@@ -635,15 +694,15 @@ def main():
             svg.append(f'<line class="tick" x1="{x(t):.1f}" y1="{TITLE_H + AXIS_H - 6}" '
                        f'x2="{x(t):.1f}" y2="{strip_bottom}"/>')
             svg.append(f'<text class="ax" x="{x(t):.1f}" y="{TITLE_H + AXIS_H - 10}">{t:g}</text>')
-            over_fills += text_fills(f"{t:g}", x(t) + 2, TITLE_H + AXIS_H - 18, INK_DIM)
+            texts.append((f"{t:g}", x(t) + 2, TITLE_H + AXIS_H - 20, INK_DIM, TEXT_SIZE))
             ticks_at.append(t)
         t += tick
 
     covered = sum(1 for r in rows[0]["roles"] if r)
     note = args.title or (args.region or "whole step")
-    head = (f"{note}  |  {t_start:.1f}-{t_end:.1f} MS  |  {n_drawn} KERNELS  |  "
-            f"{covered}/{len(rows[0]['roles'])} MAPPED  |  MS ->")
-    over_fills += text_fills(head, 0, 4, INK)
+    head = (f"{note}  |  {t_start:.1f}-{t_end:.1f} ms  |  {n_drawn} kernels  |  "
+            f"{covered}/{len(rows[0]['roles'])} mapped  |  ms ->")
+    texts.append((head, 0, 3, INK, 13))
 
     svg = ([f'<rect x="0" y="0" width="{args.width}" height="{y}" fill="rgb{BG}"/>'] +
            [f'<line class="guide" x1="{a:.1f}" y1="{b:.1f}" x2="{a:.1f}" y2="{d:.1f}" '
@@ -687,6 +746,7 @@ def main():
  .dim {{ fill: rgb{INK_DIM}; color: rgb{INK_DIM}; font-weight: 400; }}
  .lbl {{ font: 600 12px ui-monospace, monospace; fill: rgb{INK}; }}
  .band {{ font: 9px ui-monospace, monospace; fill: rgb{INK_DIM}; }}
+ .bar {{ font: 10px ui-monospace, monospace; }}
  .ax {{ font: 10px ui-monospace, monospace; fill: rgb{INK_DIM}; text-anchor: middle; }}
  .lane {{ fill: rgb{LANE_BG}; }}
  .tick {{ stroke: rgb{GRID}; stroke-width: 1; }}
@@ -717,10 +777,11 @@ def main():
 
     png = re.sub(r"\.html?$", "", args.out) + ".png"
     if not args.no_png:
-        write_png(png, args.width, int(y), guide_fills + fills + over_fills)
+        write_png(png, args.width, int(y), guide_fills + fills + over_fills, texts)
 
     print(f"{args.out}: {n_drawn} kernels, {t_start:.2f} to {t_end:.2f} ms"
-          + ("" if args.no_png else f"\n{png}: {args.width}x{int(y)} -- carries its own text"))
+          + ("" if args.no_png else f"\n{png}: {args.width}x{int(y)} -- carries its own text"
+                                    + ("" if _FONT else " (5x7 bitmap font: pip install pillow for a real face)")))
     for r in rows:
         miss = sum(1 for role in r["roles"] if not role)
         print(f"  {r['label']:<26} step {r['step']:<4} {r['busy']:8.3f} kernel-ms  "
