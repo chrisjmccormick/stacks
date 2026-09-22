@@ -4,6 +4,7 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -222,6 +223,7 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
         print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: document prefix cap "
               f"{CAP0} -> {seq_len} in 64-token steps over the first {ramp} micro-batches, then {seq_len} ===")
 
+        t0 = time.perf_counter()
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
         targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)
         rows = torch.empty((num_micro, 7, num_tokens), dtype=torch.int32, pin_memory=True)
@@ -230,7 +232,6 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
 
         docs = _doc_stream(bos_id)
         num_docs, raw_tokens = 0, 0
-        t0 = time.perf_counter()
         for i in range(num_micro):
             # Rounded to a multiple of 64.
             cap = seq_len if i >= ramp else 64 * round(CAP0 * (seq_len / CAP0) ** (i / ramp) / 64)
@@ -256,11 +257,13 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
         docs_per_micro = np.array([len(s) for s in starts])
         cu_width = max(max_num_docs, 64 * math.ceil((int(docs_per_micro.max()) + 1) / 64))
         cu = torch.full((num_micro, cu_width), num_tokens, dtype=torch.int32, pin_memory=True)
-        for i in range(num_micro):
+        def finish_micro(i):
             b = np.flatnonzero(inp_np[i] == bos_id)
             assert np.array_equal(b, np.array(starts[i])), f"micro-batch {i}: BOS positions != planned starts"
             cu[i, :b.size] = torch.from_numpy(b.astype(np.int32))
             rows_np[i] = table_rows(inp_np[i])
+        with ThreadPoolExecutor(os.cpu_count()) as pool:
+            list(pool.map(finish_micro, range(num_micro)))
 
         train_tokens = num_micro * num_tokens
         print(f"  planned in {time.perf_counter() - t0:.1f}s "

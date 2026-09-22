@@ -53,7 +53,7 @@ from typing import NamedTuple
 import numpy as np
 import wandb
 
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,pinned_use_cuda_host_register:True,pinned_num_register_threads:16"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import torch
 import torch._dynamo as dynamo
@@ -1300,6 +1300,9 @@ del lm_head, input_embeds, value_embeds, bigram_embeds, pair_values, resid_lambd
 # §§ Token Frequency Priors
 # ------------------------------------------------------------------------------
 
+torch.cuda.synchronize()
+priors_t0 = time.perf_counter()
+
 # Corpus bigram counts (all 91 train shards): bigram_counts[i, j] = how often token j follows token i.
 bigram = np.load(os.path.join(DATASET_DIR, "tokenizer/bigram_counts.npz"))
 bigram_counts = torch.zeros(cfg.d_vocab, cfg.d_vocab, dtype=torch.float32, device=device)
@@ -1353,10 +1356,16 @@ head_master = rebuild_master(m.lm_head.w, m.lm_head.mantissa).add_(head_prior)
 writeback_master(head_master, m.lm_head.w, m.lm_head.mantissa)
 del embed_prior, head_prior, head_master
 
+torch.cuda.synchronize()
+priors_time = time.perf_counter() - priors_t0
+
 
 # ------------------------------------------------------------------------------
 # §§ Pair Code
 # ------------------------------------------------------------------------------
+
+torch.cuda.synchronize()
+pair_code_t0 = time.perf_counter()
 
 # Corpus trigram statistics (all 91 train shards): each frequent [prev, curr] pair's 64 next tokens with the largest
 # log1p(count / (1,000 * bigram probability)), and those log-ratios.
@@ -1387,6 +1396,9 @@ pair_code[:-1] = pair_code[:-1] @ whitening.float()
 m.pair_code = pair_code.bfloat16()
 del pair_next_ids, pair_log_ratios, pair_counts, centred_head, pair_code, next_ids, log_ratios, position_share
 del covariance, code_rows, eigenvalues, eigenvectors, whitening
+
+torch.cuda.synchronize()
+pair_code_time = time.perf_counter() - pair_code_t0
 
 
 # ------------------------------------------------------------------------------
@@ -1468,6 +1480,7 @@ class RunResult:
     train_time:         float        = 0.0
     val_time:           float        = 0.0
     compile_time:       float        = 0.0
+    init_time:          float        = 0.0
     wall_time:          float        = 0.0
 
     # The rate
@@ -1517,6 +1530,7 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token: {cfg.num_flops_per_token:e}", console=True)
 print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", console=True)
 print0(f"Batch size: {cfg.train_batch_tokens:,} tokens per step", console=True)
+print0(f"Init: token frequency priors {priors_time:.1f}s | pair code {pair_code_time:.1f}s", console=True)
 
 # A flat row per step and the result, for analysis without wandb.
 metrics_path = f"logs/{cfg.run_name}_metrics.csv"
@@ -1755,6 +1769,7 @@ result = RunResult(
     train_time         = float(np.sum(timed)) / 60,
     val_time           = total_val_time / 60,
     compile_time       = compile_time / 60,
+    init_time          = (priors_time + pair_code_time) / 60,
     wall_time          = (time.perf_counter() - run_wall_t0) / 60,
 
     avg_step_time      = avg_step_time,
@@ -1776,7 +1791,7 @@ wandb_run.log({"step": cfg.num_steps,
 print0(f"== {result.run_name} ==", console=True)
 if result.val_bpb is not None:
     print0(f"  val_bpb {result.val_bpb:.6f} | min {result.min_val_bpb:.6f} | slack {result.slack:+,} vs {VAL_BPB_TARGET:.3f}", console=True)
-print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
+print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | init {result.init_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
     print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
 print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
