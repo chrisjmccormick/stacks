@@ -1,0 +1,1143 @@
+{
+ "note": "Kernel map for stacks@sep-28-baseline's train_stack.py (baseline 5: 8 layers, VE at 1/2/5/6/7, full context at 3/4/7, backout at 4, the FFN width ramp 2,2,3,3,5,5,6,6). Built against agent-ops-stacks/decoder-rtx/2026-09-22_0102pm_inline-muon-backward/logs/inl-00-parent-prof_trace.json.gz, step 13, 1027 kernels. Positional entries are offsets from the region's flash-attention anchor and carry an `expect` substring, so an offset that does not hold the kernel the map was written against goes grey rather than getting a confident wrong label. `seen` fields are notes and are never read back.",
+ "model": {
+  "n_layers": 8,
+  "ve_layers": [
+   1,
+   2,
+   5,
+   6,
+   7
+  ],
+  "full_ctxt_layers": [
+   3,
+   4,
+   7
+  ],
+  "backout_layer": 4,
+  "head_fwd_kernels": 6
+ },
+ "by_name": {
+  "flash_fwd": [
+   "fa"
+  ],
+  "flash_bwd": [
+   "fa"
+  ],
+  "pow_relu": [
+   "mlp_act"
+  ],
+  "mul_sqrt": [
+   "mlp_act"
+  ],
+  "embedding_dense_backward": [
+   "table"
+  ],
+  "DeviceRadixSort": [
+   "table"
+  ],
+  "cumsum": [
+   "table"
+  ],
+  "index_copy": [
+   "table"
+  ],
+  "lerp": [
+   "optim"
+  ],
+  "linalg_vector_norm": [
+   "optim"
+  ],
+  "bmm": [
+   "optim"
+  ],
+  "bitwise_or": [
+   "optim"
+  ],
+  "index_mul_pow_sqrt": [
+   "optim"
+  ],
+  "Memcpy": [
+   "copy"
+  ],
+  "Memset": [
+   "copy"
+  ],
+  "fused_copy_copy": [
+   "copy"
+  ],
+  "copy__embedding_dense_backward": [
+   "table"
+  ],
+  "splitKreduce": [
+   "copy"
+  ],
+  "vectorized_elementwise": [
+   "copy"
+  ]
+ },
+ "regions": {
+  "fwd.input": {
+   "0": {
+    "roles": [
+     "embed",
+     "rmsnorm"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_red_fused..._embedding..._rsqrt_0 (236 us) -- the input embedding and its norm"
+   },
+   "1": {
+    "roles": [
+     "copy"
+    ],
+    "expect": "to_copy",
+    "seen": "triton_poi_fused__to_copy_1 (3 us)"
+   },
+   "2": {
+    "roles": [
+     "pair"
+    ],
+    "expect": "mean_mm",
+    "seen": "triton_tem_fused__to_copy_add_embedding_mean_mm_..._transpose_2 (19 us) -- the pair code"
+   }
+  },
+  "fwd.layer": {
+   "-5": {
+    "roles": [
+     "rmsnorm",
+     "bigram",
+     "gate"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_per_fused..._rsqrt_select_sigmoid_* (~1349 us) -- resid scale + x0 gate + bigram + RMSNorm"
+   },
+   "-4": [
+    {
+     "roles": [
+      "wq"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_Q (~628 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wq"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_Q (~628 us) -- cuBLAS"
+    }
+   ],
+   "-3": [
+    {
+     "roles": [
+      "wk"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_K (~619 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wk"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_K (~619 us) -- cuBLAS"
+    }
+   ],
+   "-2": [
+    {
+     "roles": [
+      "rope",
+      "qknorm"
+     ],
+     "expect": "cat",
+     "seen": "triton_per_fused..._cat_..._rsqrt_select_slice_view_* (~858 us) -- RoPE fused into the q/k norm"
+    },
+    {
+     "roles": [
+      "rope",
+      "qknorm"
+     ],
+     "expect": "flash_attn_varlen",
+     "seen": "L0 only: the same kernel, which inductor named after the varlen fwd/bwd it also touches (1693 us)"
+    }
+   ],
+   "-1": [
+    {
+     "roles": [
+      "wv"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_V (~630 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wv"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_V (~630 us) -- cuBLAS"
+    }
+   ],
+   "0": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_fwd",
+    "seen": "flash::flash_fwd_kernel (~885 us)"
+   },
+   "1": [
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_O (~619 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_O (~619 us) -- cuBLAS"
+    }
+   ],
+   "2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_per_fused..._rsqrt_6 (~597 us) -- the MLP input norm"
+   },
+   "3": [
+    {
+     "roles": [
+      "mlp_in",
+      "mlp_act"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_in with relu^2 FUSED IN (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton_tem_fused_mm_pow_relu_* -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_in",
+      "mlp_act"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_in with relu^2 FUSED IN (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton_tem_fused_mm_pow_relu_* -- cuBLAS"
+    }
+   ],
+   "4": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_out (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_out (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- cuBLAS"
+    }
+   ]
+  },
+  "fwd.layer.ve": {
+   "-8": {
+    "roles": [
+     "rmsnorm",
+     "bigram",
+     "gate"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_per_fused..._rsqrt_select_sigmoid_* (~1349 us) -- resid scale + x0 gate + bigram + RMSNorm"
+   },
+   "-7": [
+    {
+     "roles": [
+      "wq"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_Q (~628 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wq"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_Q (~628 us) -- cuBLAS"
+    }
+   ],
+   "-6": [
+    {
+     "roles": [
+      "wk"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_K (~619 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wk"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_K (~619 us) -- cuBLAS"
+    }
+   ],
+   "-5": [
+    {
+     "roles": [
+      "rope",
+      "qknorm"
+     ],
+     "expect": "cat",
+     "seen": "triton_per_fused..._cat_..._rsqrt_select_slice_view_* (~858 us) -- RoPE fused into the q/k norm"
+    },
+    {
+     "roles": [
+      "rope",
+      "qknorm"
+     ],
+     "expect": "flash_attn_varlen",
+     "seen": "L0 only: the same kernel, which inductor named after the varlen fwd/bwd it also touches (1693 us)"
+    }
+   ],
+   "-4": [
+    {
+     "roles": [
+      "wv"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_V (~630 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wv"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_V (~630 us) -- cuBLAS"
+    }
+   ],
+   "-3": [
+    {
+     "roles": [
+      "ve",
+      "gate"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "ve_gate (~18 us) -- triton template"
+    },
+    {
+     "roles": [
+      "ve",
+      "gate"
+     ],
+     "expect": "Kernel2",
+     "seen": "ve_gate (~18 us) -- cuBLAS"
+    }
+   ],
+   "-2": [
+    {
+     "roles": [
+      "pair",
+      "gate"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "pair_gate (~14 us) -- triton template"
+    },
+    {
+     "roles": [
+      "pair",
+      "gate"
+     ],
+     "expect": "Kernel2",
+     "seen": "pair_gate (~14 us) -- cuBLAS"
+    }
+   ],
+   "-1": {
+    "roles": [
+     "ve",
+     "pair",
+     "gate"
+    ],
+    "expect": "embedding",
+    "seen": "triton_poi_fused..._embedding_mul_select_sigmoid_slice_* (~800 us) -- both table reads and both gates applied to v"
+   },
+   "0": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_fwd",
+    "seen": "flash::flash_fwd_kernel (~885 us)"
+   },
+   "1": [
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_O (~619 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_O (~619 us) -- cuBLAS"
+    }
+   ],
+   "2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_per_fused..._rsqrt_6 (~597 us) -- the MLP input norm"
+   },
+   "3": [
+    {
+     "roles": [
+      "mlp_in",
+      "mlp_act"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_in with relu^2 FUSED IN (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton_tem_fused_mm_pow_relu_* -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_in",
+      "mlp_act"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_in with relu^2 FUSED IN (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton_tem_fused_mm_pow_relu_* -- cuBLAS"
+    }
+   ],
+   "4": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_out (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_out (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- cuBLAS"
+    }
+   ]
+  },
+  "fwd.layer.1": {
+   "-10": {
+    "roles": [
+     "rmsnorm",
+     "bigram",
+     "gate"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_per_fused..._rsqrt_select_sigmoid_* (~1349 us) -- resid scale + x0 gate + bigram + RMSNorm"
+   },
+   "-9": [
+    {
+     "roles": [
+      "wq"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_Q (~628 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wq"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_Q (~628 us) -- cuBLAS"
+    }
+   ],
+   "-8": [
+    {
+     "roles": [
+      "wk"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_K (~619 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wk"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_K (~619 us) -- cuBLAS"
+    }
+   ],
+   "-7": [
+    {
+     "roles": [
+      "rope",
+      "qknorm"
+     ],
+     "expect": "cat",
+     "seen": "triton_per_fused..._cat_..._rsqrt_select_slice_view_* (~858 us) -- RoPE fused into the q/k norm"
+    },
+    {
+     "roles": [
+      "rope",
+      "qknorm"
+     ],
+     "expect": "flash_attn_varlen",
+     "seen": "L0 only: the same kernel, which inductor named after the varlen fwd/bwd it also touches (1693 us)"
+    }
+   ],
+   "-6": [
+    {
+     "roles": [
+      "wv"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_V (~630 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wv"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_V (~630 us) -- cuBLAS"
+    }
+   ],
+   "-5": [
+    {
+     "roles": [
+      "ve",
+      "gate"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "ve_gate (17 us) -- triton template"
+    },
+    {
+     "roles": [
+      "ve",
+      "gate"
+     ],
+     "expect": "Kernel2",
+     "seen": "ve_gate (17 us) -- cuBLAS"
+    }
+   ],
+   "-4": [
+    {
+     "roles": [
+      "pair",
+      "gate"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "pair_gate (14 us) -- triton template"
+    },
+    {
+     "roles": [
+      "pair",
+      "gate"
+     ],
+     "expect": "Kernel2",
+     "seen": "pair_gate (14 us) -- cuBLAS"
+    }
+   ],
+   "-3": {
+    "roles": [
+     "ve"
+    ],
+    "expect": "embedding_select",
+    "seen": "triton_poi_fused_embedding_select_slice_13 (313 us) -- the VE table read, materialised here"
+   },
+   "-2": [
+    {
+     "roles": [
+      "pair"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "pair_code_v (629 us) -- materialised here -- triton template"
+    },
+    {
+     "roles": [
+      "pair"
+     ],
+     "expect": "Kernel2",
+     "seen": "pair_code_v (629 us) -- materialised here -- cuBLAS"
+    }
+   ],
+   "-1": {
+    "roles": [
+     "ve",
+     "pair",
+     "gate"
+    ],
+    "expect": "embedding",
+    "seen": "triton_poi_fused..._embedding_mul_select_sigmoid_slice_* (~800 us) -- both table reads and both gates applied to v"
+   },
+   "0": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_fwd",
+    "seen": "flash::flash_fwd_kernel (~885 us)"
+   },
+   "1": [
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_O (~619 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_O (~619 us) -- cuBLAS"
+    }
+   ],
+   "2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt",
+    "seen": "triton_per_fused..._rsqrt_6 (~597 us) -- the MLP input norm"
+   },
+   "3": [
+    {
+     "roles": [
+      "mlp_in",
+      "mlp_act"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_in with relu^2 FUSED IN (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton_tem_fused_mm_pow_relu_* -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_in",
+      "mlp_act"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_in with relu^2 FUSED IN (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton_tem_fused_mm_pow_relu_* -- cuBLAS"
+    }
+   ],
+   "4": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_out (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_out (1226/1159 us at L0-L1, 1815/1694 at L2-L3, 3003/2744 at L4-L5, 3605/3277 at L6-L7) -- cuBLAS"
+    }
+   ]
+  },
+  "fwd.head": {
+   "0": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt_sub",
+    "seen": "triton_per_fused..._rsqrt_sub_46 (1404 us) -- the final norm, with the backout stream subtracted"
+   },
+   "1": [
+    {
+     "roles": [
+      "lmhead"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the logits GEMM (25411 us) -- triton template"
+    },
+    {
+     "roles": [
+      "lmhead"
+     ],
+     "expect": "Kernel2",
+     "seen": "the logits GEMM (25411 us) -- cuBLAS"
+    }
+   ],
+   "2": {
+    "roles": [
+     "lmhead",
+     "loss"
+    ],
+    "expect": "tanh",
+    "seen": "triton_red_fused..._exp_..._tanh_* (17531 us) -- softcap and the loss reduction"
+   },
+   "3": {
+    "roles": [
+     "loss"
+    ],
+    "expect": "gather",
+    "seen": "triton_red_fused..._gather_log_* (46 us)"
+   },
+   "4": {
+    "roles": [
+     "loss"
+    ],
+    "expect": "gather",
+    "seen": "triton_per_fused..._gather_log_* (1 us)"
+   },
+   "5": {
+    "roles": [
+     "copy"
+    ],
+    "expect": "Memset",
+    "seen": "Memset (1 us)"
+   }
+  },
+  "bwd.head": {
+   "0": [
+    {
+     "roles": [
+      "lmhead"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the logits backward (26652 us) -- triton template"
+    },
+    {
+     "roles": [
+      "lmhead"
+     ],
+     "expect": "Kernel2",
+     "seen": "the logits backward (26652 us) -- cuBLAS"
+    }
+   ],
+   "1": [
+    {
+     "roles": [
+      "lmhead"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "its sibling (24880 us) -- triton template"
+    },
+    {
+     "roles": [
+      "lmhead"
+     ],
+     "expect": "Kernel2",
+     "seen": "its sibling (24880 us) -- cuBLAS"
+    }
+   ],
+   "2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt_sub",
+    "seen": "triton_per_fused..._rsqrt_sub_sum_51 (1197 us) -- the final norm backward"
+   },
+   "3": {
+    "roles": [
+     "gate"
+    ],
+    "expect": "neg_sum",
+    "seen": "triton_red_fused_add_copy_copy__mul_neg_sum_52 (12 us) -- backout_lambda's gradient"
+   },
+   "4": {
+    "roles": [
+     "copy"
+    ],
+    "expect": "Memset",
+    "seen": "Memset (1 us)"
+   },
+   "5": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "L7's W_out backward (4031 us) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "L7's W_out backward (4031 us) -- cuBLAS"
+    }
+   ],
+   "6": {
+    "roles": [
+     "mlp_in"
+    ],
+    "expect": "tem_fused_add_mm_mul_rsqrt",
+    "seen": "L7's W_in gradient (4090 us)"
+   },
+   "7": {
+    "roles": [
+     "copy"
+    ],
+    "expect": "Memset",
+    "seen": "Memset (1 us)"
+   },
+   "8": [
+    {
+     "roles": [
+      "mlp_in"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "L7's dx through W_in (4091 us) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_in"
+     ],
+     "expect": "Kernel2",
+     "seen": "L7's dx through W_in (4091 us) -- cuBLAS"
+    }
+   ],
+   "9": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "L7's dx through W_out (3409 us) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "L7's dx through W_out (3409 us) -- cuBLAS"
+    }
+   ]
+  },
+  "bwd.layer": {
+   "-4": {
+    "roles": [
+     "mlp_in"
+    ],
+    "expect": "tem_fused_add_mm_mul_rsqrt",
+    "seen": "triton_tem_fused_add_mm_mul_rsqrt_select_* (1349-4059 us) -- W_in's gradient, the rsqrt algebra fused in"
+   },
+   "-3": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_out's backward (1142-3371 us) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_out's backward (1142-3371 us) -- cuBLAS"
+    }
+   ],
+   "-2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt_sub",
+    "seen": "triton_per_fused..._rsqrt_sub_* (~795 us) -- the MLP input norm backward"
+   },
+   "-1": [
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the W_O backward (~655 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "Kernel2",
+     "seen": "the W_O backward (~655 us) -- cuBLAS"
+    }
+   ],
+   "0": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_dot_do_o",
+    "seen": "flash::flash_bwd_dot_do_o_kernel (~863 us)"
+   },
+   "1": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_dq_dk_dv",
+    "seen": "flash::flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel (~2110 us)"
+   },
+   "2": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_convert_dq",
+    "seen": "flash::flash_bwd_convert_dq_kernel (~633 us)"
+   },
+   "3": {
+    "roles": [
+     "qknorm"
+    ],
+    "expect": "mean_mul",
+    "seen": "triton_per_fused..._mean_mul_* (~442 us) -- the q/k norm backward"
+   },
+   "4": {
+    "roles": [
+     "qknorm"
+    ],
+    "expect": "mean_mul",
+    "seen": "triton_per_fused..._mean_mul_* (~406 us) -- its sibling"
+   },
+   "5": {
+    "roles": [
+     "rope",
+     "qknorm"
+    ],
+    "expect": "rsqrt_select_slice",
+    "seen": "triton_poi_fused..._rsqrt_select_slice_* (~1218 us) -- the rotary backward"
+   }
+  },
+  "bwd.layer.ve": {
+   "-4": {
+    "roles": [
+     "mlp_in"
+    ],
+    "expect": "tem_fused_add_mm_mul_rsqrt",
+    "seen": "triton_tem_fused_add_mm_mul_rsqrt_select_* (1349-4059 us) -- W_in's gradient, the rsqrt algebra fused in"
+   },
+   "-3": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_out's backward (1142-3371 us) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_out's backward (1142-3371 us) -- cuBLAS"
+    }
+   ],
+   "-2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt_sub",
+    "seen": "triton_per_fused..._rsqrt_sub_* (~795 us) -- the MLP input norm backward"
+   },
+   "-1": [
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the W_O backward (~655 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "Kernel2",
+     "seen": "the W_O backward (~655 us) -- cuBLAS"
+    }
+   ],
+   "0": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_dot_do_o",
+    "seen": "flash::flash_bwd_dot_do_o_kernel (~863 us)"
+   },
+   "1": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_dq_dk_dv",
+    "seen": "flash::flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel (~2110 us)"
+   },
+   "2": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_convert_dq",
+    "seen": "flash::flash_bwd_convert_dq_kernel (~633 us)"
+   },
+   "3": [
+    {
+     "roles": [
+      "ve",
+      "gate"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the ve_gate backward (~25 us) -- triton template"
+    },
+    {
+     "roles": [
+      "ve",
+      "gate"
+     ],
+     "expect": "Kernel2",
+     "seen": "the ve_gate backward (~25 us) -- cuBLAS"
+    }
+   ],
+   "4": {
+    "roles": [
+     "ve",
+     "table"
+    ],
+    "expect": "embedding_dense_backward",
+    "seen": "triton_poi_fused_embedding_dense_backward_55 (~34 us)"
+   },
+   "5": [
+    {
+     "roles": [
+      "pair",
+      "gate"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the pair_gate backward (~28 us) -- triton template"
+    },
+    {
+     "roles": [
+      "pair",
+      "gate"
+     ],
+     "expect": "Kernel2",
+     "seen": "the pair_gate backward (~28 us) -- cuBLAS"
+    }
+   ],
+   "6": {
+    "roles": [
+     "pair",
+     "table"
+    ],
+    "expect": "embedding_dense_backward",
+    "seen": "triton_poi_fused_embedding_dense_backward_56 (~228 us)"
+   },
+   "7": {
+    "roles": [
+     "ve",
+     "pair",
+     "table"
+    ],
+    "expect": "embedding_dense_backward",
+    "seen": "triton_red_fused..._embedding_dense_backward_* (~1468 us) -- both tables' gradients"
+   }
+  },
+  "bwd.layer.0": {
+   "-4": {
+    "roles": [
+     "mlp_in"
+    ],
+    "expect": "tem_fused_add_mm_mul_rsqrt",
+    "seen": "triton_tem_fused_add_mm_mul_rsqrt_select_* (1349-4059 us) -- W_in's gradient, the rsqrt algebra fused in"
+   },
+   "-3": [
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "W_out's backward (1142-3371 us) -- triton template"
+    },
+    {
+     "roles": [
+      "mlp_out"
+     ],
+     "expect": "Kernel2",
+     "seen": "W_out's backward (1142-3371 us) -- cuBLAS"
+    }
+   ],
+   "-2": {
+    "roles": [
+     "rmsnorm"
+    ],
+    "expect": "rsqrt_sub",
+    "seen": "triton_per_fused..._rsqrt_sub_* (~795 us) -- the MLP input norm backward"
+   },
+   "-1": [
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "tem_fused_mm",
+     "seen": "the W_O backward (~655 us) -- triton template"
+    },
+    {
+     "roles": [
+      "wo"
+     ],
+     "expect": "Kernel2",
+     "seen": "the W_O backward (~655 us) -- cuBLAS"
+    }
+   ],
+   "0": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_dot_do_o",
+    "seen": "flash::flash_bwd_dot_do_o_kernel (~863 us)"
+   },
+   "1": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_dq_dk_dv",
+    "seen": "flash::flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel (~2110 us)"
+   },
+   "2": {
+    "roles": [
+     "fa"
+    ],
+    "expect": "flash_bwd_convert_dq",
+    "seen": "flash::flash_bwd_convert_dq_kernel (~633 us)"
+   },
+   "3": {
+    "roles": [
+     "qknorm"
+    ],
+    "expect": "mean_mul",
+    "seen": "triton_per_fused..._mean_mul_* (~442 us) -- the q/k norm backward"
+   },
+   "4": {
+    "roles": [
+     "qknorm"
+    ],
+    "expect": "mean_mul",
+    "seen": "triton_per_fused..._mean_mul_* (~406 us) -- its sibling"
+   },
+   "5": {
+    "roles": [
+     "rope",
+     "qknorm"
+    ],
+    "expect": "rsqrt_select_slice",
+    "seen": "triton_poi_fused..._rsqrt_select_slice_* (~1218 us) -- the rotary backward"
+   },
+   "131": {
+    "roles": [
+     "copy"
+    ],
+    "expect": "",
+    "seen": "the last kernel before Muon's first lerp / linalg_vector_norm"
+   },
+   "_default": {
+    "roles": [],
+    "seen": "L0's QKV backward and the gradient tail -- not yet mapped"
+   }
+  },
+  "optim": {
+   "_default": {
+    "roles": [
+     "optim"
+    ],
+    "seen": "~586 kernels, Muon and AdamW, nearly all under 20 us"
+   }
+  }
+ }
+}
