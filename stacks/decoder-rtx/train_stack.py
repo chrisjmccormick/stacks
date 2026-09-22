@@ -102,10 +102,10 @@ class StackConfig:
     # ---- Architecture ----
 
     # Model
-    n_layers:   int = 11
+    n_layers:   int = 8
     d_model:    int = 768
 
-    backout_layer: int = 6 # nanochat: n_layers // 2
+    backout_layer: int = 4 # nanochat: n_layers // 2
 
     # Input
     d_vocab:         int = 32768
@@ -124,22 +124,22 @@ class StackConfig:
     # Context and Sliding Window Attention
     seq_len:          int = 2048
     short_win_size:   int = 768
-    full_ctxt_layers: list[int] = [   3,    6,    10]
+    full_ctxt_layers: list[int] = [   3,    4,     7]
     window_sizes:     list[tuple[int, int]]  # Derived below.
 
     # Attention - Value Embeddings
     d_ve_gate: int = 12  # Gate input is first 12-dims of the layer's residual stream.
                          # Each head has its own gate, all with same input.
-    ve_layers: list[int] = [1, 2, 8, 9, 10]
+    ve_layers: list[int] = [1, 2, 5, 6, 7]
     ve_index:  list[int] # Derived from ve_layers.
     num_ves:   int
 
     # MLP
-    d_mlp:      int = 4 * 768 # 3072
+    d_mlp:      list[int] = [768 * r for r in (2, 2, 3, 3, 5, 5, 6, 6)]  # per layer; mean 4x = 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 5_891_757_334     # every trained weight (§ Weight Init & Schedule)
-    num_flops_per_token: int = 780_929_568     # 6 * 110,100,912 matmul params + attention
+    num_params:          int = 5_870_523_658     # every trained weight (§ Weight Init & Schedule)
+    num_flops_per_token: int = 586_289_376     # 6 * 82,379,472 matmul params + attention, at 8 layers
 
     # ---- Training ----
 
@@ -147,7 +147,7 @@ class StackConfig:
     train_batch_tokens: int = 96 * 2048   # 192K tokens per step
 
     # Training
-    num_steps: int = 1760
+    num_steps: int = 2079
 
     # Evaluation and logging
     val_loss_every:  int = 333
@@ -156,7 +156,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "baseline4"  # both wandb and log files
+    run_name:        str = "baseline5"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -265,9 +265,7 @@ class Model:
     pair_code:     Tensor # Frozen corpus code per frequent [prev, curr] pair; last row is zeros.
     pair_decoder:  Param  # Reads a pair's code into the value space, once for all VE layers.
 
-    # MLP
-    W_in:  Param
-    W_out: Param
+    # MLP -- one bank per width, W_in_<d> / W_out_<d> (see mlp_banks)
 
     # Cross-Layer
     x0_lambdas:     Param   # Per-layer coefficient for reading the input embedding.
@@ -308,7 +306,7 @@ class LayerStash(NamedTuple):
     lse:                Tensor    # (L,  n_qo,  T)        fp32         (18MB)
     x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
     x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
-    mlp_a:              Tensor    # (L,  T, d_mlp)              18GB
+    mlp_a:              Tensor    # (L,  T, d_mlp[i])           18GB
     #mlp_relu:          Tensor    # (L,  T, d_mlp)                               18GB
     #                                                         ------           ------
     #                                                 TOTAL:  49.5GB          20.25GB
@@ -465,9 +463,10 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         x_attn_out_inv_rms = (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         x_attn_out_hat = bf16(x_attn_out.float() * x_attn_out_inv_rms)
 
-        # MLP
-        mlp_a = F.relu(x_attn_out_hat @ m.W_in.w[i].mT).square()   # (T, d_mlp) - (64K, 3K) stashed
-        mlp_out = mlp_a @ m.W_out.w[i].mT
+        # MLP -- this layer's width has its own bank; k is the layer's slot in it
+        W_in, W_out, k = mlp_banks[i]
+        mlp_a = F.relu(x_attn_out_hat @ W_in.w[k].mT).square()   # (T, d_mlp[i]) stashed
+        mlp_out = mlp_a @ W_out.w[k].mT
 
         # Write back to the stream.
         x = x_attn_out + mlp_out            # the residual stream; appears as xb in bwd
@@ -580,19 +579,21 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         # --- MLP backward (relu^2: mlpb_z = 2*mlp_relu*mlpb_a, self-masking
         #     since mlp_relu is already 0 where z < 0) ---
 
+        W_in, W_out, k = mlp_banks[i]
+
         # Grad w.r.t. W_out
-        m.W_out.gbank[i].copy_(xb.mT @ st.mlp_a) # (d_model, T) @ (T, d_mlp)
+        W_out.gbank[k].copy_(xb.mT @ st.mlp_a) # (d_model, T) @ (T, d_mlp[i])
 
         # Grad w.r.t. the pre-relu matmul output (mlpb_a = xb @ W_out is inline)
         mlp_relu = st.mlp_a * (st.mlp_a + 1e-30).rsqrt()   # = mlp_a.sqrt()
-        mlpb_z = 2.0 * mlp_relu * (xb @ m.W_out.w[i])
+        mlpb_z = 2.0 * mlp_relu * (xb @ W_out.w[k])
 
         x_attn_out_inv_rms, x_attn_out_hat = st.x_attn_out_inv_rms, st.x_attn_out_hat
 
         # Grad w.r.t. W_in
-        m.W_in.gbank[i].copy_(mlpb_z.mT @ x_attn_out_hat) # (d_mlp, T) @ (T, d_model)
+        W_in.gbank[k].copy_(mlpb_z.mT @ x_attn_out_hat) # (d_mlp[i], T) @ (T, d_model)
 
-        xb_attn_out_hat = mlpb_z @ m.W_in.w[i] # (T, d_mlp) @ (d_mlp, d_model) --> (T, d_model)
+        xb_attn_out_hat = mlpb_z @ W_in.w[k] # (T, d_mlp[i]) @ (d_mlp[i], d_model) --> (T, d_model)
 
         xb_attn_out = xb + bf16(x_attn_out_inv_rms * (xb_attn_out_hat.float() - (x_attn_out_hat.float() * (x_attn_out_hat.float() * xb_attn_out_hat.float()).mean(dim=-1, keepdim=True))))
 
@@ -804,7 +805,10 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+# Not autotuned: autotuning a square 768x768 bank's bmm at a batch size the shipped
+# cache lacks raises inductor's "launcher() got multiple values for argument 'stream'"
+# (torch 2.10 / triton 3.6). Costs ~0.3% of the step.
+@torch.compile(dynamic=False, fullgraph=True, options={"max_autotune_gemm": False})
 def muon_step_fused(
     p: Param,       # the (K, out, in) weight-bank bundle: live tensor, state, schedule tables
     grad: Tensor,   # (K, out, in) fp32 gradient -- MUTATED (nesterov lerp)
@@ -875,6 +879,12 @@ warmdown      = slice(cfg.num_steps - warmdown_len + 1, cfg.num_steps)   # the h
 warmdown_frac = (cfg.num_steps - steps_0idx[warmdown]) / warmdown_len  # ~1 -> ~0 across the warmdown
 
 lr_mult_t[warmdown] = 0.05 + (1.0 - 0.05) * warmdown_frac
+
+# Muon warms down on its own schedule: the last 95% of the run, to 0.025.
+muon_warmdown_len = round(0.95 * cfg.num_steps)
+muon_warmdown     = slice(cfg.num_steps - muon_warmdown_len + 1, cfg.num_steps)
+muon_lr_mult_t    = np.ones(cfg.num_steps)
+muon_lr_mult_t[muon_warmdown] = 0.025 + (1.0 - 0.025) * (cfg.num_steps - steps_0idx[muon_warmdown]) / muon_warmdown_len
 
 
 # ------------------------------------------------------------------------------
@@ -1207,8 +1217,10 @@ pair_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
     0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 2))
 pair_decoder = fp32_zeros(1, cfg.n_kv_heads * cfg.d_vo, cfg.d_model)  # starts at zero
 
-W_in  = fp32_empty(cfg.n_layers, cfg.d_mlp,   cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4)
-W_out = fp32_zeros(cfg.n_layers, cfg.d_model, cfg.d_mlp)             # projections start at zero
+# One bank per distinct MLP width, holding that width's layers in order.
+mlp_widths = sorted(set(cfg.d_mlp))
+W_in  = {d: fp32_empty(cfg.d_mlp.count(d), d, cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4) for d in mlp_widths}
+W_out = {d: fp32_zeros(cfg.d_mlp.count(d), cfg.d_model, d) for d in mlp_widths}   # projections start at zero
 
 # Muon momentum warmup 0.85 -> 0.97 over 400 steps
 momentum_warmup = 400
@@ -1226,8 +1238,7 @@ muon_wd[0] = 0.28
 run_frac = (cfg.num_steps - steps_0idx[1:]) / cfg.num_steps
 muon_wd[1:] = 0.28 * (0.5 * (1.0 + np.cos(math.pi * (1.0 - run_frac))))
 
-# Muon peak lr is 0.02, scaled up for tall matrices by their sqrt(fan_out/fan_in)
-# aspect ratio -- at d12 only W_in (the 4x MLP expansion -> 2.0). rdim is the
+# Muon peak lr is 0.02, and 0.04 on W_in at every width. rdim is the
 # axis facing the residual stream: W_O and W_out live transposed -> -2; the
 # ve_gate rows read a d_ve_gate slice of the stream -> -1, pair_decoder the pair code -> -1.
 muon_configs = [
@@ -1236,8 +1247,8 @@ muon_configs = [
     ("W_K",          W_K,           0.02,      -1),
     ("W_V",          W_V,           0.02,      -1),
     ("W_O",          W_O,           0.02,      -2),
-    ("W_in",         W_in,          0.04,      -1),
-    ("W_out",        W_out,         0.02,      -2),
+    *[(f"W_in_{d}",  W_in[d],       0.04,      -1) for d in mlp_widths],
+    *[(f"W_out_{d}", W_out[d],      0.02,      -2) for d in mlp_widths],
     ("ve_gate",      ve_gate,       0.02,      -1),
     ("pair_gate",    pair_gate,     0.02,      -1),
     ("pair_decoder", pair_decoder,  0.02,      -1)
@@ -1276,8 +1287,8 @@ for (name, w, peak_lr, rdim) in muon_configs:
         # Schedules
         # The second moment is self-normalizing (the v_norm/v_norm_new
         # rescale), so lr_bc_t has no bias correction and there is no eps.
-        lr_bc_t      = dev(lr_mult_t * peak_lr),
-        wd_t         = dev(lr_mult_t * peak_lr * muon_wd),
+        lr_bc_t      = dev(muon_lr_mult_t * peak_lr),
+        wd_t         = dev(muon_lr_mult_t * peak_lr * muon_wd),
 
         # b1 is the nesterov momentum (warmed up/down above); b2 is the
         # variance-reduction EMA, a constant 0.9.
@@ -1294,6 +1305,10 @@ for (name, w, peak_lr, rdim) in muon_configs:
 
 # The Params own everything now: free the fp32 draws, drop the adopted names.
 del lm_head, input_embeds, value_embeds, bigram_embeds, pair_values, resid_lambdas, x0_lambdas, x0_gates, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, pair_gate, pair_decoder, W_in, W_out
+
+# Each layer's MLP banks and its slot in them.
+mlp_banks = [(getattr(m, f"W_in_{d}"), getattr(m, f"W_out_{d}"), cfg.d_mlp[:i].count(d)) for i, d in enumerate(cfg.d_mlp)]
+mlp_params = [getattr(m, f"W_{io}_{d}") for io in ("in", "out") for d in mlp_widths]
 
 
 # ------------------------------------------------------------------------------
@@ -1683,7 +1698,7 @@ for step in range(cfg.num_steps + 1):
     # Smooth gradients, update weights
 
     # Muon 
-    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate, m.pair_gate, m.pair_decoder):
+    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, *mlp_params, m.ve_gate, m.pair_gate, m.pair_decoder):
         muon_step_fused(p, p.grad, t_step)
 
     # AdamW
