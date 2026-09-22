@@ -86,6 +86,9 @@ ROLES = {
     "smear":    ("smear",         82,  40, 52, 33),
     "table":    ("table rows",   166,  36, 48, 32),   # sort / compaction / scatter
     "optim":    ("optimizer",      0,   0, 52, 52),
+    "muon":     ("Muon step",     18,  85, 66, 50),   # coral -- momentum, norm, variance reduction, the update
+    "muon_pe":  ("Muon Polar Express", 348, 70, 58, 42),   # rose -- its Gram / A@A / combine GEMMs
+    "adam":     ("AdamW step",    42,  80, 60, 46),   # amber
     "copy":     ("copy / cast",  210,  14, 46, 46),
     "unmapped": ("unmapped",       0,   0, 26, 26),
 }
@@ -478,11 +481,14 @@ def main():
         # dropped kernels earlier in the step has its layer 2 at a different wall time,
         # and comparing it against the baseline's clock would slide the two apart for a
         # reason that has nothing to do with the region under the microscope.
-        base_zero = rows[0]["events"][hits[0][2]][0]
+        # The alignment point is the region's anchor (its flash-attention kernel), not its first
+        # kernel: what sits at the window's first offset can differ between arms when the scheduler
+        # moves work around, and the anchor is the one kernel every row has in the same place.
+        base_zero = rows[0]["events"][hits[0][4]][0]
         for r in rows[1:]:
             mine = matching(r)
             if mine:
-                r["shift"] = r["events"][mine[0][2]][0] - base_zero
+                r["shift"] = r["events"][mine[0][4]][0] - base_zero
         ev = rows[0]["events"]
         t_start = ev[hits[0][2]][0]
         t_end = ev[hits[-1][3]][0] + ev[hits[-1][3]][1]
