@@ -67,6 +67,8 @@ DATASET_DIR = "./data/climbmix_unigram16k_14_170"
 
 NUM_TRAIN_SHARDS   = 10      # the 2,000-step plan reads 5 (100M raw tokens each)
 EVAL_BUFFER_TOKENS = 65536   # tokens per validation micro-batch
+CAP0               = 256     # document prefix cap at micro-batch 0
+CAP_RAMP_FRAC      = 0.5     # fraction of the run over which it reaches seq_len
 
 
 def download_dataset():
@@ -199,8 +201,8 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
     (inputs, targets, cu_seqlens) device tensors -- the packed varlen layout
     the forward passes consume.
     "train" plans and stages all `total_micro_steps` + 1 micro-batches up front,
-    placing each document's first seq_len tokens and cutting at most one
-    document per micro-batch to fill it exactly.
+    placing each document's first cap(i) tokens (see CAP0) and cutting at most
+    one document per micro-batch to fill it exactly.
     "val" is single-epoch: sequences are BOS-aligned and only returned from their
     beginning; tokens past `seq_len` are discarded (the next sequence starts at
     the next BOS). The generator ends when the shards run out.
@@ -216,7 +218,9 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
     if split == "train":
         num_tokens = tokens_per_micro
         num_micro = total_micro_steps + 1
-        print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: documents capped at {seq_len} ===")
+        ramp = max(1, round(CAP_RAMP_FRAC * total_micro_steps))
+        print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: document prefix cap "
+              f"{CAP0} -> {seq_len} in 64-token steps over the first {ramp} micro-batches, then {seq_len} ===")
 
         t0 = time.perf_counter()
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
@@ -227,6 +231,8 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
         docs = _doc_stream(bos_id)
         num_docs, raw_tokens = 0, 0
         for i in range(num_micro):
+            # Rounded to a multiple of 64.
+            cap = seq_len if i >= ramp else 64 * round(CAP0 * (seq_len / CAP0) ** (i / ramp) / 64)
             pos = 0
             while pos < num_tokens:
                 doc = next(docs, None)
@@ -235,7 +241,7 @@ def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
                 L = doc.size
                 num_docs += 1
                 raw_tokens += L
-                n = min(L, seq_len, num_tokens - pos)   # capped, or cut to fill
+                n = min(L, cap, num_tokens - pos)   # capped, or cut to fill
                 inp_np[i, pos:pos + n] = doc[:n]
                 if n < L:                           # cut short
                     tgt_np[i, pos:pos + n] = doc[1:n + 1]
