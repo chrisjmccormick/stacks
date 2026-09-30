@@ -455,8 +455,9 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         q, k = q.float() * q_inv_rms, k.float() * k_inv_rms
         q1, q2 = q[..., :half], q[..., half:]
         k1, k2 = k[..., :half], k[..., half:]
-        q_hat = bf16(torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=-1))
-        k_hat = bf16(torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=-1))
+        # TRAP: round each half before the cat; bf16(cat(...)) keeps the fp32 cat alive for the backward.
+        q_hat = torch.cat([bf16(q1 * cos + q2 * sin), bf16(q1 * (-sin) + q2 * cos)], dim=-1)
+        k_hat = torch.cat([bf16(k1 * cos + k2 * sin), bf16(k1 * (-sin) + k2 * cos)], dim=-1)
 
         # Read V from past residual streams by matching their K.
         y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cfg.seq_len, cfg.window_sizes[i])
