@@ -62,12 +62,10 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqle
 # Dataset
 # ------------------------------------------------------------------------------
 
-# climbmix_32k_8_170's text re-tokenized with priml's 16K byte-level Unigram
-# (agent-ops-stacks decoder-rtx/2026-09-30_0933am_priml-full-recipe/build_unigram16k.py).
 REPO_ID = "ChrisMcCormick/climbmix_unigram16k_14_170"
 DATASET_DIR = "./data/climbmix_unigram16k_14_170"
 
-NUM_TRAIN_SHARDS   = 10      # the 2,079-step plan reads ~5 (100M raw tokens each)
+NUM_TRAIN_SHARDS   = 10      # the 2,000-step plan reads 5 (100M raw tokens each)
 EVAL_BUFFER_TOKENS = 65536   # tokens per validation micro-batch
 
 
