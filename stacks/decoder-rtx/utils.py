@@ -62,13 +62,13 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqle
 # Dataset
 # ------------------------------------------------------------------------------
 
-REPO_ID = "ChrisMcCormick/climbmix_32k_8_170"
-DATASET_DIR = "./data/climbmix_32k_8_170"
+# climbmix_32k_8_170's text re-tokenized with priml's 16K byte-level Unigram
+# (agent-ops-stacks decoder-rtx/2026-09-30_0933am_priml-full-recipe/build_unigram16k.py).
+REPO_ID = "ChrisMcCormick/climbmix_unigram16k_14_170"
+DATASET_DIR = "./data/climbmix_unigram16k_14_170"
 
-NUM_TRAIN_SHARDS   = 10      # the 988-step plan reads 8 (100M raw tokens each)
+NUM_TRAIN_SHARDS   = 10      # the 2,079-step plan reads ~5 (100M raw tokens each)
 EVAL_BUFFER_TOKENS = 65536   # tokens per validation micro-batch
-CAP0               = 256     # document prefix cap at micro-batch 0
-CAP_RAMP_FRAC      = 0.5     # fraction of the run over which it reaches seq_len
 
 
 def download_dataset():
@@ -194,16 +194,15 @@ class Shard:
 # Data Loader
 # ------------------------------------------------------------------------------
 
-def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_steps=None):
+def data_generator(split, seq_len, tokens_per_micro, total_micro_steps=None):
     """
     Generator (i.e., yields rather than returns) of one micro-batch per call:
     `tokens_per_micro` tokens for "train" and EVAL_BUFFER_TOKENS for "val", as
-    (inputs, targets, rows, cu_seqlens) device tensors -- the packed varlen
-    layout the forward passes consume. `table_rows` maps a micro-batch's input
-    ids to its lookup tables' rows, a (7, tokens) int32 array, on the host.
+    (inputs, targets, cu_seqlens) device tensors -- the packed varlen layout
+    the forward passes consume.
     "train" plans and stages all `total_micro_steps` + 1 micro-batches up front,
-    placing each document's first cap(i) tokens (see CAP0) and cutting at most
-    one document per micro-batch to fill it exactly.
+    placing each document's first seq_len tokens and cutting at most one
+    document per micro-batch to fill it exactly.
     "val" is single-epoch: sequences are BOS-aligned and only returned from their
     beginning; tokens past `seq_len` are discarded (the next sequence starts at
     the next BOS). The generator ends when the shards run out.
@@ -219,22 +218,17 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
     if split == "train":
         num_tokens = tokens_per_micro
         num_micro = total_micro_steps + 1
-        ramp = max(1, round(CAP_RAMP_FRAC * total_micro_steps))
-        print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: document prefix cap "
-              f"{CAP0} -> {seq_len} in 64-token steps over the first {ramp} micro-batches, then {seq_len} ===")
+        print(f"=== Planning {num_micro} micro-batches of {num_tokens:,}: documents capped at {seq_len} ===")
 
         t0 = time.perf_counter()
         inputs = torch.empty((num_micro, num_tokens), dtype=torch.int32, pin_memory=True)
         targets = torch.empty((num_micro, num_tokens), dtype=torch.int64, pin_memory=True)
-        rows = torch.empty((num_micro, 7, num_tokens), dtype=torch.int32, pin_memory=True)
-        inp_np, tgt_np, rows_np = inputs.numpy(), targets.numpy(), rows.numpy()  # views: write straight into pinned memory
+        inp_np, tgt_np = inputs.numpy(), targets.numpy()  # views: write straight into pinned memory
         starts = [[] for _ in range(num_micro)]
 
         docs = _doc_stream(bos_id)
         num_docs, raw_tokens = 0, 0
         for i in range(num_micro):
-            # Rounded to a multiple of 64.
-            cap = seq_len if i >= ramp else 64 * round(CAP0 * (seq_len / CAP0) ** (i / ramp) / 64)
             pos = 0
             while pos < num_tokens:
                 doc = next(docs, None)
@@ -243,7 +237,7 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
                 L = doc.size
                 num_docs += 1
                 raw_tokens += L
-                n = min(L, cap, num_tokens - pos)   # capped, or cut to fill
+                n = min(L, seq_len, num_tokens - pos)   # capped, or cut to fill
                 inp_np[i, pos:pos + n] = doc[:n]
                 if n < L:                           # cut short
                     tgt_np[i, pos:pos + n] = doc[1:n + 1]
@@ -253,7 +247,7 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
                 starts[i].append(pos)
                 pos += n
 
-        # cu_seqlens (checked against the BOS positions in the inputs) and the tables' rows.
+        # cu_seqlens, checked against the BOS positions in the inputs.
         docs_per_micro = np.array([len(s) for s in starts])
         cu_width = max(max_num_docs, 64 * math.ceil((int(docs_per_micro.max()) + 1) / 64))
         cu = torch.full((num_micro, cu_width), num_tokens, dtype=torch.int32, pin_memory=True)
@@ -261,13 +255,12 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
             b = np.flatnonzero(inp_np[i] == bos_id)
             assert np.array_equal(b, np.array(starts[i])), f"micro-batch {i}: BOS positions != planned starts"
             cu[i, :b.size] = torch.from_numpy(b.astype(np.int32))
-            rows_np[i] = table_rows(inp_np[i])
         with ThreadPoolExecutor(os.cpu_count()) as pool:
             list(pool.map(finish_micro, range(num_micro)))
 
         train_tokens = num_micro * num_tokens
         print(f"  planned in {time.perf_counter() - t0:.1f}s "
-              f"({(inputs.numel() * 4 + targets.numel() * 8 + rows.numel() * 4) / 2**30:.1f} GiB pinned): "
+              f"({(inputs.numel() * 4 + targets.numel() * 8) / 2**30:.1f} GiB pinned): "
               f"{num_docs:,} docs, {raw_tokens:,} raw tokens -> {train_tokens:,} trained "
               f"({100 * (1 - train_tokens / raw_tokens):.1f}% discarded by the cap and the fill)")
         print(f"  docs per micro-batch: first {docs_per_micro[0]}, mean {docs_per_micro.mean():.0f}, "
@@ -276,7 +269,6 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
         for i in range(num_micro):
             yield (inputs[i].to("cuda", non_blocking=True),
                    targets[i].to("cuda", non_blocking=True),
-                   rows[i].to("cuda", non_blocking=True),
                    cu[i].to("cuda", non_blocking=True))
         return
 
@@ -355,12 +347,10 @@ def data_generator(split, seq_len, tokens_per_micro, table_rows, total_micro_ste
         _inputs = _inputs.to(dtype=torch.int32)
         _targets = _targets.to(dtype=torch.int64)
         _cum_lengths = _cum_lengths.to(dtype=torch.int32)
-        _rows = torch.from_numpy(table_rows(_inputs.numpy()))
 
         yield (
             _inputs.to(device="cuda", non_blocking=True),
             _targets.to(device="cuda", non_blocking=True),
-            _rows.to(device="cuda", non_blocking=True),
             _cum_lengths.to(device="cuda", non_blocking=True),
         )
         # Execution resumes here on the next call.
