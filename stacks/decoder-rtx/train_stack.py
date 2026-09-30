@@ -385,7 +385,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
 
     assert T <= m.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {m.cos.size(1)}"
 
-    cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, half)
+    cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, d_qk): [cos, cos] and [sin, -sin]
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
     x_pool = None
     x_src_hat = None
@@ -453,11 +453,8 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         q_inv_rms = (q.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         k_inv_rms = (k.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         q, k = q.float() * q_inv_rms, k.float() * k_inv_rms
-        q1, q2 = q[..., :half], q[..., half:]
-        k1, k2 = k[..., :half], k[..., half:]
-        # TRAP: round each half before the cat; bf16(cat(...)) keeps the fp32 cat alive for the backward.
-        q_hat = torch.cat([bf16(q1 * cos + q2 * sin), bf16(q1 * (-sin) + q2 * cos)], dim=-1)
-        k_hat = torch.cat([bf16(k1 * cos + k2 * sin), bf16(k1 * (-sin) + k2 * cos)], dim=-1)
+        q_hat = bf16(q * cos + torch.roll(q, half, dims=-1) * sin)
+        k_hat = bf16(k * cos + torch.roll(k, half, dims=-1) * sin)
 
         # Read V from past residual streams by matching their K.
         y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cfg.seq_len, cfg.window_sizes[i])
@@ -649,10 +646,8 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         kb = bf16(st.k_inv_rms * (kb_hat.float() - st.k_hat.float() * (st.k_hat.float() * kb_hat.float()).mean(dim=-1, keepdim=True)))
 
         # rotary backward = rotation by -theta (transpose of the forward rotation)
-        qb1, qb2 = qb[..., :half], qb[..., half:]
-        kb1, kb2 = kb[..., :half], kb[..., half:]
-        qb = torch.cat([qb1 * cos - qb2 * sin, qb1 * sin + qb2 * cos], dim=-1)
-        kb = torch.cat([kb1 * cos - kb2 * sin, kb1 * sin + kb2 * cos], dim=-1)
+        qb = qb * cos - torch.roll(qb, half, dims=-1) * sin
+        kb = kb * cos - torch.roll(kb, half, dims=-1) * sin
 
         # --- VE gate backward (ve and ve_gate_sig recomputed) ---
         j = cfg.ve_index[i]
@@ -1275,8 +1270,8 @@ inv_freq = 1.0 / (3_000_000 ** (channel_range / cfg.d_qk))
 t_pos = torch.arange(rotary_seq_len, dtype=torch.float32, device=device)          # stride the time steps
 freqs = torch.outer(t_pos, inv_freq)   # rotation frequency at each (time, channel) pair
 
-m.cos = freqs.cos().to(torch.bfloat16)[None, :, None, :]  # add batch and head dims
-m.sin = freqs.sin().to(torch.bfloat16)[None, :, None, :]  # for later broadcasting
+m.cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).to(torch.bfloat16)[None, :, None, :]   # add batch and head dims
+m.sin = torch.cat([freqs.sin(), -freqs.sin()], dim=-1).to(torch.bfloat16)[None, :, None, :]  # for later broadcasting
 
 del channel_range, inv_freq, t_pos, freqs
 
