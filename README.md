@@ -7,7 +7,7 @@ Self-contained (~single file) training stacks.
 ### DecoderStack-rtx
 
 - nanochat's d12 pretraining pipeline flattened into a single file, with a "handwritten" backward pass.
-- Timed on a single RTX Pro 6000 (96GB), currently reaches the target val bpb in 27 minutes of training.
+- Timed on a single RTX Pro 6000 (96GB), currently reaches the target val bpb of 0.9 in 16 minutes of training.
 - I'm running this as a challenge for September 2026.
 - [`stacks/decoder-rtx/`](stacks/decoder-rtx/README.md)
 

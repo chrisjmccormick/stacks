@@ -2,21 +2,22 @@
 
 To encourage more exploration/hacking of the backward pass, I'm running a single-GPU pre-training speedrun for the month of September. 
 
-The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU), current baseline is 27 minutes.
+The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU), current baseline is 16 minutes.
 
 The baseline 12 layer model (same scale as [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and pipeline come from [nanochat](https://github.com/karpathy/nanochat).
 
-Final validation score is reported in terms of the amount of slack versus the target. Current baseline slack is (0.900000 - 0.899590) x 1e6 = **410** points (or 410 µbpb, if you prefer). 
+Final validation score is reported in terms of the amount of slack versus the target. The original baseline slack was (0.900000 - 0.899590) x 1e6 = **410** points (or 410 µbpb, if you prefer). 
 
-- From identical runs, the current "noise floor" is ±35 
-- At current step time, 40 points is worth ~1 second.
-- One training step appears to cost / gain ~70 points.
+You can roughly estimate a conversion rate between slack and steps, and therefore time.
+In the original baseline:
+- 40 points was worth ~1 second.
+- 1 training step was worth ~70 points. 
 
 ### Competition
 
-The leaderboard won't be the traditional PR ladder. I'll do a weekly baseline on Mondays that folds in whatever changes I liked and managed to validate, and credit everyone involved in that. 
+For the leaderboard, instead of the traditional PR ladder, weekly baselines (on Mondays) fold in whatever changes I liked and managed to validate, and credit everyone involved in that. 
 
-(Generally, though, you'll be on your own to promote your successes. What makes it into the baseline is going to be very subjective and limited by my capacity, so I apologize in advance to those who don't get the recognition they deserve.)
+(Generally, though, you'll be on your own to promote your successes. What makes it into the baseline is going to be  subjective and limited by my capacity, so I apologize in advance to those who don't get the recognition they deserve.)
 
 Final baseline will be on Monday, September 28th.
 
@@ -57,12 +58,14 @@ python train_stack.py
 
 ### Baselines
 
-*September 4th Baseline*
+| Name | Time | Δ from Baseline 1 | Slack (μbpb) |
+| --- | --- | --- | --- |
+| 2026-09-04 - Baseline 1 | 26m 51s | - | 271 |
+| 2026-09-07 - Baseline 2 | 25m 56s | -0m 55s | 837 |
+| 2026-09-14 - Baseline 3 | 24m 21s | -2m 30s | 837 |
+| 2026-09-21 - Baseline 4 | 15m 47s | -m 04s | 920 |
 
-- [wandb run](https://wandb.ai/chrismccormick/decoderstack_rtx/runs/ykjt80he)
-- 1,627 seconds (~27 minutes)
-- 410 ubpb of slack
-
+The baseline runs can all be viewed on wandb, [here](https://wandb.ai/chrismccormick/decoderstack_rtx).
 
 ### Acknowledgements
 
@@ -73,22 +76,11 @@ python train_stack.py
 
 TODO - I'd like to try and carry forward crediting the individual algorithm and architecture improvements leveraged here that were first introduced by modded-nanogpt contributors, and any research paper behind them.
 
+- The September 21st baseline includes several innovations from the priml autoresearch run.
+
 ### Interesting Techniques
 
-- The baseline includes initialization of the vocabulary with the bigram distribution measured from the training data.
-- The head's log-frequency (unigram) component is halved at init. The first ten steps of training did that on their own, and doing it up front removes the step-1 loss spike (6.05 -> 7.6 nats) and finished 270 ubpb ahead of the same run without it.
-- The document-prefix cap ramp is rounded to multiples of 64 tokens: FA2 varlen's cost steps up each time a document crosses a 64-token boundary.
+- Initialization of the vocabulary with the bigram distribution measured from the training data.
 - Selectively re-computing certain parts of the forward activation conserved enough memory to allow for a micro-batch size of 256K tokens.
-- A frozen "pair code" read into the attention values. `tokenizer/pair_next_tokens.npz` holds, for the 2.1M most frequent [prev, curr] token pairs of the training data (88% of positions), the 64 next tokens the pair makes most likely relative to the bigram: `log1p(count / (1,000 * bigram probability))`, counted over all 91 train shards. At init each pair's log-ratios are summed through the head's rows and whitened into a fixed 768-d vector, and one zero-initialized matrix learns to read it into the values of the five value-embedding layers. It is never trained, so it carries no gradient or optimizer state, and the pair is looked up on the host by the data loader. It finished 833 ubpb ahead of the same run without it, for +0.8% step time. Read straight into the residual stream instead, the same statistics gave a large early lead that was gone by step ~500.
-
-- **The optimizer's gradient plumbing is gone from the step.** There is one micro-batch per step (`train_batch_tokens`), so every gradient buffer is written exactly once, read once and zeroed: the writes are `copy_` rather than `add_` and the zeroing pass does not exist. The two row-wise RMSProp tables (`bigram_embeds`, `pair_values`) keep no first momentum, so nothing about their gradient has to outlive the point where `embedding_dense_backward` produces it -- their update is inlined there and their 10.5 GiB of fp32 gradient buffer is deleted outright. They also touch only the rows the micro-batch looked up: the dataloader numbers each batch's distinct ids on the host (`table_rows`), the gradient accumulates over at most `cfg.touched_rows` = 120,000 rows instead of the table's 2,097,152 or 1,048,576 (a 196,608-token batch touches at most 114,895 distinct rows, so bounding the update at the batch size left 41% of the gather, the RMSProp math and the scatter as padding aimed at the scratch row; `table_rows` asserts the bound at planning time, before anything compiles), the `(rows, 1)` second moment is still decayed densely because that costs 2 MB, and the weight decay rides along as a running scalar (the live weight is the stored row times it) so an untouched row needs no write at all. Together: -7.7% of step time and -10.5 GB of peak memory, and the tables' cost is now proportional to tokens looked up rather than rows allocated.
-  - The trap worth knowing: **the fused write has to go to a whole tensor.** Writing a slot through `pair_table[j]`, a `select()` on a mutated graph input, lowers to a scatter over the whole table -- 21.5 ms in a single kernel. The five slots are held as standalone tensors (`list(pair_values.view(...).unbind(0))`) instead.
-
-- **There is no gradient-accumulation machinery.** One micro-batch per step is wired into the script rather than configured: the one batch-size variable `cfg.train_batch_tokens` replaces `micro_batch_tokens`, `total_batch_size` and `cfg.grad_accum_steps`, and `micro_step` and `is_last_micro` are gone with it, since the fold's `copy_` writes already depended on the single-micro-batch case. (`gbank` reads like the same indirection and is not: unbinding each weight bank into per-layer tensors is what keeps every gradient write a whole-tensor write, where `p.grad[i].copy_(...)` through a view lowers to a scatter over the whole bank.)
-
-- **The MLP's input norm is stashed, not recomputed.** `x_attn_out` was held for the backward and the backward's only use of it was to rebuild `x_attn_out_hat` and its `1/rms` -- and the hat is the same shape and dtype, so holding the hat instead costs the same bytes and removes the recompute: one reduction pass over a `(T, 768)` tensor and one write of the same size, per layer. -0.5% of step time, for +2.7 GB of peak (in the forward the hat now lives to the end of the layer where it used to be freed after the `W_in` matmul, so it overlaps `x_attn_out` rather than replacing it). `x_biased` already worked this way.
-
-- **The MLP stashes `relu(z)^2`, not `relu(z)`.** The square is the second matmul's input, so the forward writes it either way; stashing that instead means the forward never writes `relu(z)` as well and the backward never rebuilds the square from it -- about 2.3 GiB per layer. `relu(z)` is then only needed inside `2*relu(z)*mlpb_a`, where the square root of `mlp_a` stands in for it. -1.5% of step time for a stash of the same size.
-  - **Spell that square root `mlp_a * (mlp_a + 1e-30).rsqrt()` and the whole expression fuses into the `xb @ W_out` matmul: -4.1% of step time.** With the matmul autotuner on, inductor fuses a pointwise epilogue into its triton mm template -- the forward's `relu(z)^2` already rides along that way for free -- but it declines the backward's `2*sqrt(mlp_a)*(xb @ W_out)`, leaving a 2.4 ms pointwise kernel behind every 2.4 ms matmul (26.7 ms/step). The fusion log reports an "inf" slowdown, which is not a measurement: inductor skips benchmarking a fused kernel when Triton reports more than 8 register spills, and `sqrt` lowers to the correctly-rounded `tl.sqrt_rn`, which tips it over. The `rsqrt` spelling stays under, exact zeros stay exact zeros, and the result is slightly *closer* to fp32 than before (relative error 1.66e-3 against 2.34e-3), because the fused kernel multiplies by the matmul's fp32 accumulator where the separate kernel read that product after it had been rounded to bf16.
-
-
+- Enormous tables
+- Pair codes technique
