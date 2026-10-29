@@ -1,10 +1,22 @@
-# train_stack.py
+# train_encoder.py
 #
-# nanochat-based pre-training pipeline, with model code implemented as a single
-# forward_backward function, no nn.Module or autograd.
+# A small encoder trained from scratch to be a decision model, jointly on MLM
+# over ClimbMix and on Kev's decision records: forked from decoder-rtx's
+# train_stack.py (sep-28-baseline), with a handwritten forward and backward.
+#
+# What changed from decoder-rtx (see agent-ops-stacks/encoder-rtx/.../PROPOSAL.md):
+# - Attention is bidirectional. A pack holds decision records and ClimbMix
+#   filler; every state, question and filler document is its own segment, and
+#   each record's questions also attend to its state in a second FA2 call,
+#   merged by the softmax LSEs (§§ Attention in forward_backward).
+# - The head trains MLM on the filler, and a single readout vector scores each
+#   option's readout token, with a softmax over each question's options.
+# - The vocabulary is decoder-rtx's 32,768 BPE plus the decision special tokens.
+# - The CLM-derived inits (token frequency priors, pair code) are kept as they
+#   were; whether they suit MLM is an open question.
 #
 # Downloads the required number of pre-tokenized Climbmix dataset shards if not
-# already present.
+# already present. The decision records come from data/prepare_kev_suites.py.
 #
 # Style:
 # - Minimal helpers and classes to consolidate math and reduce redirects. 
@@ -62,7 +74,8 @@ from torch import Tensor
 
 from torch._inductor.codecache import CacheBase
 
-from utils import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dataset,
+from utils import (DATASET_DIR, KEV_DIR, Pack, doc_stream, download_dataset, load_records,
+                   materialize_packs, pack_caps, pack_loader, plan_packs,
                    flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
 
 dynamo.config.recompile_limit = 64
@@ -108,7 +121,8 @@ class StackConfig:
     backout_layer: int = 4 # nanochat: n_layers // 2
 
     # Input
-    d_vocab:         int = 32768
+    d_vocab:         int = 32832     # decoder-rtx's BPE + the decision special tokens, padded to a multiple of 64
+    bpe_vocab:       int = 32768     # the BPE alone: the shards, the corpus statistics and the table keys
     d_bigram:        int = 64 * 32768 # 2,097,152 hashed [prev, curr] pairs, read into the residual stream.
     d_pair_values:   int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the attention values.
     d_pair_code:     int = 64 * 32768 # 2,097,152 frequent [prev, curr] pairs with a frozen corpus code, likewise.
@@ -122,8 +136,8 @@ class StackConfig:
     d_vo:       int = 128   # Note: FA2 requires d_qk == d_vo, FA3 does not.
 
     # Context and Sliding Window Attention
-    seq_len:          int = 2048
-    short_win_size:   int = 768
+    seq_len:          int = 2048    # filler documents are cut to their first seq_len tokens
+    short_win_size:   int = 768     # each way: the window is 2 x 768 + 1 wide
     full_ctxt_layers: list[int] = [   3,    4,     7]
     window_sizes:     list[tuple[int, int]]  # Derived below.
 
@@ -138,25 +152,36 @@ class StackConfig:
     d_mlp:      list[int] = [768 * r for r in (2, 2, 3, 3, 5, 5, 6, 6)]  # per layer; mean 4x = 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 5_870_523_658     # every trained weight (§ Weight Init & Schedule)
-    num_flops_per_token: int = 586_289_376     # 6 * 82,379,472 matmul params + attention, at 8 layers
+    num_params:          int    # every trained weight, counted after init (§ Weight Init & Schedule)
+    num_flops_per_token: int    # estimated once the pack sizes are known (§ Data)
 
     # ---- Training ----
 
     # Batch Size
-    train_batch_tokens: int = 96 * 2048   # 192K tokens per step
+    train_batch_tokens: int = 96 * 2048   # 192K tokens per step, one pack
 
-    # Training
+    # Training: decoder-rtx's token budget, 2,079 x 192K = 409M tokens
     num_steps: int = 2079
+
+    # Packs (§ Data). The static sizes are derived from the planned packs.
+    decision_frac:   float = 0.10   # share of each pack given to decision records; the rest is MLM filler
+    decision_weight: float = 1.0    # decision loss (nats per question) against MLM loss (nats per masked token)
+    mask_rate:       float = 0.30   # of the filler tokens, in the pack with the least filler
+    cu_width:        int            # cu_self entries
+    rec_width:       int            # cu_q / cu_k entries
+    ro_cap:          int            # readout positions per pack
+    q_cap:           int            # questions per pack
+    mlm_per_pack:    int            # masked filler positions per pack
+    max_seg_len:     int            # FA2 max_seqlen bounds: any segment,
+    max_qblock_len:  int            # one record's questions,
+    max_state_len:   int            # one state
 
     # Evaluation and logging
     val_loss_every:  int = 333
-    val_tokens:      int = 10485760   # 10M tokens per val-bpb pass
-    val_steps:       int              # Derived: val micro-batches per pass.
 
     # Logging
-    wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "baseline5"  # both wandb and log files
+    wandb_project:   str = "encoderstack_rtx_dev"  # session work; baselines go to encoderstack_rtx
+    run_name:        str = "phase0-kev"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -188,16 +213,21 @@ if cfg.use_wandb:
 cfg.ve_index = [cfg.ve_layers.index(i) if i in cfg.ve_layers else -1 for i in range(cfg.n_layers)]
 cfg.num_ves = len(cfg.ve_layers)
 
-# Per-layer window sizes for sliding window attention, defined as (left, right)
-# tuples. Left means number of tokens to attend to to the left of current
-# position, and right is 0 for causal.
-cfg.window_sizes = [(cfg.short_win_size, 0)] * cfg.n_layers  # All short, ...
+# Temporary knobs for the first runs, logged below; stripped once the values settle.
+cfg.decision_frac   = float(os.environ.get("DECISION_FRAC", cfg.decision_frac))
+cfg.decision_weight = float(os.environ.get("DECISION_WEIGHT", cfg.decision_weight))
+cfg.mask_rate       = float(os.environ.get("MASK_RATE", cfg.mask_rate))
+cfg.num_steps       = int(os.environ.get("NUM_STEPS", cfg.num_steps))
+cfg.run_name        = os.environ.get("RUN_NAME", cfg.run_name)
+print(f"knobs: decision_frac {cfg.decision_frac} | decision_weight {cfg.decision_weight} | "
+      f"mask_rate {cfg.mask_rate} | num_steps {cfg.num_steps} | run_name {cfg.run_name}")
+
+# Per-layer window sizes for sliding window attention in the self call, defined
+# as (left, right) tuples: tokens attended to on each side, -1 for the whole
+# segment. The question-to-state call always reads the whole state.
+cfg.window_sizes = [(cfg.short_win_size, cfg.short_win_size)] * cfg.n_layers  # All short, ...
 for i in cfg.full_ctxt_layers:
-    cfg.window_sizes[i] = (cfg.seq_len, 0)                   # ... then overwrite with full.
-
-cfg.val_steps = cfg.val_tokens // EVAL_BUFFER_TOKENS
-
-VAL_BPB_TARGET = 0.900
+    cfg.window_sizes[i] = (-1, -1)                                           # ... then overwrite with full.
 
 gpu_device_name = torch.cuda.get_device_name(0)   # "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 # Dense BF16 peak FLOPS of the RTX PRO 6000, the MFU denominator.
@@ -206,14 +236,15 @@ gpu_peak_flops = 503.8e12
 download_dataset()
 
 
-# Reject a vocab mismatch between the .bin shards and the model.
+# Reject a vocab mismatch between the .bin shards, the decision records and the model.
 with open(os.path.join(DATASET_DIR, "config.json")) as f:
-    assert json.load(f)["vocab_size"] == cfg.d_vocab, "dataset vocab != model d_vocab"
-
-# token_bytes: per-token-id byte lengths (0 for special tokens), for the
-# vocab-size-independent bits-per-byte validation metric.
-with open(os.path.join(DATASET_DIR, "tokenizer/token_bytes.pt"), "rb") as f:
-    token_bytes = torch.load(f, map_location=device)
+    climbmix_config = json.load(f)
+assert climbmix_config["vocab_size"] == cfg.bpe_vocab, "dataset vocab != model bpe_vocab"
+with open(os.path.join(KEV_DIR, "kev_meta.json")) as f:
+    kev_meta = json.load(f)
+assert (kev_meta["bpe_vocab"], kev_meta["d_vocab"]) == (cfg.bpe_vocab, cfg.d_vocab), "decision records' vocab != model's"
+MASK_ID = kev_meta["special_tokens"]["<|mask|>"]
+BOS_ID = climbmix_config["bos_id"]
 
 
 # ==============================================================================
@@ -275,7 +306,8 @@ class Model:
     backout_lambda: Param
 
     # Output
-    lm_head: Param
+    lm_head: Param   # MLM, on the masked filler positions
+    readout: Param   # (1, D): each option's logit is this dotted with its readout token's final stream
 
     # Rotary Cache
     cos: Tensor
@@ -333,8 +365,10 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=True):
-    """One micro-batch through the model. Use backward=False for validation."""
+def forward_backward(pk: Pack, backward=True):
+    """One pack through the model: returns (MLM loss, decision loss) for training,
+    or each masked position's MLM nats and each readout's probability for
+    validation (backward=False)."""
 
     # Direction naming:
     # A bare name is the forward pass; a 'b' on its leading symbol is the
@@ -366,16 +400,21 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # *_a        - The final activation handed onward: mlp_a = mlp_relu^2,
     #              ve_gate_a = 3*ve_gate_sig. The smear gate's is just 'gate'.
 
+    idx = pk.idx
     assert idx.ndim == 1
     T = idx.size(0)
     half = cfg.d_qk // 2
 
     assert T > 1, "Forward pass should have T > 1 (smear needs a previous token)"
-    assert T <= m.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {m.cos.size(1)}"
 
-    cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, half)
+    # Rotary angles at each token's position within its segment; a question's
+    # positions continue its state's.
+    cos, sin = m.cos[0, pk.pos], m.sin[0, pk.pos]  # (T, 1, half)
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
-    bigram_ids, pair_ids, pair_code_ids = rows[:3]   # each table's rows, computed on the host (see table_rows)
+    bigram_ids, pair_ids, pair_code_ids = pk.rows[:3]   # each table's rows, computed on the host (see table_rows)
+    # The smear reads the previous token only within a segment, so no question or
+    # record sees another through it.
+    keep = bf16(~pk.seg_start[1:]).unsqueeze(1)   # (T-1, 1)
     pair_code = F.embedding(pair_code_ids, m.pair_code)
     pair_code_v = pair_code @ m.pair_decoder.w[0].mT
     x_backout = None
@@ -391,13 +430,13 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     x_embed_inv_rms = (x_embed.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
     x_embed_hat = bf16(x_embed.float() * x_embed_inv_rms)      # post-norm embedding, pre-smear
 
-    # Smear: mix the previous token's embedding into the current position.
+    # Smear: mix the previous token's embedding into the current position, inside its segment.
     # The sigmoid and its argument are unnamed here; bwd recomputes them as
     # gate_sig and (as a grad) gateb_z.
     gate = bf16(m.smear_lambda.w) * torch.sigmoid(
         x_embed_hat[1:, :cfg.d_smr_gate] @ bf16(m.smear_gate.w).mT)
     # The smeared input embedding; also added back to the stream at every layer.
-    x0 = torch.cat([x_embed_hat[:1], x_embed_hat[1:] + gate * x_embed_hat[:-1]], dim=0)  # appears as x0b in bwd
+    x0 = torch.cat([x_embed_hat[:1], x_embed_hat[1:] + gate * keep * x_embed_hat[:-1]], dim=0)  # appears as x0b in bwd
 
     # Bigram embeddings, one row per [prev, curr] token pair (see table_rows)
     x_bigram = bf16(F.embedding(bigram_ids, m.bigram_embeds.w) * bigram_w_scale)  # appears as xb_bigram in bwd
@@ -449,9 +488,23 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         q_hat = bf16(q.float() * q_inv_rms * 1.2) # 1.2^2 - Similar to temperature of 0.7
         k_hat = bf16(k.float() * k_inv_rms * 1.2)
 
-        # Read V from past residual streams by matching their K.
-        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cfg.seq_len, cfg.window_sizes[i])
-        y = y.contiguous()
+        # Read V from the streams that match K. Every segment -- state, question,
+        # filler document -- attends to itself, both ways.
+        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, pk.cu_self, pk.cu_self,
+                                           cfg.max_seg_len, cfg.max_seg_len, cfg.window_sizes[i])
+
+        # Each record's questions also read its whole state. The two calls are
+        # softmaxes over disjoint keys, so their union is their outputs weighted by
+        # each one's share of the merged normalizer, exp(lse - lse_merged). The
+        # cross call leaves rows outside its segments unwritten: merge on question
+        # rows only.
+        y_x, lse_x = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, pk.cu_q, pk.cu_k,
+                                               cfg.max_qblock_len, cfg.max_state_len, (-1, -1))
+        lse_merged = torch.logaddexp(lse, lse_x)    # (H, T)
+        y_merged = (y.float() * (lse - lse_merged).exp().T.unsqueeze(-1)
+                    + y_x.float() * (lse_x - lse_merged).exp().T.unsqueeze(-1))
+        y = torch.where(pk.is_q[:, None, None], bf16(y_merged), y).contiguous()
+        lse = torch.where(pk.is_q, lse_merged, lse)
 
         # Project value heads onto their output heads.
         attn_out = y.view(T, -1) @ m.W_O.w[i].mT
@@ -489,59 +542,87 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     x_final_hat = bf16(x_final.float() * x_final_inv_rms)
 
     # -----------------------------
-    #           LM Head
+    #           MLM Head
     # -----------------------------
-    tgt = targets.unsqueeze(1)  # (T, 1)  TODO - Have the caller pass the right shape.
+    # Only the masked filler positions are read out, M of them.
+    x_mlm_hat = x_final_hat[pk.mlm_pos]         # (M, D)
+    tgt = pk.mlm_tgt.unsqueeze(1)               # (M, 1)
 
     # ==== Forward ====
-    logits_raw = x_final_hat @ m.lm_head.w.mT  # (T, d_vocab) bf16, 4GB at (64K, 32K)
+    logits_raw = x_mlm_hat @ m.lm_head.w.mT     # (M, d_vocab) bf16
 
     # "softcap" logits to the range -15 to 15
-    logits = 15.0 * torch.tanh(logits_raw.float() / 15.0) # (T, d_vocab)
+    logits = 15.0 * torch.tanh(logits_raw.float() / 15.0) # (M, d_vocab)
 
     # Typically, subtract off the highest logit per token first:
-    #    max_logit = logits.amax(dim=1, keepdim=True) # (T, 1)
-    #    e = (logits - max_logit).exp()  # (T, d_vocab) = ((T, d_vocab) - (T, 1)).exp()
+    #    max_logit = logits.amax(dim=1, keepdim=True) # (M, 1)
+    #    e = (logits - max_logit).exp()  # (M, d_vocab) = ((M, d_vocab) - (M, 1)).exp()
     # Softcap bounds to [-15, 15], so exp() is [3.06e-7, 3.3e6], so fp32 is ok.
-    e = logits.exp()  # (T, d_vocab)
+    e = logits.exp()  # (M, d_vocab)
 
     # Softmax denominator
-    ssum = e.sum(dim=1, keepdim=True) # (T, 1)
+    ssum = e.sum(dim=1, keepdim=True) # (M, 1)
 
     # ==== Cross Entropy ====
     # Convert back to logit space
-    lse_ce = ssum.log().squeeze(1) # (T, 1)
+    lse_ce = ssum.log().squeeze(1) # (M,)
     # Select prediction logits for target token (one random access per row)
-    tgt_logit = logits.gather(1, tgt).squeeze(1) # (T,)
-    # If validation pass, return CE in nats.
+    tgt_logit = logits.gather(1, tgt).squeeze(1) # (M,)
+    mlm_nats = lse_ce - tgt_logit               # (M,)
+
+    # -----------------------------
+    #        Decision Readout
+    # -----------------------------
+    # Each option's logit is the readout vector dotted with its readout token's
+    # stream; a softmax runs over each question's options. Padding readouts
+    # belong to a dummy question, q_cap, and carry no target and no gradient.
+    x_ro_hat = x_final_hat[pk.ro_pos]                               # (Rc, D)
+    ro_logit = x_ro_hat.float() @ m.readout.w[0]                    # (Rc,)
+    ro_max = torch.full((cfg.q_cap + 1,), -math.inf, device=device).scatter_reduce(
+        0, pk.ro_qid, ro_logit, "amax")                             # (Qc + 1,)
+    ro_e = (ro_logit - ro_max[pk.ro_qid]).exp()
+    ro_ssum = torch.zeros(cfg.q_cap + 1, device=device).scatter_add(0, pk.ro_qid, ro_e)
+    ro_p = ro_e / ro_ssum[pk.ro_qid]                                # (Rc,) each option's probability
+
+    # If validation pass, return MLM nats and the options' probabilities.
     if not backward:
-        return (lse_ce - tgt_logit) # (T,)
-    # Return training loss for logging.
-    loss = (lse_ce - tgt_logit).mean()   # Return for tracking training loss
+        return mlm_nats, ro_p
+    # Return training losses for logging: nats per masked token, nats per question.
+    loss = torch.stack([mlm_nats.mean(),
+                        -(pk.ro_tgt * ro_p.clamp_min(1e-30).log()).sum() / pk.n_q[0]])
 
     # ==== Backward ====
-    onehot = torch.arange(cfg.d_vocab, device=device).unsqueeze(0) == tgt # (T, d_vocab)
+    onehot = torch.arange(cfg.d_vocab, device=device).unsqueeze(0) == tgt # (M, d_vocab)
 
-    # Predicted probs = e / ssum; (T, d_vocab)
+    # Predicted probs = e / ssum; (M, d_vocab)
     # Standard approach to backprop is (p - 1), with optimizer update w = w - grad.
     # We flip this to (1 - p) and w = w + grad, so that:
     # - grads and optim state move in the same direction as their param.
     # - target token contributes positively to stream and gradients.
-    logitsb = bf16((onehot.float() - (e / ssum)) * (1.0 - logits/15.0 * logits/15.0) * loss_scale)
+    logitsb = bf16((onehot.float() - (e / ssum)) * (1.0 - logits/15.0 * logits/15.0) / pk.mlm_pos.size(0))
 
-    # Every token updates every vocab entry.
-    m.lm_head.grad.copy_((logitsb.mT @ x_final_hat).float()) # (d_vocab, T) @ (T, d_model) --> (d_vocab, d_model)
+    # Every masked token updates every vocab entry.
+    m.lm_head.grad.copy_((logitsb.mT @ x_mlm_hat).float()) # (d_vocab, M) @ (M, d_model) --> (d_vocab, d_model)
 
-    # The backward streams start as weighted sums of the head embeddings
-    # that they (meaningfully) predicted.
-    xb_final_hat = logitsb @ m.lm_head.w # (T, d_vocab) @ (d_vocab, d_model)
+    # The decision readout, flipped the same way: target - p, scaled to the mean
+    # over the pack's questions.
+    ro_valid = (pk.ro_qid < cfg.q_cap).float()
+    ro_logitb = (pk.ro_tgt - ro_p) * ro_valid * (cfg.decision_weight / pk.n_q[0])   # (Rc,)
+    m.readout.grad.copy_((ro_logitb.unsqueeze(1) * x_ro_hat.float()).sum(dim=0, keepdim=True))
+
+    # The backward streams start as weighted sums of the head embeddings that
+    # they (meaningfully) predicted, at the masked positions, and as the readout
+    # vector at the readout positions. Padding readouts add zeros at row 0.
+    xb_final_hat = torch.zeros_like(x_final_hat)
+    xb_final_hat.index_put_((pk.mlm_pos,), logitsb @ m.lm_head.w)   # (M, d_vocab) @ (d_vocab, d_model)
+    xb_final_hat.index_put_((pk.ro_pos,), bf16(ro_logitb.unsqueeze(1) * m.readout.w), accumulate=True)
     del logitsb
 
     # -----------------------------
     #           Backward
     # -----------------------------
     # The trained tables' rows, compacted for the sparse updates (see table_rows).
-    bigram_inverse, bigram_rows, pair_inverse, pair_rows = rows[3:]
+    bigram_inverse, bigram_rows, pair_inverse, pair_rows = pk.rows[3:]
     bigram_rows, pair_rows = bigram_rows[:cfg.touched_rows], pair_rows[:cfg.touched_rows]
 
     pair_w_scale_next = pair_w_scale * m.pair_values.wd_t[t_step]
@@ -602,9 +683,17 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         m.W_O.gbank[i].copy_(xb_attn_out.mT @ st.y.view(T, -1))
         yb = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo)
 
+        # Each call's backward, given the MERGED output and LSE: its softmax weights
+        # exp(s - lse) are then its share of the merged softmax, and FA2's row term
+        # rowsum(yb * y) is the merged one, so the two calls' grads sum to the exact
+        # grad of the union. The cross call's grads are zero outside its rows.
         qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
-            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_seqlens, cfg.seq_len,
-            cfg.window_sizes[i])
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, pk.cu_self, pk.cu_self,
+            cfg.max_seg_len, cfg.max_seg_len, cfg.window_sizes[i])
+        qb_x, kb_x, vb_x = flash_attn_varlen_bwd(
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, pk.cu_q, pk.cu_k,
+            cfg.max_qblock_len, cfg.max_state_len, (-1, -1))
+        qb_hat, kb_hat, vb = qb_hat + qb_x, kb_hat + kb_x, vb + vb_x
 
         # per-(token, head) norm backward
         qb = bf16(st.q_inv_rms * (1.2 * qb_hat.float() - st.q_hat.float() * ((st.q_hat.float() * qb_hat.float()).mean(dim=-1, keepdim=True) / 1.2)))
@@ -704,12 +793,12 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
     # it folds into x0b to give the full grad wrt the smeared embedding.
     x0b = x0b + xb
 
-    # --- smear backward: x0 = cat([x_embed_hat[:1], x_embed_hat[1:] + gate*x_embed_hat[:-1]]) ---
+    # --- smear backward: x0 = cat([x_embed_hat[:1], x_embed_hat[1:] + gate*keep*x_embed_hat[:-1]]) ---
     gate_sig = torch.sigmoid(x_embed_hat[1:, :cfg.d_smr_gate] @ bf16(m.smear_gate.w).mT)  # (T-1, 1), recomputed
     gate = bf16(m.smear_lambda.w) * gate_sig
     xb_embed_hat = x0b.clone()
-    xb_embed_hat[:-1] += gate * x0b[1:]  # TRAP: shifted scatter -- p's grad reaches p-1
-    gateb = (x0b[1:] * x_embed_hat[:-1]).sum(dim=-1, keepdim=True)   # (T-1, 1)
+    xb_embed_hat[:-1] += gate * keep * x0b[1:]  # TRAP: shifted scatter -- p's grad reaches p-1
+    gateb = keep * (x0b[1:] * x_embed_hat[:-1]).sum(dim=-1, keepdim=True)   # (T-1, 1)
     m.smear_lambda.grad.copy_(sum32(gateb * gate_sig))
     gateb_z = gateb * bf16(m.smear_lambda.w) * gate_sig * (1 - gate_sig)
     m.smear_gate.grad.copy_((gateb_z.mT @ x_embed_hat[1:, :cfg.d_smr_gate]).float())
@@ -1204,6 +1293,39 @@ m.lm_head = Param(
 
 
 # ------------------------------------------------------------------------------
+# §§ Decision Readout
+# ------------------------------------------------------------------------------
+# One vector, dotted with each option's readout token: fp32 live and AdamW, with
+# the head's betas and no weight decay. Starts small, like the head.
+
+peak_lr = 0.0049
+b1_grad = 0.2    # (1-Beta1)
+b2_grad = 0.04   # (1-Beta2)
+b1_mntm = 1 - b1_grad
+b2_mntm = 1 - b2_grad
+
+readout = fp32_empty(1, cfg.d_model).normal_(mean=0.0, std=0.001)
+m.readout = Param(
+    name         = "readout",
+    w            = readout,      # fp32 live
+    mantissa     = None,
+    grad         = fp32_zeros(readout.shape),
+    gbank        = None,
+    first_mntm   = fp32_zeros(readout.shape),
+    scnd_mntm    = fp32_zeros(readout.shape),
+    residual_dim = None, # Muon only
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5 / (1.0 - b1_mntm ** steps_1idx)),
+    wd_t         = dev(np.ones(cfg.num_steps)),
+    mntm_b1_t    = dev(np.full(cfg.num_steps, b1_mntm)),
+    grad_b1_t    = dev(np.full(cfg.num_steps, b1_grad)),
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),
+    grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+del readout
+
+
+# ------------------------------------------------------------------------------
 # §§ Attention & MLPs
 # ------------------------------------------------------------------------------
 
@@ -1320,14 +1442,15 @@ priors_t0 = time.perf_counter()
 
 # Corpus bigram counts (all 91 train shards): bigram_counts[i, j] = how often token j follows token i.
 bigram = np.load(os.path.join(DATASET_DIR, "tokenizer/bigram_counts.npz"))
-bigram_counts = torch.zeros(cfg.d_vocab, cfg.d_vocab, dtype=torch.float32, device=device)
-bigram_counts[torch.from_numpy(np.repeat(np.arange(cfg.d_vocab), np.diff(bigram["train_indptr"]))).to(device),
+# The priors cover the BPE vocabulary; the decision special tokens get their own rows below.
+bigram_counts = torch.zeros(cfg.bpe_vocab, cfg.bpe_vocab, dtype=torch.float32, device=device)
+bigram_counts[torch.from_numpy(np.repeat(np.arange(cfg.bpe_vocab), np.diff(bigram["train_indptr"]))).to(device),
               torch.from_numpy(bigram["train_indices"].astype(np.int64)).to(device)] = \
     torch.from_numpy(bigram["train_data"].astype(np.float32)).to(device)
 del bigram
 
 context_counts = bigram_counts.sum(dim=1, keepdim=True)                                            # (V, 1)
-next_unigram   = (bigram_counts.sum(dim=0) + 0.5) / (bigram_counts.sum() + 0.5 * cfg.d_vocab)     # (V,)
+next_unigram   = (bigram_counts.sum(dim=0) + 0.5) / (bigram_counts.sum() + 0.5 * cfg.bpe_vocab)   # (V,)
 
 # Smoothed next-token distribution of every context: 3,000 pseudo-counts of the unigram.
 log_bigram = ((bigram_counts + 3000.0 * next_unigram) / (context_counts + 3000.0)).log()          # (V, V)
@@ -1365,11 +1488,19 @@ freq_direction = ((freq_weight * log_freq * (head_prior - head_mean)).sum(0)
 head_prior -= 0.5 * log_freq * freq_direction
 del context_counts, occurrences_per_step, freq_weight, log_freq, head_mean, freq_direction
 
-# Add the priors to the initialized weights.
-m.input_embeds.w.add_(embed_prior)
-head_master = rebuild_master(m.lm_head.w, m.lm_head.mantissa).add_(head_prior)
+# Add the priors to the initialized weights' BPE rows.
+m.input_embeds.w[:cfg.bpe_vocab].add_(embed_prior)
+head_master = rebuild_master(m.lm_head.w, m.lm_head.mantissa)
+head_master[:cfg.bpe_vocab].add_(head_prior)
 writeback_master(head_master, m.lm_head.w, m.lm_head.mantissa)
 del embed_prior, head_prior, head_master
+
+# The decision special tokens have no corpus statistics: random directions, at
+# the prior rows' norm 0.8 * sqrt(D). (Their lm_head rows keep the small random
+# init; MLM never targets them.)
+special_embeds = fp32_empty(cfg.d_vocab - cfg.bpe_vocab, cfg.d_model).normal_()
+m.input_embeds.w[cfg.bpe_vocab:].copy_(special_embeds * (0.8 * cfg.d_model ** 0.5 / special_embeds.norm(dim=1, keepdim=True)))
+del special_embeds
 
 torch.cuda.synchronize()
 priors_time = time.perf_counter() - priors_t0
@@ -1390,7 +1521,7 @@ pair_next_ids, pair_log_ratios, pair_counts = pair_next["next_ids"], pair_next["
 del pair_next
 
 # Each pair's code: the log-ratio-weighted sum of the head's centred rows.
-centred_head = rebuild_master(m.lm_head.w, m.lm_head.mantissa)
+centred_head = rebuild_master(m.lm_head.w, m.lm_head.mantissa)[:cfg.bpe_vocab]
 centred_head -= centred_head.mean(dim=0, keepdim=True)
 pair_code = fp32_zeros(cfg.d_pair_code + 1, cfg.d_model)
 for start in range(0, cfg.d_pair_code, 16384):
@@ -1431,6 +1562,91 @@ m.sin = freqs.sin().to(torch.bfloat16)[None, :, None, :]  # for later broadcasti
 
 del channel_range, inv_freq, t_pos, freqs
 
+cfg.num_params = sum(p.w.numel() for p in m)
+
+
+# ==============================================================================
+# § Data
+# ==============================================================================
+# Packs (utils.py § Packs): decision records in a decision_frac share of each
+# pack, ClimbMix filler trained on MLM in the rest. Every pack is planned and laid
+# out up front, in pinned memory. The static sizes forward_backward compiles
+# against come from the plans, training's and evaluation's together.
+
+def table_rows(tokens, seg_start):
+    """Each position's [prev, curr] pair as a row of the three pair-indexed tables, plus the two
+    trained tables' compacted rows, on the host (see materialize_packs). A segment's first token
+    has no previous token: its pair is (BOS, curr). Only pairs of BPE tokens have a corpus code."""
+    prev = tokens[:-1].copy()
+    prev[seg_start[1:]] = BOS_ID
+    curr = tokens[1:]
+    pair     = np.bitwise_xor(36313 * curr, 27191 * prev)
+    pair_key = cfg.bpe_vocab * prev + curr
+    code_row = np.minimum(np.searchsorted(pair_code_keys, pair_key), cfg.d_pair_code - 1)
+    coded    = (pair_code_keys[code_row] == pair_key) & (prev < cfg.bpe_vocab) & (curr < cfg.bpe_vocab)
+    rows = np.empty((7, tokens.size), dtype=tokens.dtype)
+    rows[0, :1], rows[0, 1:] = cfg.d_bigram - 1,      pair % (cfg.d_bigram - 1)
+    rows[1, :1], rows[1, 1:] = cfg.d_pair_values - 1, pair % (cfg.d_pair_values - 1)
+    rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(coded, code_row, cfg.d_pair_code)
+    # Compact each trained table's rows; padding points at the table's scratch row.
+    bigram_touched, rows[3] = np.unique(rows[0], return_inverse=True)
+    pair_touched,   rows[5] = np.unique(rows[1], return_inverse=True)
+    assert max(bigram_touched.size, pair_touched.size) <= cfg.touched_rows
+    rows[4], rows[4, :bigram_touched.size] = cfg.d_bigram,      bigram_touched
+    rows[6], rows[6, :pair_touched.size]   = cfg.d_pair_values, pair_touched
+    return rows
+
+packs_t0 = time.perf_counter()
+rng = np.random.default_rng(cfg.seed)
+
+# Evaluation: every record of the two development splits once, as stored, with
+# filler from the val shard. Training: shuffled epochs of Kev's training records,
+# a choice question's options permuted each time.
+val_docs = doc_stream("val", BOS_ID)
+eval_plans = {split: plan_packs(load_records(split), val_docs, cfg.train_batch_tokens,
+                                cfg.decision_frac, cfg.seq_len, None, rng)
+              for split in ("decision_dev", "transfer_dev")}
+train_records = load_records("train")
+train_plans = plan_packs(train_records, doc_stream("train", BOS_ID), cfg.train_batch_tokens,
+                         cfg.decision_frac, cfg.seq_len, cfg.num_steps + 1, rng)
+
+caps = pack_caps(train_plans + eval_plans["decision_dev"] + eval_plans["transfer_dev"])
+round_up = lambda x, k: k * math.ceil(x / k)
+cfg.cu_width       = round_up(caps["segments"] + 2, 64)
+cfg.rec_width      = round_up(caps["records"] + 1, 64)
+cfg.ro_cap         = round_up(caps["readouts"], 64)
+cfg.q_cap          = round_up(caps["questions"], 64)
+cfg.max_seg_len    = round_up(caps["seg_len"], 128)
+cfg.max_qblock_len = round_up(caps["qblock_len"], 128)
+cfg.max_state_len  = round_up(caps["state_len"], 128)
+cfg.mlm_per_pack   = 64 * int(cfg.mask_rate * caps["min_filler"] / 64)
+
+# The evaluation masks are the same every run.
+eval_packs = {split: materialize_packs(plans, cfg.train_batch_tokens, cfg, table_rows, MASK_ID,
+                                       np.random.default_rng(cfg.seed + 3))
+              for split, plans in eval_plans.items()}
+train_packs, _ = materialize_packs(train_plans, cfg.train_batch_tokens, cfg, table_rows, MASK_ID, rng)
+
+placed = sum(len(chosen) for chosen, _ in train_plans)
+dec_tokens = cfg.train_batch_tokens * len(train_plans) - sum(d.size for _, filler in train_plans for d in filler)
+data_report = (
+    f"Packs: {len(train_plans):,} train ({placed:,} records = {placed / len(train_records):.2f} epochs of "
+    f"{len(train_records):,}; decision tokens {dec_tokens / 1e6:.1f}M = "
+    f"{100 * dec_tokens / (cfg.train_batch_tokens * len(train_plans)):.1f}%), "
+    f"eval {', '.join(f'{s} {len(p)}' for s, p in eval_plans.items())}\n"
+    f"  per pack: {cfg.mlm_per_pack:,} masked | caps: segments {cfg.cu_width}, records {cfg.rec_width}, "
+    f"readouts {cfg.ro_cap}, questions {cfg.q_cap} | max_seqlen: segment {cfg.max_seg_len}, "
+    f"question block {cfg.max_qblock_len}, state {cfg.max_state_len}")
+del eval_plans, train_plans, train_records, val_docs
+packs_time = time.perf_counter() - packs_t0
+
+# A rough MFU denominator: 6 x matmul params per token in the body, the head on the
+# masked positions only, and decoder-rtx's causal attention term doubled for
+# bidirectional windows.
+body_params = sum(p.w.numel() for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.pair_decoder, *mlp_params))
+cfg.num_flops_per_token = int(6 * body_params + 2 * 92_012_544
+                              + 6 * cfg.d_vocab * cfg.d_model * cfg.mlm_per_pack / cfg.train_batch_tokens)
+
 
 # ==============================================================================
 # § Training Harness
@@ -1450,16 +1666,21 @@ class StepStats:
     step:         int          = 0
 
     # Training
-    loss:         float | None = None
+    loss:         float | None = None   # MLM, nats per masked token
+    dec_loss:     float | None = None   # decision, nats per question
     lr_mult_t:    float | None = None
     dt:           float | None = None   # seconds; unset for steps 0-10
     tok_per_sec:  int   | None = None   # "
     mfu:          float | None = None   # "
 
-    # Validation, on val steps only
-    bpb:          float | None = None
+    # Validation, on val steps only: MLM nats on the val filler, and accuracy and
+    # Brier score (sum over options) on the clean rows of each decision split
+    mlm:          float | None = None
+    dec_acc:      float | None = None   # decision-v7 development
+    dec_brier:    float | None = None
+    xfer_acc:     float | None = None   # transfer-v4 development (Kev-0.8B: 0.648)
+    xfer_brier:   float | None = None
     eval_seconds: float | None = None
-    slack:        int   | None = None
 
     # Run clocks, in minutes; stamped by log_step
     train_total:  float | None = None
@@ -1469,7 +1690,7 @@ class StepStats:
 
 # Field -> wandb panel. A field not named here lands under `train/`.
 WANDB_GROUPS = {
-    "val":  ("bpb", "eval_seconds", "slack"),
+    "val":  ("mlm", "dec_acc", "dec_brier", "xfer_acc", "xfer_brier", "eval_seconds"),
     "time": ("train_total", "wall_total", "eta"),
 }
 _WANDB_PREFIX = {f: g for g, fs in WANDB_GROUPS.items() for f in fs}
@@ -1486,10 +1707,12 @@ class RunResult:
     num_steps:          int          = 0
     train_batch_tokens: int          = 0
 
-    # The result
-    val_bpb:            float | None = None
-    min_val_bpb:        float | None = None
-    slack:              int   | None = None   # micro-bpb under VAL_BPB_TARGET
+    # The result, from the final validation
+    val_mlm:            float | None = None
+    dec_acc:            float | None = None
+    dec_brier:          float | None = None
+    xfer_acc:           float | None = None
+    xfer_brier:         float | None = None
 
     # The cost, in minutes
     train_time:         float        = 0.0
@@ -1542,10 +1765,12 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 
-print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token: {cfg.num_flops_per_token:e}", console=True)
+print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token (estimate): {cfg.num_flops_per_token:e}", console=True)
 print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", console=True)
 print0(f"Batch size: {cfg.train_batch_tokens:,} tokens per step", console=True)
-print0(f"Init: token frequency priors {priors_time:.1f}s | pair code {pair_code_time:.1f}s", console=True)
+print0(f"Knobs: decision_frac {cfg.decision_frac} | decision_weight {cfg.decision_weight} | mask_rate {cfg.mask_rate}", console=True)
+print0(f"Init: token frequency priors {priors_time:.1f}s | pair code {pair_code_time:.1f}s | packs {packs_time:.1f}s", console=True)
+print0(data_report, console=True)
 
 # A flat row per step and the result, for analysis without wandb.
 metrics_path = f"logs/{cfg.run_name}_metrics.csv"
@@ -1612,35 +1837,48 @@ if PROFILE:
 # Schedule position: one (1,) int64 device tensor, advanced on-device
 t_step = torch.zeros(1, dtype=torch.int64, device=device)
 
-val_bpb = None
-min_val_bpb = float("inf")
-smooth_train_loss = 0.0
+smooth_train_loss = np.zeros(2)   # (MLM, decision)
+final_val = None  # the last validation's StepStats
 total_val_time = 0.0
 timed = []   # Length of each step in seconds, steps 0-10 excluded.
              # Total training time = np.sum(timed).
 warmup = []  # Those first 11 steps, where the compile lives.
 
-def table_rows(tokens):
-    """Each position's [prev, curr] pair as a row of the three pair-indexed tables, plus the two trained tables' compacted rows, on the host (see data_generator)."""
-    pair     = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
-    pair_key = cfg.d_vocab * tokens[:-1] + tokens[1:]
-    code_row = np.minimum(np.searchsorted(pair_code_keys, pair_key), cfg.d_pair_code - 1)
-    rows = np.empty((7, tokens.size), dtype=tokens.dtype)
-    rows[0, :1], rows[0, 1:] = cfg.d_bigram - 1,      pair % (cfg.d_bigram - 1)
-    rows[1, :1], rows[1, 1:] = cfg.d_pair_values - 1, pair % (cfg.d_pair_values - 1)
-    rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(pair_code_keys[code_row] == pair_key, code_row, cfg.d_pair_code)
-    # Compact each trained table's rows; padding points at the table's scratch row.
-    bigram_touched, rows[3] = np.unique(rows[0], return_inverse=True)
-    pair_touched,   rows[5] = np.unique(rows[1], return_inverse=True)
-    assert max(bigram_touched.size, pair_touched.size) <= cfg.touched_rows
-    rows[4], rows[4, :bigram_touched.size] = cfg.d_bigram,      bigram_touched
-    rows[6], rows[6, :pair_touched.size]   = cfg.d_pair_values, pair_touched
-    return rows
 
-train_loader = data_generator("train", cfg.seq_len, cfg.train_batch_tokens, table_rows,
-                              cfg.num_steps)
+def validate():
+    """MLM nats per masked token on the val filler, and, on each decision split's
+    clean rows, (accuracy, Brier score summed over options, questions, accuracy
+    by source), from the eval packs."""
+    mlm_nats, mlm_n, result = 0.0, 0, {}
+    for split, (packs, scored) in eval_packs.items():
+        right = total = 0
+        brier = 0.0
+        by_source = {}
+        for i, pk in enumerate(pack_loader(packs)):
+            nats, ro_p = forward_backward(pk, backward=False)
+            mlm_nats += nats.sum().item()
+            mlm_n += nats.numel()
+            ro_p = ro_p.cpu().numpy()
+            k = 0
+            for r, q, perm in scored[i]:   # the pack's questions, in readout order
+                n = len(perm)
+                probs, k = ro_p[k:k + n], k + n
+                if r["variant"] != "clean":
+                    continue
+                label = int(np.flatnonzero(perm == q["label"])[0])
+                hit = int(probs.argmax() == label)
+                right += hit
+                total += 1
+                brier += float(((probs - np.eye(n)[label]) ** 2).sum())
+                source = by_source.setdefault(r["source"], [0, 0])
+                source[0] += hit
+                source[1] += 1
+        result[split] = (right / total, brier / total, total, by_source)
+    return mlm_nats / mlm_n, result
 
-inputs, targets, rows, cu_seqlens = next(train_loader)   # kick off the first batch
+
+train_loader = pack_loader(train_packs)
+pk = next(train_loader)   # kick off the first batch
 
 # Training loop
 for step in range(cfg.num_steps + 1):
@@ -1654,24 +1892,20 @@ for step in range(cfg.num_steps + 1):
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.train_batch_tokens, table_rows)
-        total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
-        total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
-        for _ in range(cfg.val_steps):
-            v_inputs, v_targets, v_rows, v_cu_seqlens = next(val_loader)
-            loss_flat = forward_backward(v_inputs, v_targets, v_rows, v_cu_seqlens,
-                                         backward=False)
-            num_bytes_flat = token_bytes[v_targets]
-            total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
-            total_bytes += num_bytes_flat.sum()
-        del val_loader
-        val_bpb = total_nats.item() / (math.log(2) * total_bytes.item())
-        min_val_bpb = min(min_val_bpb, val_bpb)
+        val_mlm, dec = validate()
         val_elapsed = time.perf_counter() - val_t0
         total_val_time += val_elapsed
-        print0(f"step:{step}/{cfg.num_steps} val_bpb:{val_bpb:.6f} val_time:{val_elapsed:.2f}s", console=True)
-        stats.bpb, stats.eval_seconds = val_bpb, val_elapsed
-        stats.slack = round((VAL_BPB_TARGET - val_bpb) * 1e6)
+        stats.mlm, stats.eval_seconds = val_mlm, val_elapsed
+        stats.dec_acc, stats.dec_brier, n_dec, _ = dec["decision_dev"]
+        stats.xfer_acc, stats.xfer_brier, n_xfer, _ = dec["transfer_dev"]
+        print0(f"step:{step}/{cfg.num_steps} val_mlm:{val_mlm:.4f} | decision_dev acc:{stats.dec_acc:.4f} "
+               f"brier:{stats.dec_brier:.4f} (n={n_dec}) | transfer_dev acc:{stats.xfer_acc:.4f} "
+               f"brier:{stats.xfer_brier:.4f} (n={n_xfer}) | val_time:{val_elapsed:.2f}s", console=True)
+        if last_step:
+            for split, (*_, by_source) in dec.items():
+                print0(f"  {split} accuracy by source: " + ", ".join(
+                    f"{s} {h}/{n}" for s, (h, n) in sorted(by_source.items())), console=True)
+        final_val = stats
 
     # --------------- Checkpoint -----------------
     if cfg.save_checkpoint and (last_step or step in cfg.save_steps):
@@ -1689,11 +1923,10 @@ for step in range(cfg.num_steps + 1):
     step_t0 = time.perf_counter()
 
     # Forward and Backward pass
-    loss = forward_backward(inputs, targets, rows, cu_seqlens,
-                            loss_scale=1.0 / inputs.size(0))
+    loss = forward_backward(pk)
 
     # Next training batch
-    inputs, targets, rows, cu_seqlens = next(train_loader)
+    pk = next(train_loader)
 
     # Smooth gradients, update weights
 
@@ -1702,14 +1935,14 @@ for step in range(cfg.num_steps + 1):
         muon_step_fused(p, p.grad, t_step)
 
     # AdamW
-    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
+    for p in (m.lm_head, m.readout, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
               m.x0_gates, m.bigram_lambdas, m.smear_gate, m.smear_lambda, m.backout_lambda):
         # Run AdamW
         adamw_step_fused(p, p.grad, t_step)
 
     t_step.add_(1)  # advance the schedule on-device
 
-    train_loss = loss.item()
+    train_loss = loss.cpu().numpy()   # (MLM, decision)
     torch.cuda.synchronize()
     dt = time.perf_counter() - step_t0
 
@@ -1732,9 +1965,9 @@ for step in range(cfg.num_steps + 1):
     tok_per_sec = int(cfg.train_batch_tokens / dt)
     mfu = 100 * cfg.num_flops_per_token * cfg.train_batch_tokens / dt / gpu_peak_flops
 
-    print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lr_mult_t: {lr_mult_t[step]:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
+    print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | mlm: {debiased_smooth_loss[0]:.4f} | decision: {debiased_smooth_loss[1]:.4f} | lr_mult_t: {lr_mult_t[step]:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
 
-    stats.loss = train_loss
+    stats.loss, stats.dec_loss = float(train_loss[0]), float(train_loss[1])
     stats.lr_mult_t = float(lr_mult_t[step])
     if step > 10:   # the compile and warm-up rates are not the run's rates
         stats.dt, stats.tok_per_sec, stats.mfu = dt, tok_per_sec, mfu
@@ -1784,7 +2017,7 @@ result = RunResult(
     train_time         = float(np.sum(timed)) / 60,
     val_time           = total_val_time / 60,
     compile_time       = compile_time / 60,
-    init_time          = (priors_time + pair_code_time) / 60,
+    init_time          = (priors_time + pair_code_time + packs_time) / 60,
     wall_time          = (time.perf_counter() - run_wall_t0) / 60,
 
     avg_step_time      = avg_step_time,
@@ -1792,9 +2025,9 @@ result = RunResult(
                           / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
     peak_mem_gb        = torch.cuda.max_memory_reserved() / 2**30,
 )
-if val_bpb is not None:
-    result.val_bpb, result.min_val_bpb = val_bpb, min_val_bpb
-    result.slack = round((VAL_BPB_TARGET - val_bpb) * 1e6)
+if final_val is not None:
+    result.val_mlm, result.dec_acc, result.dec_brier = final_val.mlm, final_val.dec_acc, final_val.dec_brier
+    result.xfer_acc, result.xfer_brier = final_val.xfer_acc, final_val.xfer_brier
 
 row = asdict(result)
 with open(result_path, "w") as f:
@@ -1804,8 +2037,9 @@ wandb_run.log({"step": cfg.num_steps,
                   if k not in FINAL_IDENTITY and v is not None}})
 
 print0(f"== {result.run_name} ==", console=True)
-if result.val_bpb is not None:
-    print0(f"  val_bpb {result.val_bpb:.6f} | min {result.min_val_bpb:.6f} | slack {result.slack:+,} vs {VAL_BPB_TARGET:.3f}", console=True)
+if result.xfer_acc is not None:
+    print0(f"  val_mlm {result.val_mlm:.4f} | decision_dev acc {result.dec_acc:.4f} brier {result.dec_brier:.4f} | "
+           f"transfer_dev acc {result.xfer_acc:.4f} brier {result.xfer_brier:.4f} (Kev-0.8B: 0.648)", console=True)
 print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | init {result.init_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
     print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
