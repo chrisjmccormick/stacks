@@ -165,7 +165,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "baseline-priml"  # both wandb and log files
+    run_name:        str = "baseline6"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -246,7 +246,7 @@ class Param(NamedTuple):
     gbank:        list      # Banked weights unbound into a list
     first_mntm:   Tensor
     scnd_mntm:    Tensor
-    residual_dim: int       # NorMuon only, dim that touches the res stream.
+    residual_dim: int       # NorMuon only, the smaller dim of the matrix.
 
     # Schedules (Per-Step Coefficients)
     lr_bc_t:      Tensor    # bias-corrected learning rate
@@ -298,39 +298,39 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=256K  -->  Held: 54GB,  Recomputed:  20.25GB
+    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB
     """
     #                                                            Stash (Tiny) Recompute
-    x_in:               Tensor    # (L,  T,    D)              4.5GB
-    x_biased_hat:       Tensor    # (L,  T,    D)              4.5GB
-    x_biased_inv_rms:   Tensor    # (L,  T,    1)         fp32          (3MB)
-    q_hat:              Tensor    # (L,  T, n_qo, d_qk)        4.5GB
-    k_hat:              Tensor    # (L,  T, n_kv, d_qk)        4.5GB
-    q_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (18MB)
-    k_inv_rms:          Tensor    # (L,  T, n_kv,    1)   fp32         (18MB)
-    #ve:                Tensor    # (Lv, T, n_kv, d_vo)                        2.25GB
-    #ve_gate_a:         Tensor    # (Lv, T, n_kv)                               (18MB)
-    v:                  Tensor    # (L,  T, n_kv, d_vo)        4.5GB
-    y:                  Tensor    # (L,  T, n_qo, d_vo)        4.5GB
-    y_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (18MB)
-    lse:                Tensor    # (L,  n_qo,  T)        fp32         (18MB)
-    x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
-    x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
-    mlp_a:              Tensor    # (L,  T, d_mlp[i])           18GB
-    #mlp_relu:          Tensor    # (L,  T, d_mlp)                               18GB
-    mlp_out_hat:        Tensor    # (L,  T,     D)             4.5GB
-    mlp_out_inv_rms:    Tensor    # (L,  T,     1)        fp32          (3MB)
+    x_in:               Tensor    # (L,  T,    D)             2.25GB
+    x_biased_hat:       Tensor    # (L,  T,    D)             2.25GB
+    x_biased_inv_rms:   Tensor    # (L,  T,    1)         fp32          (6MB)
+    q_hat:              Tensor    # (L,  T, n_qo, d_qk)       2.25GB
+    k_hat:              Tensor    # (L,  T, n_kv, d_qk)       2.25GB
+    q_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (36MB)
+    k_inv_rms:          Tensor    # (L,  T, n_kv,    1)   fp32         (36MB)
+    #ve:                Tensor    # (Lv, T, n_kv, d_vo)                        1.13GB
+    #ve_gate_a:         Tensor    # (Lv, T, n_kv)                                (9MB)
+    v:                  Tensor    # (L,  T, n_kv, d_vo)       2.25GB
+    y:                  Tensor    # (L,  T, n_qo, d_vo)       2.25GB
+    y_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (36MB)
+    lse:                Tensor    # (L,  n_qo,  T)        fp32         (36MB)
+    x_attn_out_hat:     Tensor    # (L,  T,     D)            2.25GB
+    x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (6MB)
+    mlp_a:              Tensor    # (L,  T, d_mlp[i])            9GB
+    #mlp_relu:          Tensor    # (L,  T, d_mlp[i])                             9GB
+    mlp_out_hat:        Tensor    # (L,  T,     D)            2.25GB
+    mlp_out_inv_rms:    Tensor    # (L,  T,     1)        fp32          (6MB)
     #                                                         ------           ------
-    #                                                 TOTAL:    54GB          20.25GB
+    #                                                 TOTAL:    27GB           10.1GB
 
 # Model-level activations held as locals:
-#   x0                 (T, D)          384MB    layer-blend + embedding-norm backward
-#   x_embed_inv_rms    (T, 1)   fp32   (1.2MB)
-#   x_pool             (T, D)          384MB    pooling backward
-#   x_final_hat        (T, D)          384MB    lm_head grad + final-norm backward
-#   x_final_inv_rms    (T, 1)   fp32   (1.2MB)
+#   x0                 (T, D)          288MB    layer-blend + embedding-norm backward
+#   x_embed_inv_rms    (T, 1)   fp32   (0.8MB)
+#   x_pool             (T, D)          288MB    pooling backward
+#   x_final_hat        (T, D)          288MB    lm_head grad + final-norm backward
+#   x_final_inv_rms    (T, 1)   fp32   (0.8MB)
 #   ngram_ids          (7, 2, T) int64  22MB    the n-gram tables' rows
-#                               TOTAL: 1.2GB
+#                               TOTAL: 0.9GB
 
 # Cast shorthands for the bodies below: the fp32 scalars/gates need explicit
 # bf16 casts at their use sites (see forward_backward's docstring), and the
@@ -514,7 +514,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     tgt = targets.unsqueeze(1)  # (T, 1)  TODO - Have the caller pass the right shape.
 
     # ==== Forward ====
-    logits_raw = x_final_hat @ m.lm_head.w.mT  # (T, d_vocab) bf16, 4GB at (64K, 32K)
+    logits_raw = x_final_hat @ m.lm_head.w.mT  # (T, d_vocab) bf16, 6.4GB at (192K, 16K)
 
     # "softcap" logits to the range -15 to 15
     logits = 15.0 * torch.tanh(logits_raw.float() / 15.0) # (T, d_vocab)
@@ -1213,7 +1213,7 @@ for (name, w, peak_lr, rdim) in muon_configs:
     grad = fp32_zeros(live.shape)
 
     # The NorMuon second moment holds each neuron's mean-square update -- the
-    # weight's shape with the residual-facing dim `rdim` collapsed to 1 (after
+    # weight's shape with its smaller dim `rdim` collapsed to 1 (after
     # orthogonalization only the smaller dim can carry variance).
     scnd_shape = list(live.shape)
     scnd_shape[rdim] = 1
