@@ -68,7 +68,7 @@ REPO_ID = "ChrisMcCormick/climbmix_32k_8_170"
 DATASET_DIR = os.path.expanduser("~/.cache/encoder-rtx/climbmix_32k_8_170")
 KEV_DIR = os.path.expanduser("~/.cache/encoder-rtx/data")   # data/prepare_kev_suites.py writes here
 
-NUM_TRAIN_SHARDS = 10      # 100M raw tokens each; the filler reads about 4 of them
+NUM_TRAIN_SHARDS = 20      # 100M raw tokens each; the joint 409M-token run reads about 4, an MLM-only run at 1.63B tokens about 17
 
 
 def download_dataset():
@@ -221,7 +221,8 @@ def plan_packs(records, docs, tokens_per_pack, decision_frac, seq_len, num_packs
             break                          # evaluation: nothing left to place
         filler, pos = [], used
         while pos < tokens_per_pack:
-            doc = next(docs)
+            doc = next(docs, None)
+            assert doc is not None, f"the filler ran out after {len(plans)} packs: raise NUM_TRAIN_SHARDS (utils.py)"
             n = min(doc.size, seq_len, tokens_per_pack - pos)
             filler.append(doc[:n])
             pos += n
