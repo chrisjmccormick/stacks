@@ -221,3 +221,7 @@ env.sh
 stacks/decoder-rtx/data/
 stacks/decoder-rtx/logs/
 stacks/decoder-rtx/wandb/
+
+# encoder-rtx: run logs + wandb land here when run from its folder (train_encoder.py)
+stacks/encoder-rtx/logs/
+stacks/encoder-rtx/wandb/
