@@ -2,21 +2,22 @@
 
 To encourage more exploration/hacking of the backward pass, I'm running a single-GPU pre-training speedrun for the month of September. 
 
-The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU), current baseline is 27 minutes.
+The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU), current baseline is 16 minutes.
 
 The baseline 12 layer model (same scale as [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and pipeline come from [nanochat](https://github.com/karpathy/nanochat).
 
-Final validation score is reported in terms of the amount of slack versus the target. Current baseline slack is (0.900000 - 0.899590) x 1e6 = **410** points (or 410 µbpb, if you prefer). 
+Final validation score is reported in terms of the amount of slack versus the target. The original baseline slack was (0.900000 - 0.899590) x 1e6 = **410** points (or 410 µbpb, if you prefer). 
 
-- From identical runs, the current "noise floor" is ±35 
-- At current step time, 40 points is worth ~1 second.
-- One training step appears to cost / gain ~70 points.
+You can roughly estimate a conversion rate between slack and steps, and therefore time.
+In the original baseline:
+- 40 points was worth ~1 second.
+- 1 training step was worth ~70 points. 
 
 ### Competition
 
-The leaderboard won't be the traditional PR ladder. I'll do a weekly baseline on Mondays that folds in whatever changes I liked and managed to validate, and credit everyone involved in that. 
+For the leaderboard, instead of the traditional PR ladder, weekly baselines (on Mondays) fold in whatever changes I liked and managed to validate, and credit everyone involved in that. 
 
-(Generally, though, you'll be on your own to promote your successes. What makes it into the baseline is going to be very subjective and limited by my capacity, so I apologize in advance to those who don't get the recognition they deserve.)
+(Generally, though, you'll be on your own to promote your successes. What makes it into the baseline is going to be subjective and limited by my capacity, so I apologize in advance to those who don't get the recognition they deserve.)
 
 Final baseline will be on Monday, September 28th.
 
@@ -57,12 +58,14 @@ python train_stack.py
 
 ### Baselines
 
-*September 4th Baseline*
+| Name | Time | Δ from Baseline 1 | Slack (μbpb) | Write-up |
+| --- | --- | --- | --- | --- |
+| 2026-09-04 - Baseline 1 | 26m 51s | - | 271 | [#1](https://github.com/chrisjmccormick/stacks/pull/1) |
+| 2026-09-07 - Baseline 2 | 25m 56s | -0m 55s | 837 | [#3](https://github.com/chrisjmccormick/stacks/pull/3) |
+| 2026-09-14 - Baseline 3 | 24m 21s | -2m 30s | 837 | [#4](https://github.com/chrisjmccormick/stacks/pull/4) |
+| 2026-09-21 - Baseline 4 | 15m 47s | -11m 04s | 920 | [#5](https://github.com/chrisjmccormick/stacks/pull/5) |
 
-- [wandb run](https://wandb.ai/chrismccormick/decoderstack_rtx/runs/ykjt80he)
-- 1,627 seconds (~27 minutes)
-- 410 ubpb of slack
-
+Each baseline's PR has the write-up of what it changed. The baseline runs can all be viewed on wandb, [here](https://wandb.ai/chrismccormick/decoderstack_rtx).
 
 ### Acknowledgements
 
@@ -73,10 +76,11 @@ python train_stack.py
 
 TODO - I'd like to try and carry forward crediting the individual algorithm and architecture improvements leveraged here that were first introduced by modded-nanogpt contributors, and any research paper behind them.
 
+- The September 21st baseline includes several innovations from the priml autoresearch run.
+
 ### Interesting Techniques
 
-- The baseline includes initialization of the vocabulary with the bigram distribution measured from the training data.
-- The head's log-frequency (unigram) component is halved at init. The first ten steps of training did that on their own, and doing it up front removes the step-1 loss spike (6.05 -> 7.6 nats) and finished 270 ubpb ahead of the same run without it.
-- The document-prefix cap ramp is rounded to multiples of 64 tokens: FA2 varlen's cost steps up each time a document crosses a 64-token boundary.
+- Initialization of the vocabulary with the bigram distribution measured from the training data.
 - Selectively re-computing certain parts of the forward activation conserved enough memory to allow for a micro-batch size of 256K tokens.
-
+- Two huge bigram hash tables (2M rows added to x0, 1M rows added to the values), from rekursive.ai's autoresearch run. They have no `.grad` buffers: their optimizer (sparse, no first moment, one second moment per row) is inlined in their backward math. See [#5](https://github.com/chrisjmccormick/stacks/pull/5).
+- A frozen 2M-row trigram ("pair code") stats table tallied from the dataset, projected and added to the values. See [#5](https://github.com/chrisjmccormick/stacks/pull/5).

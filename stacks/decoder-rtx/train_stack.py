@@ -22,7 +22,8 @@
 #     ABORT_STEP
 #     cfg.use_wandb
 #
-# Grep for "§" to retrieve the document outline.
+# Grep for "§" to retrieve the document outline
+# ("§ " marks a chapter, "§§ " a subsection).
 
 # ==============================================================================
 # § Setup
@@ -59,10 +60,16 @@ import torch._dynamo as dynamo
 import torch.nn.functional as F
 from torch import Tensor
 
+from torch._inductor.codecache import CacheBase
+
 from utils import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dataset,
                    flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
 
 dynamo.config.recompile_limit = 64
+
+# Matmul backend chosen per shape, read from the cache shipped beside this script.
+torch._inductor.config.max_autotune_gemm = True
+torch._inductor.config.autotune_in_subproc = False
 
 # Confirm Ampere or newer
 assert torch.cuda.is_available(), "no GPU -- Runtime > Change runtime type > A100"
@@ -73,6 +80,13 @@ assert props.major >= 8, f"needs Ampere or newer (got sm{props.major}{props.mino
 
 device = torch.device("cuda", 0)
 torch.cuda.set_device(device)
+
+# Install the shipped autotune cache, if it was measured on this GPU, triton and CUDA.
+autotune_cache = Path(CacheBase.get_local_cache_path())
+shipped_cache = json.loads((Path(sys.argv[0]).resolve().parent / "autotune_cache.json").read_text())
+if not autotune_cache.is_file() and shipped_cache["system"] == CacheBase.get_system():
+    autotune_cache.parent.mkdir(parents=True, exist_ok=True)
+    autotune_cache.write_text(json.dumps(shipped_cache))
 
 # ==============================================================================
 # § Configuration
@@ -94,9 +108,12 @@ class StackConfig:
     backout_layer: int = 6 # nanochat: n_layers // 2
 
     # Input
-    d_vocab:    int = 32768
-    d_bigram:   int = 5 * 32768 # 163,840 hashed [prev, curr] token pairs.
-    d_smr_gate: int = 24    # Gate input is first 24-dims of input embed.
+    d_vocab:         int = 32768
+    d_bigram:        int = 64 * 32768 # 2,097,152 hashed [prev, curr] pairs, read into the residual stream.
+    d_pair_values:   int = 32 * 32768 # 1,048,576 hashed [prev, curr] pairs, read into the attention values.
+    d_pair_code:     int = 64 * 32768 # 2,097,152 frequent [prev, curr] pairs with a frozen corpus code, likewise.
+    touched_rows:    int = 120_000    # Bound on the distinct rows of one table a batch touches (measured max: 114,895).
+    d_smr_gate:      int = 24    # Gate input is first 24-dims of input embed.
 
     # Attention
     n_qo_heads: int = 6
@@ -121,27 +138,25 @@ class StackConfig:
     d_mlp:      int = 4 * 768 # 3072
 
     # Model stats, for MFU and logging
-    num_params:          int = 412_090_861     # every trained weight (§ Weight Init & Schedule)
+    num_params:          int = 5_891_757_334     # every trained weight (§ Weight Init & Schedule)
     num_flops_per_token: int = 780_929_568     # 6 * 110,100,912 matmul params + attention
 
     # ---- Training ----
 
     # Batch Size
-    micro_batch_tokens: int = 2**18   # 256K tokens per micro-batch
-    total_batch_size:   int = 2**19   # 512K tokens per step
-    grad_accum_steps:   int
+    train_batch_tokens: int = 96 * 2048   # 192K tokens per step
 
     # Training
-    num_steps: int = 975
+    num_steps: int = 1760
 
     # Evaluation and logging
-    val_loss_every:  int = 125
+    val_loss_every:  int = 333
     val_tokens:      int = 10485760   # 10M tokens per val-bpb pass
     val_steps:       int              # Derived: val micro-batches per pass.
 
     # Logging
     wandb_project:   str = "decoderstack_rtx"  # baselines only
-    run_name:        str = "baseline"  # both wandb and log files
+    run_name:        str = "baseline4"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -180,8 +195,7 @@ cfg.window_sizes = [(cfg.short_win_size, 0)] * cfg.n_layers  # All short, ...
 for i in cfg.full_ctxt_layers:
     cfg.window_sizes[i] = (cfg.seq_len, 0)                   # ... then overwrite with full.
 
-cfg.grad_accum_steps = cfg.total_batch_size // cfg.micro_batch_tokens
-cfg.val_steps =        cfg.val_tokens       // EVAL_BUFFER_TOKENS
+cfg.val_steps = cfg.val_tokens // EVAL_BUFFER_TOKENS
 
 VAL_BPB_TARGET = 0.900
 
@@ -223,12 +237,12 @@ class Param(NamedTuple):
 
     # Schedules (Per-Step Coefficients)
     lr_bc_t:      Tensor    # bias-corrected learning rate
-    wd_t:         Tensor    # weight decay * non-corrected lr; AdamW stores 1 - that
+    wd_t:         Tensor    # weight decay * non-corrected lr; AdamW/RMSProp store 1 - that
     mntm_b1_t:    Tensor    # Beta1
     grad_b1_t:    Tensor    # 1 - Beta1
     mntm_b2_t:    Tensor    # Beta2
     grad_b2_t:    Tensor    # 1 - Beta2
-    eps_t:        Tensor    # AdamW only
+    eps_t:        Tensor    # AdamW and RMSProp
 
 class Model:
     """Container for the model's weights, plus RoPE buffers"""
@@ -244,8 +258,12 @@ class Model:
     W_K: Param
     W_V: Param
     W_O: Param
-    value_embeds: Param
-    ve_gate:      Param
+    value_embeds:  Param
+    ve_gate:       Param
+    pair_values:   Param  # [prev, curr]-indexed value memory, one table per VE layer.
+    pair_gate:     Param
+    pair_code:     Tensor # Frozen corpus code per frequent [prev, curr] pair; last row is zeros.
+    pair_decoder:  Param  # Reads a pair's code into the value space, once for all VE layers.
 
     # MLP
     W_in:  Param
@@ -253,6 +271,7 @@ class Model:
 
     # Cross-Layer
     x0_lambdas:     Param   # Per-layer coefficient for reading the input embedding.
+    x0_gates:       Param   # Per-layer scale on the channel-mean gate of that read.
     bigram_lambdas: Param   # Per-layer coefficient for reading the bigram embedding.
     resid_lambdas:  Param   # Per-layer gain on the residual stream.
     backout_lambda: Param
@@ -272,7 +291,7 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=256K  -->  Held: 49.5GB,  Recomputed:  24.75GB
+    For T=256K  -->  Held: 49.5GB,  Recomputed:  20.25GB
     """
     #                                                            Stash (Tiny) Recompute
     x_in:               Tensor    # (L,  T,    D)              4.5GB
@@ -287,12 +306,12 @@ class LayerStash(NamedTuple):
     v:                  Tensor    # (L,  T, n_kv, d_vo)        4.5GB
     y:                  Tensor    # (L,  T, n_qo, d_vo)        4.5GB
     lse:                Tensor    # (L,  n_qo,  T)        fp32         (18MB)
-    x_attn_out:         Tensor    # (L,  T,     D)             4.5GB
-    #x_attn_out_hat:    Tensor    # (L,  T,     D)                              4.5GB
-    mlp_relu:           Tensor    # (L,  T, d_mlp)              18GB
-    #mlp_a:             Tensor    # (L,  T, d_mlp)                               18GB
+    x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
+    x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
+    mlp_a:              Tensor    # (L,  T, d_mlp)              18GB
+    #mlp_relu:          Tensor    # (L,  T, d_mlp)                               18GB
     #                                                         ------           ------
-    #                                                 TOTAL:  49.5GB          24.75GB
+    #                                                 TOTAL:  49.5GB          20.25GB
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          384MB    layer-blend + smear backward
@@ -316,7 +335,7 @@ sum32 = lambda x: x.sum(dtype=torch.float32)
 
 @torch.compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backward=True):
+def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=True):
     """One micro-batch through the model. Use backward=False for validation."""
 
     # Direction naming:
@@ -340,11 +359,11 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # *_inv_rms  - 1/rms, used by RMS norm fwd and bwd.
     # *_hat      - RMS-normed  (x_hat = x * inv_rms)
     #
-    # Activation naming -- the MLP and both gates share three stages:
+    # Activation naming -- the MLP and the gates share three stages:
     # *_z        - Pre-nonlinearity, the raw matmul output. Only ever named in
-    #              bwd (mlpb_z, ve_gateb_z, gateb_z); inlined in fwd.
+    #              bwd (mlpb_z, ve_gateb_z, gateb_z, x0_gateb_z); inlined in fwd.
     #              ('logit' is reserved for the lm_head's output.)
-    # *_relu     - Post-relu, pre-square (MLP only; the stashed half of relu^2).
+    # *_relu     - Post-relu, pre-square (MLP only; recomputed in bwd).
     # *_sig      - Post-sigmoid, in [0, 1] (gates only; recomputed in bwd).
     # *_a        - The final activation handed onward: mlp_a = mlp_relu^2,
     #              ve_gate_a = 3*ve_gate_sig. The smear gate's is just 'gate'.
@@ -358,6 +377,9 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
 
     cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, half)
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
+    bigram_ids, pair_ids, pair_code_ids = rows[:3]   # each table's rows, computed on the host (see table_rows)
+    pair_code = F.embedding(pair_code_ids, m.pair_code)
+    pair_code_v = pair_code @ m.pair_decoder.w[0].mT
     x_backout = None
 
     # -----------------------------
@@ -379,12 +401,8 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # The smeared input embedding; also added back to the stream at every layer.
     x0 = torch.cat([x_embed_hat[:1], x_embed_hat[1:] + gate * x_embed_hat[:-1]], dim=0)  # appears as x0b in bwd
 
-    # Hash each [prev, curr] token pair into a bigram slot.
-    bigram_ids = idx.to(torch.int32).clone()
-    bigram_ids[0] = cfg.d_bigram - 1
-    bigram_ids[1:] = torch.bitwise_xor(36313 * bigram_ids[1:],
-                                       27191 * bigram_ids[:-1]) % (cfg.d_bigram - 1)
-    x_bigram = F.embedding(bigram_ids, m.bigram_embeds.w)  # appears as xb_bigram in bwd
+    # Bigram embeddings, one row per [prev, curr] token pair (see table_rows)
+    x_bigram = bf16(F.embedding(bigram_ids, m.bigram_embeds.w) * bigram_w_scale)  # appears as xb_bigram in bwd
 
     # The residual stream starts as the smeared embedding.
     x = x0
@@ -396,8 +414,9 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     for i in range(cfg.n_layers):
         x_in = x
 
-        # Scale residual stream, add input and bigram embeddings
-        x_biased = (m.resid_lambdas.w[i] * x_in + m.x0_lambdas.w[i] * x0
+        # Scale residual stream, add gated input and bigram embeddings
+        x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
+        x_biased = (m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
                     + m.bigram_lambdas.w[i] * x_bigram)
         x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
@@ -414,6 +433,11 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
             ve_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_ve_gate] @ m.ve_gate.w[j].mT)
             ve_gate_a = 3 * ve_gate_sig          # (T, n_kv_heads), in [0, 3]
             v = v + ve_gate_a.unsqueeze(-1) * ve # ve and the gate are both recomputed in bwd, not stashed
+
+            # Pair value memory, plus the pair's decoded code: gated like ve, from the next slice of the stream
+            pair_v = (bf16(F.embedding(pair_ids, pair_wbank[j]) * pair_w_scale) + pair_code_v).view(T, cfg.n_kv_heads, cfg.d_vo)
+            pair_gate_sig = torch.sigmoid(x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate] @ m.pair_gate.w[j].mT)
+            v = v + (3 * pair_gate_sig).unsqueeze(-1) * pair_v
 
         # RoPE
         q1, q2 = q[..., :half], q[..., half:]
@@ -437,13 +461,12 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         # Write back to the stream.
         x_attn_out = x_biased + attn_out
 
-        # MLP input norm
-        # Recomputed in backward pass to save memory.
-        x_attn_out_hat = bf16(x_attn_out.float() * (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt())
+        # MLP input norm. Stashed, not recomputed.
+        x_attn_out_inv_rms = (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        x_attn_out_hat = bf16(x_attn_out.float() * x_attn_out_inv_rms)
 
         # MLP
-        mlp_relu = F.relu(x_attn_out_hat @ m.W_in.w[i].mT)
-        mlp_a = mlp_relu.square()    # (T, d_mlp) - (64K, 3K) recomputed
+        mlp_a = F.relu(x_attn_out_hat @ m.W_in.w[i].mT).square()   # (T, d_mlp) - (64K, 3K) stashed
         mlp_out = mlp_a @ m.W_out.w[i].mT
 
         # Write back to the stream.
@@ -457,7 +480,8 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         if backward:
             stash.append(LayerStash(x_in=x_in, x_biased_hat=x_biased_hat, x_biased_inv_rms=x_biased_inv_rms,
                                     q_hat=q_hat, k_hat=k_hat, q_inv_rms=q_inv_rms, k_inv_rms=k_inv_rms,
-                                    v=v, y=y, lse=lse, x_attn_out=x_attn_out, mlp_relu=mlp_relu))
+                                    v=v, y=y, lse=lse, x_attn_out_hat=x_attn_out_hat,
+                                    x_attn_out_inv_rms=x_attn_out_inv_rms, mlp_a=mlp_a))
 
     x_final = x - bf16(m.backout_lambda.w) * x_backout # TODO - backout lambda could be bf16 instead.
 
@@ -507,7 +531,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     logitsb = bf16((onehot.float() - (e / ssum)) * (1.0 - logits/15.0 * logits/15.0) * loss_scale)
 
     # Every token updates every vocab entry.
-    m.lm_head.grad.add_((logitsb.mT @ x_final_hat).float()) # (d_vocab, T) @ (T, d_model) --> (d_vocab, d_model)
+    m.lm_head.grad.copy_((logitsb.mT @ x_final_hat).float()) # (d_vocab, T) @ (T, d_model) --> (d_vocab, d_model)
 
     # The backward streams start as weighted sums of the head embeddings
     # that they (meaningfully) predicted.
@@ -517,11 +541,15 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     # -----------------------------
     #           Backward
     # -----------------------------
-    # Only compute some grads on the last micro batch.
-    is_last_micro = (micro_step == cfg.grad_accum_steps - 1)
+    # The trained tables' rows, compacted for the sparse updates (see table_rows).
+    bigram_inverse, bigram_rows, pair_inverse, pair_rows = rows[3:]
+    bigram_rows, pair_rows = bigram_rows[:cfg.touched_rows], pair_rows[:cfg.touched_rows]
+
+    pair_w_scale_next = pair_w_scale * m.pair_values.wd_t[t_step]
+    bigram_w_scale_next = bigram_w_scale * m.bigram_embeds.wd_t[t_step]
 
     # Scalar grads are collected, grad tensors updated at the end.
-    g_resid = []; g_x0 = []; g_bigram = []
+    g_resid = []; g_x0 = []; g_bigram = []; g_x0_gate = []
 
     # Each stream's cosine similarity to the vocab signal, divided by d_model.
     # (T, 1) = ((T, d_model) * (T, d_model)).mean()
@@ -531,13 +559,13 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     xb_final = bf16(x_final_inv_rms * (xb_final_hat.float() - (x_final_hat.float() * res_ms)))
 
     # Dot product between final vs. backout streams.
-    if is_last_micro:
-        m.backout_lambda.grad.add_(-sum32(xb_final * x_backout))  # (T, d_model)
+    m.backout_lambda.grad.copy_(-sum32(xb_final * x_backout))  # (T, d_model)
 
     # xb updates every layer, keep xb_final for backout layer.
     xb = xb_final                       # grad wrt layer num_layers-1's output
     x0b = torch.zeros_like(x0)          # accumulates over layers
     xb_bigram = torch.zeros_like(x0)    # accumulates over layers
+    pair_code_vb = torch.zeros_like(pair_code_v)  # accumulates over VE layers
 
     # For each layer in reverse order,
     for i in reversed(range(cfg.n_layers)):
@@ -553,18 +581,16 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         #     since mlp_relu is already 0 where z < 0) ---
 
         # Grad w.r.t. W_out
-        mlp_a = st.mlp_relu.square()  # (T, d_mlp)
-        m.W_out.gbank[i].add_(xb.mT @ mlp_a) # (d_model, T) @ (T, d_mlp)
+        m.W_out.gbank[i].copy_(xb.mT @ st.mlp_a) # (d_model, T) @ (T, d_mlp)
 
         # Grad w.r.t. the pre-relu matmul output (mlpb_a = xb @ W_out is inline)
-        mlpb_z = 2.0 * st.mlp_relu * (xb @ m.W_out.w[i])
+        mlp_relu = st.mlp_a * (st.mlp_a + 1e-30).rsqrt()   # = mlp_a.sqrt()
+        mlpb_z = 2.0 * mlp_relu * (xb @ m.W_out.w[i])
 
-        # Recompute the MLP input norm
-        x_attn_out_inv_rms = (st.x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
-        x_attn_out_hat = bf16(st.x_attn_out.float() * x_attn_out_inv_rms)
+        x_attn_out_inv_rms, x_attn_out_hat = st.x_attn_out_inv_rms, st.x_attn_out_hat
 
         # Grad w.r.t. W_in
-        m.W_in.gbank[i].add_(mlpb_z.mT @ x_attn_out_hat) # (d_mlp, T) @ (T, d_model)
+        m.W_in.gbank[i].copy_(mlpb_z.mT @ x_attn_out_hat) # (d_mlp, T) @ (T, d_model)
 
         xb_attn_out_hat = mlpb_z @ m.W_in.w[i] # (T, d_mlp) @ (d_mlp, d_model) --> (T, d_model)
 
@@ -572,7 +598,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
 
         # Attention backward
         x_biased_hat = st.x_biased_hat
-        m.W_O.gbank[i].add_(xb_attn_out.mT @ st.y.view(T, -1))
+        m.W_O.gbank[i].copy_(xb_attn_out.mT @ st.y.view(T, -1))
         yb = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo)
 
         qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
@@ -592,6 +618,7 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
         # --- VE gate backward (ve and ve_gate_sig recomputed) ---
         j = cfg.ve_index[i]
         xb_biased_hat_ve = None
+        xb_biased_hat_pair = None
         if j >= 0:
             # Retrieve the value embeddings
             ve = F.embedding(idx, ve_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
@@ -604,45 +631,73 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
             ve_gateb_a = (vb * ve).sum(dim=-1)   # (T, n_kv_heads)
             ve_gateb_z = ve_gateb_a * (3 * ve_gate_sig * (1 - ve_gate_sig))
 
-            m.ve_gate.gbank[j].add_(ve_gateb_z.mT @ x_biased_hat[..., :cfg.d_ve_gate])
+            m.ve_gate.gbank[j].copy_(ve_gateb_z.mT @ x_biased_hat[..., :cfg.d_ve_gate])
 
             # Embedding gradient
             veb = (vb * (3 * ve_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
             # embedding_dense_backward beat raw index_add_ atomics ~2x
-            m.value_embeds.gbank[j].add_(
+            m.value_embeds.gbank[j].copy_(
                 torch.ops.aten.embedding_dense_backward(veb, idx, cfg.d_vocab, -1, False))
 
             xb_biased_hat_ve = ve_gateb_z @ m.ve_gate.w[j]
+
+            # --- pair value memory backward (pair_v and pair_gate_sig recomputed) ---
+            pair_v = (bf16(F.embedding(pair_ids, pair_wbank[j]) * pair_w_scale) + pair_code_v).view(T, cfg.n_kv_heads, cfg.d_vo)
+            pair_gate_sig = torch.sigmoid(x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate] @ m.pair_gate.w[j].mT)
+            pair_gateb_z = (vb * pair_v).sum(dim=-1) * (3 * pair_gate_sig * (1 - pair_gate_sig))   # (T, n_kv_heads)
+            m.pair_gate.gbank[j].copy_(pair_gateb_z.mT @ x_biased_hat[..., cfg.d_ve_gate:2 * cfg.d_ve_gate])
+            pair_vb = (vb * (3 * pair_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
+            pair_code_vb = pair_code_vb + pair_vb
+
+            # Sparse update: row-wise RMSProp on this slot's touched rows (pair_rows), fused in at its gradient.
+            pair_grad = torch.ops.aten.embedding_dense_backward(pair_vb.float(), pair_inverse, cfg.touched_rows, -1, False)
+            pair_vbank[j].mul_(m.pair_values.mntm_b2_t[t_step])   # (rows, 1) fp32
+            pair_slot_mntm = (pair_vbank[j].index_select(0, pair_rows)
+                              + pair_grad.square().mean(dim=-1, keepdim=True) * m.pair_values.grad_b2_t[t_step])
+            pair_vbank[j].index_copy_(0, pair_rows, pair_slot_mntm)
+            pair_wbank[j].index_copy_(0, pair_rows, bf16(
+                pair_wbank[j].index_select(0, pair_rows).float()
+                + (m.pair_values.lr_bc_t[t_step] / pair_w_scale_next)
+                  * (pair_grad / (pair_slot_mntm.sqrt() + m.pair_values.eps_t[t_step]))))
+            xb_biased_hat_pair = pair_gateb_z @ m.pair_gate.w[j]
 
         # vb passes through the VE add unchanged: v = v0 + ve_gate_a*ve
         qb = qb.view(T, cfg.n_qo_heads * cfg.d_qk)
         kb = kb.view(T, cfg.n_kv_heads * cfg.d_qk)
         vb = vb.reshape(T, cfg.n_kv_heads * cfg.d_vo)
 
-        m.W_Q.gbank[i].add_(qb.mT @ x_biased_hat)
-        m.W_K.gbank[i].add_(kb.mT @ x_biased_hat)
-        m.W_V.gbank[i].add_(vb.mT @ x_biased_hat)
+        m.W_Q.gbank[i].copy_(qb.mT @ x_biased_hat)
+        m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
+        m.W_V.gbank[i].copy_(vb.mT @ x_biased_hat)
 
         xb_biased_hat = qb @ m.W_Q.w[i] + kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
         if xb_biased_hat_ve is not None:
             xb_biased_hat[:, :cfg.d_ve_gate] += xb_biased_hat_ve
+            xb_biased_hat[:, cfg.d_ve_gate:2 * cfg.d_ve_gate] += xb_biased_hat_pair
         xb_biased = xb_attn_out + bf16(st.x_biased_inv_rms * (xb_biased_hat.float() - (x_biased_hat.float() * (x_biased_hat.float() * xb_biased_hat.float()).mean(dim=-1, keepdim=True))))
-        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0 + bigram_lambdas[i]*x_bigram ---
-        if is_last_micro:
-            g_resid.append(sum32(xb_biased * st.x_in))
-            g_x0.append(sum32(xb_biased * x0))
-            g_bigram.append(sum32(xb_biased * x_bigram))
-        x0b = x0b + m.x0_lambdas.w[i] * xb_biased  # TRAP: x0 feeds every layer, accumulate
+        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0_gate*x0 + bigram_lambdas[i]*x_bigram,
+        #     x0_gate = 2*sigmoid(x0_gates[i] * mean_c(x_in)) ---
+        x_in_mean  = st.x_in.float().mean(dim=-1, keepdim=True)                         # (T, 1)
+        x0_gate    = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in_mean)                   # (T, 1)
+        x0_dot     = (xb_biased * x0).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
+        x0_gateb_z = x0_dot * m.x0_lambdas.w[i] * x0_gate * (1.0 - 0.5 * x0_gate)       # (T, 1)
+        g_resid.append(sum32(xb_biased * st.x_in))
+        g_x0.append((x0_dot * x0_gate).sum())
+        g_bigram.append(sum32(xb_biased * x_bigram))
+        g_x0_gate.append((x0_gateb_z * x_in_mean).sum())
+        x0b = x0b + bf16(m.x0_lambdas.w[i] * x0_gate) * xb_biased  # TRAP: x0 feeds every layer, accumulate
         xb_bigram = xb_bigram + m.bigram_lambdas.w[i] * xb_biased  # TRAP: x_bigram feeds every layer, accumulate
-        xb = m.resid_lambdas.w[i] * xb_biased
+        xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
         stash[i] = None                          # free this layer's stash as we go
 
-    # Land the per-layer resid/x0/bigram scalar sums (collected in REVERSED
-    # layer order) as one stacked add each.
-    if is_last_micro:
-        m.resid_lambdas.grad.add_(torch.stack(g_resid[::-1]))
-        m.x0_lambdas.grad.add_(torch.stack(g_x0[::-1]))
-        m.bigram_lambdas.grad.add_(torch.stack(g_bigram[::-1]))
+    m.pair_decoder.gbank[0].copy_(pair_code_vb.mT @ pair_code)
+
+    # Land the per-layer resid/x0/bigram/x0-gate scalar sums (collected in REVERSED
+    # layer order) as one stacked copy each.
+    m.resid_lambdas.grad.copy_(torch.stack(g_resid[::-1]))
+    m.x0_lambdas.grad.copy_(torch.stack(g_x0[::-1]))
+    m.bigram_lambdas.grad.copy_(torch.stack(g_bigram[::-1]))
+    m.x0_gates.grad.copy_(torch.stack(g_x0_gate[::-1]))
 
     # xb is now the grad through layer 0's input, which IS x0 (same tensor), so
     # it folds into x0b to give the full grad wrt the smeared embedding.
@@ -654,17 +709,29 @@ def forward_backward(idx, targets, cu_seqlens, micro_step, loss_scale=1.0, backw
     xb_embed_hat = x0b.clone()
     xb_embed_hat[:-1] += gate * x0b[1:]  # TRAP: shifted scatter -- p's grad reaches p-1
     gateb = (x0b[1:] * x_embed_hat[:-1]).sum(dim=-1, keepdim=True)   # (T-1, 1)
-    m.smear_lambda.grad.add_(sum32(gateb * gate_sig))
+    m.smear_lambda.grad.copy_(sum32(gateb * gate_sig))
     gateb_z = gateb * bf16(m.smear_lambda.w) * gate_sig * (1 - gate_sig)
-    m.smear_gate.grad.add_((gateb_z.mT @ x_embed_hat[1:, :cfg.d_smr_gate]).float())
+    m.smear_gate.grad.copy_((gateb_z.mT @ x_embed_hat[1:, :cfg.d_smr_gate]).float())
     xb_embed_hat[1:, :cfg.d_smr_gate] += gateb_z @ bf16(m.smear_gate.w)
 
     # --- embedding norm + token embedding scatter ---
     xb_embed = bf16(x_embed_inv_rms * (xb_embed_hat.float() - (x_embed_hat.float() * (x_embed_hat.float() * xb_embed_hat.float()).mean(dim=-1, keepdim=True))))
-    m.input_embeds.grad.add_(
+    m.input_embeds.grad.copy_(
         torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
-    m.bigram_embeds.grad.add_(
-        torch.ops.aten.embedding_dense_backward(xb_bigram, bigram_ids, cfg.d_bigram, -1, False))
+
+    # Sparse update: row-wise RMSProp on the bigram table's touched rows (bigram_rows).
+    bigram_grad = torch.ops.aten.embedding_dense_backward(xb_bigram.float(), bigram_inverse, cfg.touched_rows, -1, False)
+    m.bigram_embeds.scnd_mntm.mul_(m.bigram_embeds.mntm_b2_t[t_step])
+    bigram_mntm = (m.bigram_embeds.scnd_mntm.index_select(0, bigram_rows)
+                   + bigram_grad.square().mean(dim=-1, keepdim=True) * m.bigram_embeds.grad_b2_t[t_step])
+    m.bigram_embeds.scnd_mntm.index_copy_(0, bigram_rows, bigram_mntm)
+    m.bigram_embeds.w.index_copy_(0, bigram_rows, bf16(
+        m.bigram_embeds.w.index_select(0, bigram_rows).float()
+        + (m.bigram_embeds.lr_bc_t[t_step] / bigram_w_scale_next)
+          * (bigram_grad / (bigram_mntm.sqrt() + m.bigram_embeds.eps_t[t_step]))))
+
+    pair_w_scale.copy_(pair_w_scale_next)
+    bigram_w_scale.copy_(bigram_w_scale_next)
 
     return loss
 
@@ -686,7 +753,7 @@ def writeback_master(master: Tensor, live: Tensor, mantissa: Tensor) -> None:
     mantissa.view(torch.int16).copy_(bits.to(torch.int16))
 
 # ------------------------------------------------------------------------------
-# AdamW
+# §§ AdamW
 # ------------------------------------------------------------------------------
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -725,7 +792,7 @@ def adamw_step_fused(
 
 
 # ------------------------------------------------------------------------------
-# Muon
+# §§ Muon
 # ------------------------------------------------------------------------------
 
 # Polar Express orthogonalization coefficients, 5 iterations.
@@ -792,11 +859,11 @@ def muon_step_fused(
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# LR Schedule
+# §§ LR Schedule
 # ------------------------------------------------------------------------------
 
 # Learning rate schedule as a per-step multiplier.
-# Shared by Muon and AdamW. No warmup: peak from step 0.
+# Shared by Muon, AdamW and RMSProp. No warmup: peak from step 0.
 lr_mult_t = np.ones(cfg.num_steps)
 
 steps_0idx = np.arange(cfg.num_steps, dtype=np.float64)  # 0-based, the way the loop counts
@@ -811,7 +878,7 @@ lr_mult_t[warmdown] = 0.05 + (1.0 - 0.05) * warmdown_frac
 
 
 # ------------------------------------------------------------------------------
-# Common
+# §§ Common
 # ------------------------------------------------------------------------------
 
 m = Model()
@@ -836,11 +903,12 @@ dev = lambda a: torch.tensor(a, dtype=torch.float32, device=device)
 
 
 # ------------------------------------------------------------------------------
-# Scalars
+# §§ Scalars
 # ------------------------------------------------------------------------------
 
 resid_lambdas  = torch.linspace(1.15, 1.05, cfg.n_layers, dtype=torch.float32, device=device)
 x0_lambdas     = torch.linspace(0.20, 0.05, cfg.n_layers, dtype=torch.float32, device=device)
+x0_gates       = fp32_zeros(cfg.n_layers)
 bigram_lambdas = fp32_empty(cfg.n_layers).fill_(0.1)
 smear_lambda   = fp32_zeros(1)
 backout_lambda = fp32_empty(1).fill_(0.2)
@@ -855,6 +923,7 @@ scalar_configs = [
 #   name,               weights,       peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,   0.005,    0.2,        0.05,   0.05),
     ("x0_lambdas",      x0_lambdas,      0.1,      0.04,       0.05,   0.0),
+    ("x0_gates",        x0_gates,        0.1,      0.04,       0.05,   0.0),
     ("bigram_lambdas",  bigram_lambdas,  0.1,      0.04,       0.05,   0.0),
     ("smear_gate",      smear_gate,      0.2,      0.2,        0.05,   0.0),
     ("smear_lambda",    smear_lambda,    0.2,      0.2,        0.05,   0.0),
@@ -906,7 +975,7 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd) in scalar_configs:
     setattr(m, name, p)
 
 # ------------------------------------------------------------------------------
-# Embeddings
+# §§ Embeddings
 # ------------------------------------------------------------------------------
 
 input_embeds =     bf16_empty(cfg.d_vocab, cfg.d_model)  # + the token frequency prior, below
@@ -915,15 +984,15 @@ value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_
 value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
                    .uniform_(-matrix_init_s, matrix_init_s))
 
-bigram_embeds = bf16_zeros(cfg.d_bigram, cfg.d_model)
+bigram_embeds = bf16_zeros(cfg.d_bigram + 1, cfg.d_model)                                     # + a scratch row
+pair_values   = bf16_zeros(cfg.num_ves * (cfg.d_pair_values + 1), cfg.n_kv_heads * cfg.d_vo)  # + one per slot
 
 ve_rows = cfg.num_ves * cfg.d_vocab
 
 embed_configs = [
 #   name,             weights,       peak lr,  b1_grad,  b2_grad,  wd,       slots
-    ("input_embeds",  input_embeds,  0.3,      0.2,      0.005,    0.001,   1),
-    ("value_embeds",  value_embeds,  0.15,     0.2,      0.005,    0.01,   cfg.num_ves),
-    ("bigram_embeds", bigram_embeds, 0.03,     0.2,      0.005,    0.001,   1)
+    ("input_embeds",  input_embeds,  0.1837,   0.2,      0.005,    0.001,   1),
+    ("value_embeds",  value_embeds,  0.0919,   0.2,      0.005,    0.01,   cfg.num_ves)
 ]
 
 # For each of the embedding tables...
@@ -973,7 +1042,104 @@ for (name, w, peak_lr, b1_grad, b2_grad, wd, slots) in embed_configs:
 
 
 # ------------------------------------------------------------------------------
-# LM Head
+# §§ Bigram Table
+# ------------------------------------------------------------------------------
+
+peak_lr = 0.0184
+b2_grad = 0.005   # (1-Beta2)
+wd      = 0.001
+
+# Derive the momentum buffer's decay.
+b2_mntm = 1 - b2_grad
+
+m.bigram_embeds = Param(
+    # Weight
+    name         = "bigram_embeds",
+    w            = bigram_embeds,      # bf16 live, no fp32 master
+    mantissa     = None,
+
+    # Gradients -- none: the update is fused into forward_backward
+    grad         = None,
+    gbank        = None,
+
+    # Momentum buffers
+    first_mntm   = None,
+    scnd_mntm    = fp32_zeros(cfg.d_bigram + 1, 1),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+
+    # Weight decay schedule
+    wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+    mntm_b1_t    = None,
+    grad_b1_t    = None,
+
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),   # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+
+# The weight decay the rows have not had applied: the live weight is the row times this.
+bigram_w_scale = fp32_empty(1).fill_(1.0)
+
+
+# ------------------------------------------------------------------------------
+# §§ Pair Value Memory
+# ------------------------------------------------------------------------------
+
+peak_lr = 0.0736
+b2_grad = 0.005   # (1-Beta2)
+wd      = 0.001
+
+b2_mntm = 1 - b2_grad
+
+m.pair_values = Param(
+    # Weight
+    name         = "pair_values",
+    w            = pair_values,      # bf16 live, no fp32 master
+    mantissa     = None,
+
+    # Gradients -- none: the update is fused into forward_backward
+    grad         = None,
+    gbank        = None,
+
+    # Momentum buffers
+    first_mntm   = None,
+    scnd_mntm    = fp32_zeros(cfg.num_ves * (cfg.d_pair_values + 1), 1),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+
+    # Weight decay schedule
+    wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+    mntm_b1_t    = None,
+    grad_b1_t    = None,
+
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),   # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+
+# The table's five slots as standalone tensors, so each update writes a whole one.
+pair_wbank = list(pair_values.view(cfg.num_ves, cfg.d_pair_values + 1, -1).unbind(0))
+pair_vbank = list(m.pair_values.scnd_mntm.view(cfg.num_ves, cfg.d_pair_values + 1, 1).unbind(0))
+
+# The weight decay the rows have not had applied: the live weight is the row times this.
+pair_w_scale = fp32_empty(1).fill_(1.0)
+
+
+# ------------------------------------------------------------------------------
+# §§ LM Head
 # ------------------------------------------------------------------------------
 
 lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001)  # + the token frequency prior, below
@@ -981,7 +1147,7 @@ lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001)  # +
 # Per-step multiplier on the head's grad mix-ins (1-beta). Constant: no warmup ramp.
 lm_grad_mult_t = np.ones(cfg.num_steps)
 
-peak_lr = 0.008
+peak_lr = 0.0049
 b1_grad = 0.2    # (1-Beta1)
 b2_grad = 0.04   # (1-Beta2)
 wd      = 0.01
@@ -1028,7 +1194,7 @@ m.lm_head = Param(
 
 
 # ------------------------------------------------------------------------------
-# Attention & MLPs
+# §§ Attention & MLPs
 # ------------------------------------------------------------------------------
 
 W_Q =   fp32_empty(cfg.n_layers, cfg.n_qo_heads * cfg.d_qk, cfg.d_model).uniform_(-matrix_init_s, matrix_init_s)
@@ -1037,6 +1203,9 @@ W_V =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_vo, cfg.d_model).uniform
 W_O =   fp32_zeros(cfg.n_layers,               cfg.d_model, cfg.n_qo_heads * cfg.d_vo)  # projections start at zero
 
 ve_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(0.0, 0.02)
+pair_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
+    0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 2))
+pair_decoder = fp32_zeros(1, cfg.n_kv_heads * cfg.d_vo, cfg.d_model)  # starts at zero
 
 W_in  = fp32_empty(cfg.n_layers, cfg.d_mlp,   cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4)
 W_out = fp32_zeros(cfg.n_layers, cfg.d_model, cfg.d_mlp)             # projections start at zero
@@ -1060,16 +1229,18 @@ muon_wd[1:] = 0.28 * (0.5 * (1.0 + np.cos(math.pi * (1.0 - run_frac))))
 # Muon peak lr is 0.02, scaled up for tall matrices by their sqrt(fan_out/fan_in)
 # aspect ratio -- at d12 only W_in (the 4x MLP expansion -> 2.0). rdim is the
 # axis facing the residual stream: W_O and W_out live transposed -> -2; the
-# ve_gate rows read a d_ve_gate slice of the stream -> -1.
+# ve_gate rows read a d_ve_gate slice of the stream -> -1, pair_decoder the pair code -> -1.
 muon_configs = [
-#    name,      weights,  peak lr,  rdim
-    ("W_Q",     W_Q,      0.02,      -1),
-    ("W_K",     W_K,      0.02,      -1),
-    ("W_V",     W_V,      0.02,      -1),
-    ("W_O",     W_O,      0.02,      -2),
-    ("W_in",    W_in,     0.04,      -1),
-    ("W_out",   W_out,    0.02,      -2),
-    ("ve_gate", ve_gate,  0.02,      -1)
+#    name,           weights,       peak lr,  rdim
+    ("W_Q",          W_Q,           0.02,      -1),
+    ("W_K",          W_K,           0.02,      -1),
+    ("W_V",          W_V,           0.02,      -1),
+    ("W_O",          W_O,           0.02,      -2),
+    ("W_in",         W_in,          0.04,      -1),
+    ("W_out",        W_out,         0.02,      -2),
+    ("ve_gate",      ve_gate,       0.02,      -1),
+    ("pair_gate",    pair_gate,     0.02,      -1),
+    ("pair_decoder", pair_decoder,  0.02,      -1)
 ]
 
 # For each of the Muon-trained weight banks...
@@ -1122,11 +1293,11 @@ for (name, w, peak_lr, rdim) in muon_configs:
     setattr(m, name, p)
 
 # The Params own everything now: free the fp32 draws, drop the adopted names.
-del lm_head, input_embeds, value_embeds, bigram_embeds, resid_lambdas, x0_lambdas, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, W_in, W_out
+del lm_head, input_embeds, value_embeds, bigram_embeds, pair_values, resid_lambdas, x0_lambdas, x0_gates, bigram_lambdas, smear_gate, smear_lambda, backout_lambda, W_Q, W_K, W_V, W_O, ve_gate, pair_gate, pair_decoder, W_in, W_out
 
 
 # ------------------------------------------------------------------------------
-# Token Frequency Priors
+# §§ Token Frequency Priors
 # ------------------------------------------------------------------------------
 
 # Corpus bigram counts (all 91 train shards): bigram_counts[i, j] = how often token j follows token i.
@@ -1166,7 +1337,7 @@ head_prior = torch.linalg.solve((xe_prior.T @ (context_weight ** 2 * xe_prior)).
 del raw_target, xe_prior, context_weight, next_unigram
 
 # Halve the head's log-frequency component.
-occurrences_per_step = context_counts / context_counts.sum() * cfg.total_batch_size               # (V, 1)
+occurrences_per_step = context_counts / context_counts.sum() * cfg.train_batch_tokens             # (V, 1)
 freq_weight = occurrences_per_step.clamp_min(1e-3)
 log_freq = (occurrences_per_step + 1e-3).log()
 log_freq -= (freq_weight * log_freq).sum() / freq_weight.sum()                                    # centred
@@ -1184,10 +1355,45 @@ del embed_prior, head_prior, head_master
 
 
 # ------------------------------------------------------------------------------
-# Rotary Cache
+# §§ Pair Code
 # ------------------------------------------------------------------------------
 
-rotary_seq_len = cfg.micro_batch_tokens
+# Corpus trigram statistics (all 91 train shards): each frequent [prev, curr] pair's 64 next tokens with the largest
+# log1p(count / (1,000 * bigram probability)), and those log-ratios.
+pair_next = np.load(os.path.join(DATASET_DIR, "tokenizer/pair_next_tokens.npz"))
+pair_code_keys = pair_next["keys"]  # prev * d_vocab + curr, ascending
+pair_next_ids, pair_log_ratios, pair_counts = pair_next["next_ids"], pair_next["log_ratios"], pair_next["counts"]
+del pair_next
+
+# Each pair's code: the log-ratio-weighted sum of the head's centred rows.
+centred_head = rebuild_master(m.lm_head.w, m.lm_head.mantissa)
+centred_head -= centred_head.mean(dim=0, keepdim=True)
+pair_code = fp32_zeros(cfg.d_pair_code + 1, cfg.d_model)
+for start in range(0, cfg.d_pair_code, 16384):
+    next_ids   = torch.from_numpy(pair_next_ids[start:start + 16384].astype(np.int64)).to(device)
+    log_ratios = torch.from_numpy(pair_log_ratios[start:start + 16384].astype(np.float32)).to(device)
+    pair_code[start:start + 16384] = (log_ratios.unsqueeze(-1) * centred_head[next_ids]).sum(dim=1)
+
+# Centre and whiten, weighted by each pair's share of positions.
+position_share = torch.from_numpy(pair_counts / pair_counts.sum()).float().unsqueeze(1).to(device)
+pair_code[:-1] -= (pair_code[:-1] * position_share).sum(dim=0, keepdim=True)
+covariance = torch.zeros(cfg.d_model, cfg.d_model, dtype=torch.float64, device=device)
+for start in range(0, cfg.d_pair_code, 65536):
+    code_rows = pair_code[start:start + 65536].double()
+    covariance += code_rows.T @ (code_rows * position_share[start:start + 65536].double())
+eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+whitening = (eigenvectors * (eigenvalues.clamp_min(0.0) + 1e-3 * eigenvalues.mean()).rsqrt()) @ eigenvectors.T
+pair_code[:-1] = pair_code[:-1] @ whitening.float()
+m.pair_code = pair_code.bfloat16()
+del pair_next_ids, pair_log_ratios, pair_counts, centred_head, pair_code, next_ids, log_ratios, position_share
+del covariance, code_rows, eigenvalues, eigenvectors, whitening
+
+
+# ------------------------------------------------------------------------------
+# §§ Rotary Cache
+# ------------------------------------------------------------------------------
+
+rotary_seq_len = cfg.train_batch_tokens
 channel_range = torch.arange(0, cfg.d_qk, 2, dtype=torch.float32, device=device)  # stride the channels
 inv_freq = 1.0 / (100000 ** (channel_range / cfg.d_qk))
 t_pos = torch.arange(rotary_seq_len, dtype=torch.float32, device=device)          # stride the time steps
@@ -1205,7 +1411,7 @@ del channel_range, inv_freq, t_pos, freqs
 
 
 # ------------------------------------------------------------------------------
-# Stats
+# §§ Stats
 # ------------------------------------------------------------------------------
 # One row per step. The CSV header is the field list, the wandb row is the same
 # fields under their panel prefixes. A field nobody wrote stays None, and both
@@ -1249,32 +1455,32 @@ class RunResult:
     """The run in one row: the results panel, the result JSON, the runs table."""
 
     # Identity, for the JSON; wandb has these from the run name and config
-    run_name:         str          = ""
-    num_steps:        int          = 0
-    total_batch_size: int          = 0
+    run_name:           str          = ""
+    num_steps:          int          = 0
+    train_batch_tokens: int          = 0
 
     # The result
-    val_bpb:          float | None = None
-    min_val_bpb:      float | None = None
-    slack:            int   | None = None   # micro-bpb under VAL_BPB_TARGET
+    val_bpb:            float | None = None
+    min_val_bpb:        float | None = None
+    slack:              int   | None = None   # micro-bpb under VAL_BPB_TARGET
 
     # The cost, in minutes
-    train_time:       float        = 0.0
-    val_time:         float        = 0.0
-    compile_time:     float        = 0.0
-    wall_time:        float        = 0.0
+    train_time:         float        = 0.0
+    val_time:           float        = 0.0
+    compile_time:       float        = 0.0
+    wall_time:          float        = 0.0
 
     # The rate
-    avg_step_time:    float        = 0.0    # seconds
-    avg_mfu:          float        = 0.0    # percent of BF16 peak
-    peak_mem_gb:      float        = 0.0
+    avg_step_time:      float        = 0.0    # seconds
+    avg_mfu:            float        = 0.0    # percent of BF16 peak
+    peak_mem_gb:        float        = 0.0
 
 
-FINAL_IDENTITY = ("run_name", "num_steps", "total_batch_size")
+FINAL_IDENTITY = ("run_name", "num_steps", "train_batch_tokens")
 
 
 # ------------------------------------------------------------------------------
-# Logging
+# §§ Logging
 # ------------------------------------------------------------------------------
 
 def write_checkpoint(step):
@@ -1310,8 +1516,7 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 
 print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token: {cfg.num_flops_per_token:e}", console=True)
 print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", console=True)
-print0(f"Total batch size: {cfg.total_batch_size:,} tokens = {cfg.micro_batch_tokens:,} tokens/micro "
-       f"x {cfg.grad_accum_steps} grad accum", console=True)
+print0(f"Batch size: {cfg.train_batch_tokens:,} tokens per step", console=True)
 
 # A flat row per step and the result, for analysis without wandb.
 metrics_path = f"logs/{cfg.run_name}_metrics.csv"
@@ -1386,10 +1591,27 @@ timed = []   # Length of each step in seconds, steps 0-10 excluded.
              # Total training time = np.sum(timed).
 warmup = []  # Those first 11 steps, where the compile lives.
 
-train_loader = data_generator("train", cfg.seq_len, cfg.micro_batch_tokens,
-                              cfg.num_steps * cfg.grad_accum_steps)
+def table_rows(tokens):
+    """Each position's [prev, curr] pair as a row of the three pair-indexed tables, plus the two trained tables' compacted rows, on the host (see data_generator)."""
+    pair     = np.bitwise_xor(36313 * tokens[1:], 27191 * tokens[:-1])
+    pair_key = cfg.d_vocab * tokens[:-1] + tokens[1:]
+    code_row = np.minimum(np.searchsorted(pair_code_keys, pair_key), cfg.d_pair_code - 1)
+    rows = np.empty((7, tokens.size), dtype=tokens.dtype)
+    rows[0, :1], rows[0, 1:] = cfg.d_bigram - 1,      pair % (cfg.d_bigram - 1)
+    rows[1, :1], rows[1, 1:] = cfg.d_pair_values - 1, pair % (cfg.d_pair_values - 1)
+    rows[2, :1], rows[2, 1:] = cfg.d_pair_code,       np.where(pair_code_keys[code_row] == pair_key, code_row, cfg.d_pair_code)
+    # Compact each trained table's rows; padding points at the table's scratch row.
+    bigram_touched, rows[3] = np.unique(rows[0], return_inverse=True)
+    pair_touched,   rows[5] = np.unique(rows[1], return_inverse=True)
+    assert max(bigram_touched.size, pair_touched.size) <= cfg.touched_rows
+    rows[4], rows[4, :bigram_touched.size] = cfg.d_bigram,      bigram_touched
+    rows[6], rows[6, :pair_touched.size]   = cfg.d_pair_values, pair_touched
+    return rows
 
-inputs, targets, cu_seqlens = next(train_loader)   # kick off the first batch
+train_loader = data_generator("train", cfg.seq_len, cfg.train_batch_tokens, table_rows,
+                              cfg.num_steps)
+
+inputs, targets, rows, cu_seqlens = next(train_loader)   # kick off the first batch
 
 # Training loop
 for step in range(cfg.num_steps + 1):
@@ -1403,12 +1625,13 @@ for step in range(cfg.num_steps + 1):
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.micro_batch_tokens)
+        val_loader = data_generator("val", cfg.seq_len, cfg.train_batch_tokens, table_rows)
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
-        for micro_i in range(cfg.val_steps):
-            v_inputs, v_targets, v_cu_seqlens = next(val_loader)
-            loss_flat = forward_backward(v_inputs, v_targets, v_cu_seqlens, micro_step=micro_i, backward=False)
+        for _ in range(cfg.val_steps):
+            v_inputs, v_targets, v_rows, v_cu_seqlens = next(val_loader)
+            loss_flat = forward_backward(v_inputs, v_targets, v_rows, v_cu_seqlens,
+                                         backward=False)
             num_bytes_flat = token_bytes[v_targets]
             total_nats += (loss_flat * (num_bytes_flat > 0)).sum()
             total_bytes += num_bytes_flat.sum()
@@ -1436,30 +1659,24 @@ for step in range(cfg.num_steps + 1):
     torch.cuda.synchronize()
     step_t0 = time.perf_counter()
 
-    # Gradient Accumulation Loop
-    for micro_i in range(cfg.grad_accum_steps):
+    # Forward and Backward pass
+    loss = forward_backward(inputs, targets, rows, cu_seqlens,
+                            loss_scale=1.0 / inputs.size(0))
 
-        # Forward and Backward pass
-        loss = forward_backward(inputs, targets, cu_seqlens,
-                                micro_step=micro_i,
-                                loss_scale=1.0 / (cfg.grad_accum_steps * inputs.size(0)))
+    # Next training batch
+    inputs, targets, rows, cu_seqlens = next(train_loader)
 
-        # Next training batch
-        inputs, targets, cu_seqlens = next(train_loader)
-
-    # Smooth gradients, update weights, zero the grads
+    # Smooth gradients, update weights
 
     # Muon 
-    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate):
+    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, m.W_in, m.W_out, m.ve_gate, m.pair_gate, m.pair_decoder):
         muon_step_fused(p, p.grad, t_step)
-        p.grad.zero_()
 
     # AdamW
-    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.bigram_embeds, m.resid_lambdas, m.x0_lambdas, \
-              m.bigram_lambdas, m.smear_gate, m.smear_lambda, m.backout_lambda):
+    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
+              m.x0_gates, m.bigram_lambdas, m.smear_gate, m.smear_lambda, m.backout_lambda):
         # Run AdamW
         adamw_step_fused(p, p.grad, t_step)
-        p.grad.zero_()
 
     t_step.add_(1)  # advance the schedule on-device
 
@@ -1483,8 +1700,8 @@ for step in range(cfg.num_steps + 1):
         warmup.append(dt)
         eta_str = ""
 
-    tok_per_sec = int(cfg.total_batch_size / dt)
-    mfu = 100 * cfg.num_flops_per_token * cfg.total_batch_size / dt / gpu_peak_flops
+    tok_per_sec = int(cfg.train_batch_tokens / dt)
+    mfu = 100 * cfg.num_flops_per_token * cfg.train_batch_tokens / dt / gpu_peak_flops
 
     print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lr_mult_t: {lr_mult_t[step]:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
 
@@ -1512,7 +1729,7 @@ for step in range(cfg.num_steps + 1):
 
 
 # ------------------------------------------------------------------------------
-# Results
+# §§ Results
 # ------------------------------------------------------------------------------
 
 if profiler is not None:
@@ -1531,19 +1748,19 @@ avg_step_time = float(np.mean(timed)) if timed else 0.0
 compile_time = max(0.0, np.sum(warmup) - len(warmup) * avg_step_time)
 
 result = RunResult(
-    run_name         = cfg.run_name,
-    num_steps        = cfg.num_steps,
-    total_batch_size = cfg.total_batch_size,
+    run_name           = cfg.run_name,
+    num_steps          = cfg.num_steps,
+    train_batch_tokens = cfg.train_batch_tokens,
 
-    train_time       = float(np.sum(timed)) / 60,
-    val_time         = total_val_time / 60,
-    compile_time     = compile_time / 60,
-    wall_time        = (time.perf_counter() - run_wall_t0) / 60,
+    train_time         = float(np.sum(timed)) / 60,
+    val_time           = total_val_time / 60,
+    compile_time       = compile_time / 60,
+    wall_time          = (time.perf_counter() - run_wall_t0) / 60,
 
-    avg_step_time    = avg_step_time,
-    avg_mfu          = (100 * cfg.num_flops_per_token * cfg.total_batch_size
-                        / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
-    peak_mem_gb      = torch.cuda.max_memory_reserved() / 2**30,
+    avg_step_time      = avg_step_time,
+    avg_mfu            = (100 * cfg.num_flops_per_token * cfg.train_batch_tokens
+                          / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
+    peak_mem_gb        = torch.cuda.max_memory_reserved() / 2**30,
 )
 if val_bpb is not None:
     result.val_bpb, result.min_val_bpb = val_bpb, min_val_bpb
@@ -1561,7 +1778,7 @@ if result.val_bpb is not None:
     print0(f"  val_bpb {result.val_bpb:.6f} | min {result.min_val_bpb:.6f} | slack {result.slack:+,} vs {VAL_BPB_TARGET:.3f}", console=True)
 print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
-    print0(f"  {cfg.total_batch_size:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.total_batch_size / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
+    print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
 print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
 
 for _f in (logfile, metrics_path, result_path):
