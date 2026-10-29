@@ -17,7 +17,7 @@ In the original baseline:
 
 For the leaderboard, instead of the traditional PR ladder, weekly baselines (on Mondays) fold in whatever changes I liked and managed to validate, and credit everyone involved in that. 
 
-(Generally, though, you'll be on your own to promote your successes. What makes it into the baseline is going to be  subjective and limited by my capacity, so I apologize in advance to those who don't get the recognition they deserve.)
+(Generally, though, you'll be on your own to promote your successes. What makes it into the baseline is going to be subjective and limited by my capacity, so I apologize in advance to those who don't get the recognition they deserve.)
 
 Final baseline will be on Monday, September 28th.
 
@@ -58,14 +58,14 @@ python train_stack.py
 
 ### Baselines
 
-| Name | Time | Δ from Baseline 1 | Slack (μbpb) |
-| --- | --- | --- | --- |
-| 2026-09-04 - Baseline 1 | 26m 51s | - | 271 |
-| 2026-09-07 - Baseline 2 | 25m 56s | -0m 55s | 837 |
-| 2026-09-14 - Baseline 3 | 24m 21s | -2m 30s | 837 |
-| 2026-09-21 - Baseline 4 | 15m 47s | -m 04s | 920 |
+| Name | Time | Δ from Baseline 1 | Slack (μbpb) | Write-up |
+| --- | --- | --- | --- | --- |
+| 2026-09-04 - Baseline 1 | 26m 51s | - | 271 | [#1](https://github.com/chrisjmccormick/stacks/pull/1) |
+| 2026-09-07 - Baseline 2 | 25m 56s | -0m 55s | 837 | [#3](https://github.com/chrisjmccormick/stacks/pull/3) |
+| 2026-09-14 - Baseline 3 | 24m 21s | -2m 30s | 837 | [#4](https://github.com/chrisjmccormick/stacks/pull/4) |
+| 2026-09-21 - Baseline 4 | 15m 47s | -11m 04s | 920 | [#5](https://github.com/chrisjmccormick/stacks/pull/5) |
 
-The baseline runs can all be viewed on wandb, [here](https://wandb.ai/chrismccormick/decoderstack_rtx).
+Each baseline's PR has the write-up of what it changed. The baseline runs can all be viewed on wandb, [here](https://wandb.ai/chrismccormick/decoderstack_rtx).
 
 ### Acknowledgements
 
@@ -82,5 +82,5 @@ TODO - I'd like to try and carry forward crediting the individual algorithm and 
 
 - Initialization of the vocabulary with the bigram distribution measured from the training data.
 - Selectively re-computing certain parts of the forward activation conserved enough memory to allow for a micro-batch size of 256K tokens.
-- Enormous tables
-- Pair codes technique
+- Two huge bigram hash tables (2M rows added to x0, 1M rows added to the values), from rekursive.ai's autoresearch run. They have no `.grad` buffers: their optimizer (sparse, no first moment, one second moment per row) is inlined in their backward math. See [#5](https://github.com/chrisjmccormick/stacks/pull/5).
+- A frozen 2M-row trigram ("pair code") stats table tallied from the dataset, projected and added to the values. See [#5](https://github.com/chrisjmccormick/stacks/pull/5).
