@@ -307,7 +307,7 @@ class LayerStash(NamedTuple):
     x_attn_out_hat:     Tensor    # (L,  T,     D)             4.5GB
     x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (3MB)
     mlp_a:              Tensor    # (L,  T, d_mlp[i])           18GB
-    #mlp_relu:          Tensor    # (L,  T, d_mlp)                               18GB
+    #mlp_relu:          Tensor    # (L,  T, d_mlp[i])                            18GB
     #                                                         ------           ------
     #                                                 TOTAL:  49.5GB          20.25GB
 
@@ -463,7 +463,7 @@ def forward_backward(idx, targets, rows, cu_seqlens, loss_scale=1.0, backward=Tr
         x_attn_out_inv_rms = (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         x_attn_out_hat = bf16(x_attn_out.float() * x_attn_out_inv_rms)
 
-        # MLP -- this layer's width has its own bank; k is the layer's slot in it
+        # MLP
         W_in, W_out, k = mlp_banks[i]
         mlp_a = F.relu(x_attn_out_hat @ W_in.w[k].mT).square()   # (T, d_mlp[i]) stashed
         mlp_out = mlp_a @ W_out.w[k].mT
@@ -805,9 +805,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-# Not autotuned: autotuning a square 768x768 bank's bmm at a batch size the shipped
-# cache lacks raises inductor's "launcher() got multiple values for argument 'stream'"
-# (torch 2.10 / triton 3.6). Costs ~0.3% of the step.
 @torch.compile(dynamic=False, fullgraph=True, options={"max_autotune_gemm": False})
 def muon_step_fused(
     p: Param,       # the (K, out, in) weight-bank bundle: live tensor, state, schedule tables
@@ -867,7 +864,7 @@ def muon_step_fused(
 # ------------------------------------------------------------------------------
 
 # Learning rate schedule as a per-step multiplier.
-# Shared by Muon, AdamW and RMSProp. No warmup: peak from step 0.
+# Shared by AdamW and RMSProp. No warmup: peak from step 0.
 lr_mult_t = np.ones(cfg.num_steps)
 
 steps_0idx = np.arange(cfg.num_steps, dtype=np.float64)  # 0-based, the way the loop counts
@@ -880,7 +877,7 @@ warmdown_frac = (cfg.num_steps - steps_0idx[warmdown]) / warmdown_len  # ~1 -> ~
 
 lr_mult_t[warmdown] = 0.05 + (1.0 - 0.05) * warmdown_frac
 
-# Muon warms down on its own schedule: the last 95% of the run, to 0.025.
+# Muon lr warmdown for 95% of the run.
 muon_warmdown_len = round(0.95 * cfg.num_steps)
 muon_warmdown     = slice(cfg.num_steps - muon_warmdown_len + 1, cfg.num_steps)
 muon_lr_mult_t    = np.ones(cfg.num_steps)
@@ -1217,9 +1214,9 @@ pair_gate = fp32_empty(cfg.num_ves, cfg.n_kv_heads, cfg.d_ve_gate).uniform_(
     0.0, 0.02, generator=torch.Generator(device=device).manual_seed(cfg.seed + 2))
 pair_decoder = fp32_zeros(1, cfg.n_kv_heads * cfg.d_vo, cfg.d_model)  # starts at zero
 
-# One bank per distinct MLP width, holding that width's layers in order.
+# One MLP bank per width.
 mlp_widths = sorted(set(cfg.d_mlp))
-W_in  = {d: fp32_empty(cfg.d_mlp.count(d), d, cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4) for d in mlp_widths}
+W_in  = {d: fp32_empty(cfg.d_mlp.count(d), d,           cfg.d_model).uniform_(-matrix_init_s * 0.4, matrix_init_s * 0.4) for d in mlp_widths}
 W_out = {d: fp32_zeros(cfg.d_mlp.count(d), cfg.d_model, d) for d in mlp_widths}   # projections start at zero
 
 # Muon momentum warmup 0.85 -> 0.97 over 400 steps
