@@ -2,11 +2,11 @@
 
 To encourage more exploration/hacking of the backward pass, I'm running a single-GPU pre-training speedrun for the month of September. 
 
-The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU), current baseline is 16 minutes.
+The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU), current baseline is 15 minutes.
 
 The baseline 12 layer model (same scale as [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and pipeline come from [nanochat](https://github.com/karpathy/nanochat).
 
-Final validation score is reported in terms of the amount of slack versus the target. The original baseline slack was (0.900000 - 0.899590) x 1e6 = **410** points (or 410 µbpb, if you prefer). 
+Final validation score is reported in terms of the amount of slack versus the target. Baseline 1's slack was (0.900000 - 0.899729) x 1e6 = **271** points (or 271 µbpb, if you prefer). 
 
 You can roughly estimate a conversion rate between slack and steps, and therefore time.
 In the original baseline:
@@ -64,6 +64,7 @@ python train_stack.py
 | 2026-09-07 - Baseline 2 | 25m 56s | -0m 55s | 837 | [#3](https://github.com/chrisjmccormick/stacks/pull/3) |
 | 2026-09-14 - Baseline 3 | 24m 21s | -2m 30s | 837 | [#4](https://github.com/chrisjmccormick/stacks/pull/4) |
 | 2026-09-21 - Baseline 4 | 15m 47s | -11m 04s | 920 | [#5](https://github.com/chrisjmccormick/stacks/pull/5) |
+| 2026-09-28 - Baseline 5 | 14m 52s | -11m 59s | 1,531 | [#6](https://github.com/chrisjmccormick/stacks/pull/6) |
 
 Each baseline's PR has the write-up of what it changed. The baseline runs can all be viewed on wandb, [here](https://wandb.ai/chrismccormick/decoderstack_rtx).
 
@@ -76,7 +77,7 @@ Each baseline's PR has the write-up of what it changed. The baseline runs can al
 
 TODO - I'd like to try and carry forward crediting the individual algorithm and architecture improvements leveraged here that were first introduced by modded-nanogpt contributors, and any research paper behind them.
 
-- The September 21st baseline includes several innovations from the priml autoresearch run.
+- The September 21st and 28th baselines include several innovations from the priml autoresearch run.
 
 ### Interesting Techniques
 
