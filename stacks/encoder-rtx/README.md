@@ -7,9 +7,11 @@ predictions distilled from an open decision model, beginning from
 [`decoder-rtx`](../decoder-rtx/)'s code.
 
 **Status:** Phase 0 (October 2026). `train_encoder.py` is forked from decoder-rtx's
-`sep-28-baseline`, and its new attention merge, readout and packer are checked on CPU.
-It hasn't run on a GPU yet. The proposal and the discussion behind it are in
-`agent-ops-stacks/encoder-rtx/` (private).
+`sep-28-baseline`; its attention merge is verified against the real FA2 kernel, and the
+first runs on an RTX Pro 6000 (17.6 min for 409M tokens, 53.5 GB peak) reach val MLM 2.04
+nats, decision-dev accuracy 0.56 against 0.33 for chance, and chance on transfer-dev.
+Training is now split into an MLM stage and a decision stage (below). The proposal and
+the discussion behind it are in `agent-ops-stacks/encoder-rtx/` (private).
 
 ## How to run
 
@@ -20,9 +22,22 @@ python data/prepare_kev_suites.py    # once: Kev's suites -> ~/.cache/encoder-rt
 python train_encoder.py              # downloads the ClimbMix shards on first run
 ```
 
+Training runs in two stages. Stage 1 is MLM alone and writes a checkpoint to
+`~/.cache/encoder-rtx/runs/<run>/`; stage 2 starts from it with fresh optimizer state, its
+own step count and schedules, and trains the decision readout on Kev's records (with some
+MLM filler kept, so the language doesn't drift):
+
+```bash
+DECISION_FRAC=0 NUM_STEPS=8316 SAVE_CHECKPOINT=1 RUN_NAME=stage1-mlm python train_encoder.py
+INIT_FROM=~/.cache/encoder-rtx/runs/stage1-mlm/model_step008316.pt \
+  DECISION_FRAC=0.5 LR_SCALE=0.3 NUM_STEPS=400 VAL_EVERY=50 RUN_NAME=stage2-frac50 python train_encoder.py
+```
+
 For the first runs, these environment variables override the config (the values are
-logged): `DECISION_FRAC` (0.10), `DECISION_WEIGHT` (1.0), `MASK_RATE` (0.30),
-`NUM_STEPS` (2079) and `RUN_NAME`.
+logged): `DECISION_FRAC` (0.10; 0 for MLM only, at most 0.9 so the MLM validation keeps
+enough filler), `DECISION_WEIGHT` (1.0), `MASK_RATE` (0.30), `NUM_STEPS` (2079),
+`VAL_EVERY` (333), `LR_SCALE` (1.0), `SAVE_CHECKPOINT` (0), `INIT_FROM` and `RUN_NAME`.
+At a 0.5 share one epoch of Kev's 30.5k records is about 130 steps; at 0.9, about 75.
 
 ## The model
 

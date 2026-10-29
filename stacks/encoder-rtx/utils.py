@@ -195,8 +195,9 @@ def plan_packs(records, docs, tokens_per_pack, decision_frac, seq_len, num_packs
     filler documents. Training (num_packs set) cycles shuffled epochs of the
     records and permutes every choice's options; evaluation (num_packs None)
     takes each record once, in order, as stored. A pack takes records until the
-    next would pass its decision budget, then filler: each document's first
-    seq_len tokens, the last one cut to fill the pack exactly."""
+    next would pass its decision budget (none at all when the budget is 0: MLM-only
+    packs), then filler: each document's first seq_len tokens, the last one cut to
+    fill the pack exactly."""
     budget = decision_frac * tokens_per_pack
     order, k = [], 0
     plans = []
@@ -209,15 +210,15 @@ def plan_packs(records, docs, tokens_per_pack, decision_frac, seq_len, num_packs
                 order, k = (list(rng.permutation(len(records))) if num_packs else list(range(len(records)))), 0
             r = records[order[k]]
             n = record_tokens(r)
-            if chosen and used + n > budget:
+            if (chosen or budget <= 0) and used + n > budget:
                 break
             perms = [rng.permutation(len(q["options"])) if (num_packs and q["kind"] == "choice")
                      else np.arange(len(q["options"])) for q in r["questions"]]
             chosen.append((r, perms))
             used += n
             k += 1
-        if not chosen:
-            break
+        if not chosen and num_packs is None:
+            break                          # evaluation: nothing left to place
         filler, pos = [], used
         while pos < tokens_per_pack:
             doc = next(docs)
@@ -247,15 +248,17 @@ def pack_caps(plans):
             caps["seg_len"] = max(caps["seg_len"], r["state"].size, *q_lens)
             caps["qblock_len"] = max(caps["qblock_len"], sum(q_lens))
             caps["state_len"] = max(caps["state_len"], r["state"].size)
-        caps["seg_len"] = max(caps["seg_len"], *(d.size for d in filler))
+        caps["seg_len"] = max([caps["seg_len"], *(d.size for d in filler)])
         caps["min_filler"] = min(caps["min_filler"], sum(d.size for d in filler))
     return caps
 
 
-def materialize_packs(plans, tokens_per_pack, cfg, table_rows, mask_id, rng, pin=True):
+def materialize_packs(plans, tokens_per_pack, cfg, table_rows, mask_id, rng, mlm_per_pack, pin=True):
     """Lay out every planned pack into pinned host tensors (see Pack), and return
     them with each pack's questions' (record, question) for scoring. cfg carries
-    the static sizes: cu_width, rec_width, ro_cap, q_cap, mlm_per_pack, bpe_vocab."""
+    the static sizes: cu_width, rec_width, ro_cap, q_cap, bpe_vocab; mlm_per_pack is
+    the masked positions per pack (the evaluation packs have their own count, fixed
+    across runs, so their validation is comparable whatever the training share)."""
     T, n = tokens_per_pack, len(plans)
     alloc = lambda *shape, dtype: torch.empty(*shape, dtype=dtype, pin_memory=pin)
     out = dict(idx=alloc(n, T, dtype=torch.int32), pos=alloc(n, T, dtype=torch.int32),
@@ -263,7 +266,7 @@ def materialize_packs(plans, tokens_per_pack, cfg, table_rows, mask_id, rng, pin
                is_q=alloc(n, T, dtype=torch.bool),
                cu_self=alloc(n, cfg.cu_width, dtype=torch.int32),
                cu_q=alloc(n, cfg.rec_width, dtype=torch.int32), cu_k=alloc(n, cfg.rec_width, dtype=torch.int32),
-               mlm_pos=alloc(n, cfg.mlm_per_pack, dtype=torch.int64), mlm_tgt=alloc(n, cfg.mlm_per_pack, dtype=torch.int64),
+               mlm_pos=alloc(n, mlm_per_pack, dtype=torch.int64), mlm_tgt=alloc(n, mlm_per_pack, dtype=torch.int64),
                ro_pos=alloc(n, cfg.ro_cap, dtype=torch.int64), ro_qid=alloc(n, cfg.ro_cap, dtype=torch.int64),
                ro_tgt=alloc(n, cfg.ro_cap, dtype=torch.float32), n_q=alloc(n, 1, dtype=torch.float32))
     np_ = {k: v.numpy() for k, v in out.items()}
@@ -328,7 +331,7 @@ def materialize_packs(plans, tokens_per_pack, cfg, table_rows, mask_id, rng, pin
         np_["n_q"][i][0] = len(questions)
 
         # MLM on the filler: BERT's 80/10/10 -- [MASK], a random token, or unchanged.
-        mlm = q_end + g.choice(T - q_end, cfg.mlm_per_pack, replace=False)
+        mlm = q_end + g.choice(T - q_end, mlm_per_pack, replace=False)
         mlm.sort()
         np_["mlm_pos"][i][:] = mlm
         np_["mlm_tgt"][i][:] = idx[mlm]

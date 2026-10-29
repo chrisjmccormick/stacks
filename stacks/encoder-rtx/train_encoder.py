@@ -12,8 +12,13 @@
 # - The head trains MLM on the filler, and a single readout vector scores each
 #   option's readout token, with a softmax over each question's options.
 # - The vocabulary is decoder-rtx's 32,768 BPE plus the decision special tokens.
-# - The CLM-derived inits (token frequency priors, pair code) are kept as they
-#   were; whether they suit MLM is an open question.
+# - The CLM-derived inits (token frequency priors, pair code) are kept, with
+#   [MASK]'s row solved so the direct path emits the unigram at masked positions
+#   (agent-ops-stacks/encoder-rtx/2026-10-28_0902pm_phase0-first-runs: 0.022 nats
+#   better at the end of a run than a random row).
+# - Two stages. Stage 1 is MLM alone (DECISION_FRAC=0) and writes a checkpoint;
+#   stage 2 starts from it (INIT_FROM) with fresh optimizer state, its own step
+#   count and schedules, a decision share up to 0.9 and LR_SCALE on every rate.
 #
 # Downloads the required number of pre-tokenized Climbmix dataset shards if not
 # already present. The decision records come from data/prepare_kev_suites.py.
@@ -171,10 +176,14 @@ class StackConfig:
     rec_width:       int            # cu_q / cu_k entries
     ro_cap:          int            # readout positions per pack
     q_cap:           int            # questions per pack
-    mlm_per_pack:    int            # masked filler positions per pack
+    mlm_per_pack:    int            # masked filler positions per training pack (the evaluation packs' count is fixed: eval_mlm_per_pack)
     max_seg_len:     int            # FA2 max_seqlen bounds: any segment,
     max_qblock_len:  int            # one record's questions,
     max_state_len:   int            # one state
+
+    # Two stages (§§ Init From a Checkpoint)
+    init_from:       str = ""       # stage 2: a model_step*.pt written by stage 1
+    lr_scale:        float = 1.0    # stage 2: every peak rate times this
 
     # Evaluation and logging
     val_loss_every:  int = 333
@@ -219,8 +228,15 @@ cfg.decision_weight = float(os.environ.get("DECISION_WEIGHT", cfg.decision_weigh
 cfg.mask_rate       = float(os.environ.get("MASK_RATE", cfg.mask_rate))
 cfg.num_steps       = int(os.environ.get("NUM_STEPS", cfg.num_steps))
 cfg.run_name        = os.environ.get("RUN_NAME", cfg.run_name)
+cfg.init_from       = os.environ.get("INIT_FROM", cfg.init_from)
+cfg.lr_scale        = float(os.environ.get("LR_SCALE", cfg.lr_scale))
+cfg.val_loss_every  = int(os.environ.get("VAL_EVERY", cfg.val_loss_every))
+cfg.save_checkpoint = bool(int(os.environ.get("SAVE_CHECKPOINT", int(cfg.save_checkpoint))))
+assert 0.0 <= cfg.decision_frac <= 0.9, "decision_frac above 0.9 leaves too little filler for the MLM validation"
 print(f"knobs: decision_frac {cfg.decision_frac} | decision_weight {cfg.decision_weight} | "
-      f"mask_rate {cfg.mask_rate} | num_steps {cfg.num_steps} | run_name {cfg.run_name}")
+      f"mask_rate {cfg.mask_rate} | num_steps {cfg.num_steps} | run_name {cfg.run_name} | "
+      f"init_from {cfg.init_from or '-'} | lr_scale {cfg.lr_scale} | val_every {cfg.val_loss_every} | "
+      f"save_checkpoint {cfg.save_checkpoint}")
 
 # Per-layer window sizes for sliding window attention in the self call, defined
 # as (left, right) tuples: tokens attended to on each side, -1 for the whole
@@ -589,7 +605,7 @@ def forward_backward(pk: Pack, backward=True):
         return mlm_nats, ro_p
     # Return training losses for logging: nats per masked token, nats per question.
     loss = torch.stack([mlm_nats.mean(),
-                        -(pk.ro_tgt * ro_p.clamp_min(1e-30).log()).sum() / pk.n_q[0]])
+                        -(pk.ro_tgt * ro_p.clamp_min(1e-30).log()).sum() / pk.n_q[0].clamp_min(1.0)])
 
     # ==== Backward ====
     onehot = torch.arange(cfg.d_vocab, device=device).unsqueeze(0) == tgt # (M, d_vocab)
@@ -607,7 +623,7 @@ def forward_backward(pk: Pack, backward=True):
     # The decision readout, flipped the same way: target - p, scaled to the mean
     # over the pack's questions.
     ro_valid = (pk.ro_qid < cfg.q_cap).float()
-    ro_logitb = (pk.ro_tgt - ro_p) * ro_valid * (cfg.decision_weight / pk.n_q[0])   # (Rc,)
+    ro_logitb = (pk.ro_tgt - ro_p) * ro_valid * (cfg.decision_weight / pk.n_q[0].clamp_min(1.0))   # (Rc,); no questions in an MLM-only pack
     m.readout.grad.copy_((ro_logitb.unsqueeze(1) * x_ro_hat.float()).sum(dim=0, keepdim=True))
 
     # The backward streams start as weighted sums of the head embeddings that
@@ -974,6 +990,11 @@ muon_warmdown_len = round(0.95 * cfg.num_steps)
 muon_warmdown     = slice(cfg.num_steps - muon_warmdown_len + 1, cfg.num_steps)
 muon_lr_mult_t    = np.ones(cfg.num_steps)
 muon_lr_mult_t[muon_warmdown] = 0.025 + (1.0 - 0.025) * (cfg.num_steps - steps_0idx[muon_warmdown]) / muon_warmdown_len
+
+# Stage 2 trains from a checkpoint at a fraction of the pretraining rates (weight decay
+# follows, being lr-coupled); 1.0 in stage 1.
+lr_mult_t *= cfg.lr_scale
+muon_lr_mult_t *= cfg.lr_scale
 
 
 # ------------------------------------------------------------------------------
@@ -1475,7 +1496,7 @@ embed_prior *= 0.8 * cfg.d_model ** 0.5 / embed_prior.norm(dim=1, keepdim=True)
 xe_prior   = embed_prior / 0.8                                                                     # normed rows
 head_prior = torch.linalg.solve((xe_prior.T @ (context_weight ** 2 * xe_prior)).double(),
                                 ((context_weight ** 2 * xe_prior).T @ raw_target).double()).float().T   # (V, D)
-del raw_target, xe_prior, context_weight, next_unigram
+del raw_target, xe_prior, context_weight
 
 # Halve the head's log-frequency component.
 occurrences_per_step = context_counts / context_counts.sum() * cfg.train_batch_tokens             # (V, 1)
@@ -1487,6 +1508,20 @@ freq_direction = ((freq_weight * log_freq * (head_prior - head_mean)).sum(0)
                   / (freq_weight * log_freq.square()).sum())                                      # (D,)
 head_prior -= 0.5 * log_freq * freq_direction
 del context_counts, occurrences_per_step, freq_weight, log_freq, head_mean, freq_direction
+
+# [MASK] reads the unigram through the solved head: the normed row x (norm sqrt(D), what the
+# RMS norm hands the head) with head_prior @ x closest to the centred log unigram, pre-softcap,
+# each vocab row weighted by its probability (the cross-entropy's own weighting). A random row
+# here starts MLM above uniform (the head reads bigram-scale logits off a random direction).
+mask_target = next_unigram.log()
+mask_target = 15.0 * torch.atanh((mask_target - mask_target.mean()).clamp(-14.25, 14.25) / 15.0)   # (V_bpe,)
+mask_w = next_unigram.sqrt().unsqueeze(1)                                                         # (V_bpe, 1)
+mask_row = torch.linalg.lstsq((mask_w * head_prior).double(), (mask_w * mask_target.unsqueeze(1)).double()).solution.float()[:, 0]
+mask_row *= cfg.d_model ** 0.5 / mask_row.norm()
+mask_logits = 15.0 * torch.tanh(head_prior @ mask_row / 15.0)
+mask_ce = -(next_unigram * mask_logits.log_softmax(0)).sum()
+print(f"[MASK] row: direct-path CE against the unigram {mask_ce:.4f} nats "
+      f"(unigram entropy {-(next_unigram * next_unigram.log()).sum():.4f}; uniform {math.log(cfg.d_vocab):.4f})")
 
 # Add the priors to the initialized weights' BPE rows.
 m.input_embeds.w[:cfg.bpe_vocab].add_(embed_prior)
@@ -1500,7 +1535,8 @@ del embed_prior, head_prior, head_master
 # init; MLM never targets them.)
 special_embeds = fp32_empty(cfg.d_vocab - cfg.bpe_vocab, cfg.d_model).normal_()
 m.input_embeds.w[cfg.bpe_vocab:].copy_(special_embeds * (0.8 * cfg.d_model ** 0.5 / special_embeds.norm(dim=1, keepdim=True)))
-del special_embeds
+m.input_embeds.w[MASK_ID].copy_(0.8 * mask_row)   # the solved direction, at the prior rows' norm
+del special_embeds, mask_target, mask_w, mask_row, mask_logits, mask_ce, next_unigram
 
 torch.cuda.synchronize()
 priors_time = time.perf_counter() - priors_t0
@@ -1565,6 +1601,28 @@ del channel_range, inv_freq, t_pos, freqs
 cfg.num_params = sum(p.w.numel() for p in m)
 
 
+# ------------------------------------------------------------------------------
+# §§ Init From a Checkpoint
+# ------------------------------------------------------------------------------
+# Stage 2 starts from stage 1's weights (write_checkpoint, §§ Logging): every trained
+# weight and the frozen pair code are overwritten; the optimizer state stays fresh and the
+# schedules are this run's. The hashed tables were saved with their pending weight decay
+# folded in, so their scales start at 1 here as at init.
+
+if cfg.init_from:
+    saved = torch.load(os.path.expanduser(cfg.init_from), map_location=device)
+    for p in m:
+        w = saved["weights"][p.name]
+        assert w.shape == p.w.shape, (p.name, tuple(w.shape), tuple(p.w.shape))
+        if p.mantissa is not None:
+            writeback_master(w.contiguous(), p.w, p.mantissa)   # the fp32 master -> bf16 live + low bits
+        else:
+            p.w.copy_(w)
+    m.pair_code.copy_(saved["weights"]["pair_code"])
+    print(f"init from {cfg.init_from}: run {saved['run_name']} at step {saved['step']}")
+    del saved, w
+
+
 # ==============================================================================
 # § Data
 # ==============================================================================
@@ -1603,8 +1661,10 @@ rng = np.random.default_rng(cfg.seed)
 # filler from the val shard. Training: shuffled epochs of Kev's training records,
 # a choice question's options permuted each time.
 val_docs = doc_stream("val", BOS_ID)
+# The evaluation packs take a fixed 10% decision share whatever the training share, so a
+# checkpoint scores the same in the run that wrote it and in the one that starts from it.
 eval_plans = {split: plan_packs(load_records(split), val_docs, cfg.train_batch_tokens,
-                                cfg.decision_frac, cfg.seq_len, None, rng)
+                                0.10, cfg.seq_len, None, rng)
               for split in ("decision_dev", "transfer_dev")}
 train_records = load_records("train")
 train_plans = plan_packs(train_records, doc_stream("train", BOS_ID), cfg.train_batch_tokens,
@@ -1612,6 +1672,11 @@ train_plans = plan_packs(train_records, doc_stream("train", BOS_ID), cfg.train_b
 
 caps = pack_caps(train_plans + eval_plans["decision_dev"] + eval_plans["transfer_dev"])
 round_up = lambda x, k: k * math.ceil(x / k)
+# Masked positions per pack, from the pack with the least filler -- of the training packs
+# for training, and of the evaluation packs for evaluation, so the validation masks are the
+# same in every run whatever its training share (53,056 at the 0.30 rate).
+cfg.mlm_per_pack   = 64 * int(cfg.mask_rate * pack_caps(train_plans)["min_filler"] / 64)
+eval_mlm_per_pack  = 64 * int(cfg.mask_rate * pack_caps(eval_plans["decision_dev"] + eval_plans["transfer_dev"])["min_filler"] / 64)
 cfg.cu_width       = round_up(caps["segments"] + 2, 64)
 cfg.rec_width      = round_up(caps["records"] + 1, 64)
 cfg.ro_cap         = round_up(caps["readouts"], 64)
@@ -1619,13 +1684,12 @@ cfg.q_cap          = round_up(caps["questions"], 64)
 cfg.max_seg_len    = round_up(caps["seg_len"], 128)
 cfg.max_qblock_len = round_up(caps["qblock_len"], 128)
 cfg.max_state_len  = round_up(caps["state_len"], 128)
-cfg.mlm_per_pack   = 64 * int(cfg.mask_rate * caps["min_filler"] / 64)
 
 # The evaluation masks are the same every run.
 eval_packs = {split: materialize_packs(plans, cfg.train_batch_tokens, cfg, table_rows, MASK_ID,
-                                       np.random.default_rng(cfg.seed + 3))
+                                       np.random.default_rng(cfg.seed + 3), eval_mlm_per_pack)
               for split, plans in eval_plans.items()}
-train_packs, _ = materialize_packs(train_plans, cfg.train_batch_tokens, cfg, table_rows, MASK_ID, rng)
+train_packs, _ = materialize_packs(train_plans, cfg.train_batch_tokens, cfg, table_rows, MASK_ID, rng, cfg.mlm_per_pack)
 
 placed = sum(len(chosen) for chosen, _ in train_plans)
 dec_tokens = cfg.train_batch_tokens * len(train_plans) - sum(d.size for _, filler in train_plans for d in filler)
@@ -1634,7 +1698,7 @@ data_report = (
     f"{len(train_records):,}; decision tokens {dec_tokens / 1e6:.1f}M = "
     f"{100 * dec_tokens / (cfg.train_batch_tokens * len(train_plans)):.1f}%), "
     f"eval {', '.join(f'{s} {len(p)}' for s, p in eval_plans.items())}\n"
-    f"  per pack: {cfg.mlm_per_pack:,} masked | caps: segments {cfg.cu_width}, records {cfg.rec_width}, "
+    f"  per pack: {cfg.mlm_per_pack:,} masked ({eval_mlm_per_pack:,} in evaluation) | caps: segments {cfg.cu_width}, records {cfg.rec_width}, "
     f"readouts {cfg.ro_cap}, questions {cfg.q_cap} | max_seqlen: segment {cfg.max_seg_len}, "
     f"question block {cfg.max_qblock_len}, state {cfg.max_state_len}")
 del eval_plans, train_plans, train_records, val_docs
@@ -1734,20 +1798,37 @@ FINAL_IDENTITY = ("run_name", "num_steps", "train_batch_tokens")
 # §§ Logging
 # ------------------------------------------------------------------------------
 
+# Checkpoints go to the cache; a run worth keeping is pushed to the hub on purpose.
+runs_dir = os.path.expanduser("~/.cache/encoder-rtx/runs")
+
 def write_checkpoint(step):
+    """The model as a successor run starts from it (§§ Init From a Checkpoint): every
+    trained weight -- the fp32 master where one exists, the hashed tables with their pending
+    weight decay folded in -- plus the frozen pair code and this script, in model_step*.pt;
+    the optimizer moments in optim_step*.pt."""
+    fold = lambda w, scale: torch.cat([(rows.float() * scale).bfloat16() for rows in w.split(1 << 18)]).cpu()
+    weights = {}
+    for p in m:
+        if p.mantissa is not None:
+            weights[p.name] = rebuild_master(p.w, p.mantissa).cpu()
+        elif p.name == "bigram_embeds":
+            weights[p.name] = fold(p.w, bigram_w_scale)
+        elif p.name == "pair_values":
+            weights[p.name] = fold(p.w, pair_w_scale)
+        else:
+            weights[p.name] = p.w.cpu()
+    weights["pair_code"] = m.pair_code.cpu()
     state = {}
     for p in m:
-        for attr in ("mantissa", "first_mntm", "scnd_mntm"):
+        for attr in ("first_mntm", "scnd_mntm"):
             buf = getattr(p, attr)
             if buf is not None:
                 state[f"{p.name}.{attr}"] = buf.cpu()
-
-    os.makedirs(f"logs/{cfg.run_name}", exist_ok=True)
-    torch.save(dict(step=step, code=code,
-                    weights={p.name: p.w.cpu() for p in m}),
-               f"logs/{cfg.run_name}/model_step{step:06d}.pt")
-    torch.save(dict(step=step, t_step=int(t_step.item()), state=state),
-               f"logs/{cfg.run_name}/optim_step{step:06d}.pt")
+    run_dir = os.path.join(runs_dir, cfg.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    torch.save(dict(step=step, run_name=cfg.run_name, code=code, weights=weights), f"{run_dir}/model_step{step:06d}.pt")
+    torch.save(dict(step=step, t_step=int(t_step.item()), state=state), f"{run_dir}/optim_step{step:06d}.pt")
+    return run_dir
 
 logfile = None
 os.makedirs("logs", exist_ok=True)
@@ -1874,7 +1955,7 @@ def validate():
                 source[0] += hit
                 source[1] += 1
         result[split] = (right / total, brier / total, total, by_source)
-    return mlm_nats / mlm_n, result
+    return mlm_nats / max(mlm_n, 1), result
 
 
 train_loader = pack_loader(train_packs)
@@ -1910,8 +1991,8 @@ for step in range(cfg.num_steps + 1):
     # --------------- Checkpoint -----------------
     if cfg.save_checkpoint and (last_step or step in cfg.save_steps):
         ckpt_t0 = time.perf_counter()
-        write_checkpoint(step)
-        print0(f"checkpoint captured at step {step} ({time.perf_counter() - ckpt_t0:.1f}s)", console=True)
+        run_dir = write_checkpoint(step)
+        print0(f"checkpoint captured at step {step} -> {run_dir} ({time.perf_counter() - ckpt_t0:.1f}s)", console=True)
 
     # Exit final step after validation and checkpoint
     if last_step:
