@@ -261,8 +261,8 @@ class Model:
     """Container for the model's weights, plus RoPE buffers"""
 
     # Input
-    input_embeds:  Param = None
-    x0_vocab:         Tensor  # input_embeds RMS-normed per row, bf16; rewritten by its update in forward_backward
+    input_embeds:     Param = None
+    x0_vocab:         Tensor  # (d_vocab, D) bf16, input_embeds RMS-normed per row
     x0_vocab_inv_rms: Tensor  # (d_vocab, 1) fp32, its 1/rms, for the norm backward
 
     # Attention
@@ -327,7 +327,6 @@ class LayerStash(NamedTuple):
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          288MB    layer-blend backward
-#   (m.x0_vocab and m.x0_vocab_inv_rms are model state, kept current by input_embeds' update)
 #   x_pool             (T, D)          288MB    pooling backward
 #   x_final_hat        (T, D)          288MB    lm_head grad + final-norm backward
 #   x_final_inv_rms    (T, 1)   fp32   (0.8MB)
@@ -403,14 +402,12 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     #           Forward
     # -----------------------------
 
-    # RMS normalize the embedding table, then look up the input embeds; also added back
-    # to the stream at every layer.
+    # Look up the normed input embeds; also added back to the stream at every layer.
     x0 = F.embedding(idx, m.x0_vocab)                   # appears as x0b in bwd
 
-    # Layer 0 attends from x0 alone, so its q, k, v are per-vocab: project the table's
-    # 16,384 rows rather than the T tokens.
+    # Layer 0's q, k, v, projected once per vocab row.
     W_qkv0 = torch.cat([m.W_Q.w[0], m.W_K.w[0], m.W_V.w[0]])   # (3D, D)
-    qkv0_vocab = m.x0_vocab @ W_qkv0.mT                 # (d_vocab, 3D); stays here: Muon updates W after the backward
+    qkv0_vocab = m.x0_vocab @ W_qkv0.mT                        # (d_vocab, 3D)
 
     # The residual stream starts as the normed embedding.
     x = x0
@@ -426,8 +423,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
         x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
 
-        # Attention input norm. Layer 0 attends from x0 (its q, k, v are qkv0_vocab's
-        # rows; its gate reads x0), and the source_readers from the source stream.
+        # Attention input norm. Layer 0 attends from x0, the source_readers from the source stream.
         if i == 0:
             x_biased_hat, x_biased_inv_rms = x0, None
         elif i in cfg.source_readers:
@@ -438,7 +434,6 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
 
         # QKV Projections. Layer 0 looks its q, k, v up by token.
         if i == 0:
-            # v gathered on its own: FA needs it as a buffer, and q / k gather into the QK-norm kernel.
             q, k = F.embedding(idx, qkv0_vocab[:, :2 * cfg.d_model]).view(T, 2, cfg.n_qo_heads, cfg.d_qk).unbind(1)  # n_qo == n_kv
             v = F.embedding(idx, qkv0_vocab[:, 2 * cfg.d_model:]).view(T, cfg.n_kv_heads, cfg.d_vo)
         else:
@@ -716,8 +711,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         vb = vb.reshape(T, cfg.n_kv_heads * cfg.d_vo)
 
         if i == 0:
-            # Sum each token's q, k, v grads onto its vocab row, then run the
-            # projections' backward over the rows.
+            # Layer 0's projections backward, over the vocab rows.
             qkv0b_vocab = torch.ops.aten.embedding_dense_backward(
                 torch.cat([qb, kb, vb], dim=-1), idx, cfg.d_vocab, -1, False)   # (d_vocab, 3D)
             W_qkv0b = qkv0b_vocab.mT @ m.x0_vocab              # (3D, D) TRAP: this step's table; the update below overwrites it
@@ -771,18 +765,17 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     # it folds into x0b to give the full grad wrt the normed embedding.
     x0b = x0b + xb
 
-    # --- input embeddings: every token's grad onto its vocab row, plus layer 0's projections' ---
+    # --- token embedding scatter, plus layer 0's vocab-row grads ---
     x0b_vocab = torch.ops.aten.embedding_dense_backward(x0b.float(), idx, cfg.d_vocab, -1, False) + x0b_vocab.float()
 
-    # Norm backward, against the table this step's forward read.
+    # Embedding norm backward
     x0_vocab_f = m.x0_vocab.float()
-    grad = m.x0_vocab_inv_rms * (x0b_vocab - x0_vocab_f * (x0_vocab_f * x0b_vocab).mean(dim=-1, keepdim=True))
+    embed_grad = m.x0_vocab_inv_rms * (x0b_vocab - x0_vocab_f * (x0_vocab_f * x0b_vocab).mean(dim=-1, keepdim=True))
 
-    # AdamW, inline (adamw_step_fused's math; fp32 live, no mantissa). Dense: rows outside the
-    # batch have grad 0 but still move on their momentum, so this covers all 16,384 rows.
+    # AdamW, inline (adamw_step_fused's math; fp32 live, no mantissa).
     p = m.input_embeds
-    p.first_mntm.mul_(p.mntm_b1_t[t_step]).add_(grad * p.grad_b1_t[t_step])           # m = beta1*m + (1 - beta1)*g
-    p.scnd_mntm.mul_(p.mntm_b2_t[t_step]).add_(grad.square() * p.grad_b2_t[t_step])   # v = beta2*v + (1 - beta2)*g^2
+    p.first_mntm.mul_(p.mntm_b1_t[t_step]).add_(embed_grad * p.grad_b1_t[t_step])           # m = beta1*m + (1 - beta1)*g
+    p.scnd_mntm.mul_(p.mntm_b2_t[t_step]).add_(embed_grad.square() * p.grad_b2_t[t_step])   # v = beta2*v + (1 - beta2)*g^2
     w = p.w * p.wd_t[t_step] + p.lr_bc_t[t_step] * (p.first_mntm / (p.scnd_mntm.sqrt() + p.eps_t[t_step]))
     p.w.copy_(w)
 
@@ -923,7 +916,7 @@ def muon_step_fused(
 # ------------------------------------------------------------------------------
 
 # Learning rate schedules as per-step multipliers.
-# No warmup: peak from step 0.
+# No warmup: peak from step 0 (the x0 scalars add a 20-step one, §§ Scalars).
 steps_0idx = np.arange(cfg.num_steps, dtype=np.float64)  # 0-based, the way the loop counts
 steps_1idx = steps_0idx + 1.0                            # 1-based, the way bias corrections count
 run_frac   = steps_0idx / cfg.num_steps
@@ -973,12 +966,15 @@ pool_lambda    = fp32_zeros(1)
 # Grad mix-in coefficient (1-beta), currently fixed, can be scheduled here.
 scalar_grad_mult_t = np.ones(cfg.num_steps)
 
+# x0 scalars' lr: a 20-step warmup, then Muon's schedule.
+x0_lr_mult_t = muon_lr_mult_t * np.minimum(1.0, steps_1idx / 20)
+
 
 scalar_configs = [
 #   name,               weights,        lr schedule,     peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,  lr_mult_t,       0.008,    0.2,        0.05,   0.0),
-    ("x0_lambdas",      x0_lambdas,     muon_lr_mult_t * np.minimum(1.0, steps_1idx / 20),  1.2,  0.04,  0.05,  0.002),
-    ("x0_gates",        x0_gates,       muon_lr_mult_t * np.minimum(1.0, steps_1idx / 20),  1.2,  0.04,  0.05,  0.002),
+    ("x0_lambdas",      x0_lambdas,     x0_lr_mult_t,    1.2,      0.04,       0.05,   0.002),
+    ("x0_gates",        x0_gates,       x0_lr_mult_t,    1.2,      0.04,       0.05,   0.002),
     ("pool_lambda",     pool_lambda,    lr_mult_t,       0.06,     0.04,       0.05,   0.0),
 ]
 
@@ -1030,7 +1026,7 @@ for (name, w, sched_t, peak_lr, b1_grad, b2_grad, wd) in scalar_configs:
 # §§ Embeddings
 # ------------------------------------------------------------------------------
 
-input_embeds =     fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=1.0)   # fp32: only its update reads it
+input_embeds =     fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=1.0)
 value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
 value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
                    .uniform_(-matrix_init_s, matrix_init_s))
@@ -1088,6 +1084,10 @@ for (name, w, peak_lr, b2_grad, wd, slots) in embed_configs:
 
     # Add the parameter to the "model" container.
     setattr(m, name, p)
+
+# The normed table the forward gathers from, kept current from here on by input_embeds' update.
+m.x0_vocab_inv_rms = (m.input_embeds.w.square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+m.x0_vocab         = bf16(m.input_embeds.w * m.x0_vocab_inv_rms)
 
 
 # ------------------------------------------------------------------------------
@@ -1293,10 +1293,6 @@ for (name, w, peak_lr, rdim) in muon_configs:
 
     # Add the parameter to the "model" container.
     setattr(m, name, p)
-
-# The normed table the forward gathers from, kept current from here on by input_embeds' update.
-m.x0_vocab_inv_rms = (m.input_embeds.w.square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
-m.x0_vocab         = bf16(m.input_embeds.w * m.x0_vocab_inv_rms)
 
 # The Params own everything now: free the fp32 draws, drop the adopted names.
 del lm_head, input_embeds, value_embeds, ngram_values, resid_lambdas, x0_lambdas, x0_gates, pool_lambda, W_Q, W_K, W_V, W_O, head_gate, ve_gate, ngram_gate, W_in, W_out
