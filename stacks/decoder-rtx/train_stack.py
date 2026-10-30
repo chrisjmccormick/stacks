@@ -124,7 +124,7 @@ class StackConfig:
 
     # Attention - Input Reuse
     source_layer:     int = 4
-    src_layers:       list[int] = [5, 6, 7]
+    source_readers:   list[int] = [5, 6, 7]
 
     # Attention - Gates
     d_gate:    int = 16  # Gate input is a 16-dim slice of the layer's attention input.
@@ -262,6 +262,8 @@ class Model:
 
     # Input
     input_embeds:  Param = None
+    x0_vocab:         Tensor  # input_embeds RMS-normed per row, bf16; rewritten by its update in forward_backward
+    x0_vocab_inv_rms: Tensor  # (d_vocab, 1) fp32, its 1/rms, for the norm backward
 
     # Attention
     W_Q: Param
@@ -324,8 +326,8 @@ class LayerStash(NamedTuple):
     #                                                 TOTAL:    27GB           10.1GB
 
 # Model-level activations held as locals:
-#   x0                 (T, D)          288MB    layer-blend + embedding-norm backward
-#   x_embed_inv_rms    (T, 1)   fp32   (0.8MB)
+#   x0                 (T, D)          288MB    layer-blend backward
+#   (m.x0_vocab and m.x0_vocab_inv_rms are model state, kept current by input_embeds' update)
 #   x_pool             (T, D)          288MB    pooling backward
 #   x_final_hat        (T, D)          288MB    lm_head grad + final-norm backward
 #   x_final_inv_rms    (T, 1)   fp32   (0.8MB)
@@ -358,11 +360,11 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     #
     # Stream stages (forward name; each has a matching xb_* in bwd). Each is
     # named for what was just done to it:
-    # x_embed    - The input embedding
-    # x0         - The normed embedding, re-read by every layer
+    # x0_vocab   - The normed embedding table, one row per vocab entry (m.x0_vocab)
+    # x0         - The normed embedding (x0_vocab's rows), re-read by every layer
     # x          - The running residual stream (x_in is this layer's input)
     # x_biased   - Layer input scaled by resid_lambda, biased by x0
-    # x_src      - The source_layer's output, the src_layers' attention input
+    # x_src      - The source_layer's output, the source_readers' attention input
     # x_attn_out - Post-attention stream, the MLP's input
     # x_final    - Post-pooling stream, feeding the lm_head
     #
@@ -401,12 +403,14 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     #           Forward
     # -----------------------------
 
-    # Input embeddings
-    x_embed = F.embedding(idx, m.input_embeds.w)        # bf16
+    # RMS normalize the embedding table, then look up the input embeds; also added back
+    # to the stream at every layer.
+    x0 = F.embedding(idx, m.x0_vocab)                   # appears as x0b in bwd
 
-    # RMS normalize the input embeds; also added back to the stream at every layer.
-    x_embed_inv_rms = (x_embed.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
-    x0 = bf16(x_embed.float() * x_embed_inv_rms)      # appears as x0b in bwd
+    # Layer 0 attends from x0 alone, so its q, k, v are per-vocab: project the table's
+    # 16,384 rows rather than the T tokens.
+    W_qkv0 = torch.cat([m.W_Q.w[0], m.W_K.w[0], m.W_V.w[0]])   # (3D, D)
+    qkv0_vocab = m.x0_vocab @ W_qkv0.mT                 # (d_vocab, 3D); stays here: Muon updates W after the backward
 
     # The residual stream starts as the normed embedding.
     x = x0
@@ -422,17 +426,25 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
         x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
 
-        # Attention input norm. The src_layers attend from the source stream instead.
-        if i in cfg.src_layers:
+        # Attention input norm. Layer 0 attends from x0 (its q, k, v are qkv0_vocab's
+        # rows; its gate reads x0), and the source_readers from the source stream.
+        if i == 0:
+            x_biased_hat, x_biased_inv_rms = x0, None
+        elif i in cfg.source_readers:
             x_biased_hat, x_biased_inv_rms = x_src_hat, x_src_inv_rms
         else:
             x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
             x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
 
-        # QKV Projections
-        q = (x_biased_hat @ m.W_Q.w[i].mT).view(T, cfg.n_qo_heads, cfg.d_qk)
-        k = (x_biased_hat @ m.W_K.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_qk)
-        v = (x_biased_hat @ m.W_V.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_vo)
+        # QKV Projections. Layer 0 looks its q, k, v up by token.
+        if i == 0:
+            # v gathered on its own: FA needs it as a buffer, and q / k gather into the QK-norm kernel.
+            q, k = F.embedding(idx, qkv0_vocab[:, :2 * cfg.d_model]).view(T, 2, cfg.n_qo_heads, cfg.d_qk).unbind(1)  # n_qo == n_kv
+            v = F.embedding(idx, qkv0_vocab[:, 2 * cfg.d_model:]).view(T, cfg.n_kv_heads, cfg.d_vo)
+        else:
+            q = (x_biased_hat @ m.W_Q.w[i].mT).view(T, cfg.n_qo_heads, cfg.d_qk)
+            k = (x_biased_hat @ m.W_K.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_qk)
+            v = (x_biased_hat @ m.W_V.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_vo)
 
         # Value Embeddings
         j = cfg.ve_index[i]
@@ -443,10 +455,10 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
             v = v + ve_gate_a.unsqueeze(-1) * ve # ve and the gate are both recomputed in bwd, not stashed
 
         # N-gram value memories, gated like ve, each from its own slice of the input
-        for n, s in cfg.ngram_memories[i]:
+        for n, gate_slice in cfg.ngram_memories[i]:
             ngram_v = torch.cat([F.embedding(ngram_ids[n, h], ngram_wbank[2 * n + h]) for h in (0, 1)],
                                 dim=-1).view(T, cfg.n_kv_heads, cfg.d_vo)
-            ngram_gate_sig = torch.sigmoid(x_biased_hat[..., s * cfg.d_gate:(s + 1) * cfg.d_gate] @ m.ngram_gate.w[n].mT)
+            ngram_gate_sig = torch.sigmoid(x_biased_hat[..., gate_slice * cfg.d_gate:(gate_slice + 1) * cfg.d_gate] @ m.ngram_gate.w[n].mT)
             v = v + (2 * ngram_gate_sig).unsqueeze(-1) * ngram_v
 
         # QK-Norm, then RoPE
@@ -485,7 +497,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         # Write back to the stream.
         x = x_attn_out + mlp_out_hat        # the residual stream; appears as xb in bwd
 
-        # The source layer's output is the src_layers' attention input.
+        # The source layer's output is the source_readers' attention input.
         if i == cfg.source_layer:
             x_src_inv_rms = (x.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
             x_src_hat = bf16(x.float() * x_src_inv_rms)
@@ -561,10 +573,11 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     #           Backward
     # -----------------------------
     # Each n-gram hash's rows, compacted for the sparse updates.
-    ngram_sorted, ngram_order = ngram_ids.sort(dim=-1)                                # (num_ngrams, 2, T)
+    ngram_sorted, ngram_sort_idx = ngram_ids.sort(dim=-1)                             # (num_ngrams, 2, T)
     ngram_segment = torch.cat([torch.ones_like(ngram_sorted[..., :1]),
                                (ngram_sorted[..., 1:] != ngram_sorted[..., :-1]).long()], dim=-1).cumsum(dim=-1) - 1
-    ngram_inverse = torch.empty_like(ngram_segment).scatter_(-1, ngram_order, ngram_segment)
+    torch._assert_async(ngram_segment[..., -1].max() < cfg.touched_rows, "a batch touched more than cfg.touched_rows rows of one hash")
+    ngram_inverse = torch.empty_like(ngram_segment).scatter_(-1, ngram_sort_idx, ngram_segment)
     ngram_touched = torch.full_like(ngram_sorted, cfg.d_ngram).scatter_(-1, ngram_segment, ngram_sorted)[..., :cfg.touched_rows]
 
     # Scalar grads are collected, grad tensors updated at the end.
@@ -583,7 +596,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     # xb updates every layer, keep xb_final for the pool layer.
     xb = xb_final                       # grad wrt layer num_layers-1's output
     x0b = torch.zeros_like(x0)          # accumulates over layers
-    xb_src_hat = torch.zeros_like(x0)   # accumulates over the src_layers
+    xb_src_hat = torch.zeros_like(x0)   # accumulates over the source_readers
 
     # For each layer in reverse order,
     for i in reversed(range(cfg.n_layers)):
@@ -674,14 +687,14 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
             xb_gates[:, :cfg.d_gate] += ve_gateb_z @ m.ve_gate.w[j]
 
         # --- n-gram memory backward (ngram_v and ngram_gate_sig recomputed) ---
-        for n, s in cfg.ngram_memories[i]:
-            gate_in = x_biased_hat[..., s * cfg.d_gate:(s + 1) * cfg.d_gate]
+        for n, gate_slice in cfg.ngram_memories[i]:
+            gate_in = x_biased_hat[..., gate_slice * cfg.d_gate:(gate_slice + 1) * cfg.d_gate]
             ngram_v = torch.cat([F.embedding(ngram_ids[n, h], ngram_wbank[2 * n + h]) for h in (0, 1)],
                                 dim=-1).view(T, cfg.n_kv_heads, cfg.d_vo)
             ngram_gate_sig = torch.sigmoid(gate_in @ m.ngram_gate.w[n].mT)
             ngram_gateb_z = (vb * ngram_v).sum(dim=-1) * (2 * ngram_gate_sig * (1 - ngram_gate_sig))   # (T, n_kv_heads)
             m.ngram_gate.gbank[n].copy_(ngram_gateb_z.mT @ gate_in)
-            xb_gates[:, s * cfg.d_gate:(s + 1) * cfg.d_gate] += ngram_gateb_z @ m.ngram_gate.w[n]
+            xb_gates[:, gate_slice * cfg.d_gate:(gate_slice + 1) * cfg.d_gate] += ngram_gateb_z @ m.ngram_gate.w[n]
             ngram_vb = (vb * (2 * ngram_gate_sig).unsqueeze(-1)).reshape(T, 2, -1)   # each hash's half of the values
 
             # Sparse update: row-wise RMSProp on each hash's touched rows, fused in at its gradient.
@@ -702,15 +715,30 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         kb = kb.view(T, cfg.n_kv_heads * cfg.d_qk)
         vb = vb.reshape(T, cfg.n_kv_heads * cfg.d_vo)
 
-        m.W_Q.gbank[i].copy_(qb.mT @ x_biased_hat)
-        m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
-        m.W_V.gbank[i].copy_(vb.mT @ x_biased_hat)
+        if i == 0:
+            # Sum each token's q, k, v grads onto its vocab row, then run the
+            # projections' backward over the rows.
+            qkv0b_vocab = torch.ops.aten.embedding_dense_backward(
+                torch.cat([qb, kb, vb], dim=-1), idx, cfg.d_vocab, -1, False)   # (d_vocab, 3D)
+            W_qkv0b = qkv0b_vocab.mT @ m.x0_vocab              # (3D, D) TRAP: this step's table; the update below overwrites it
+            m.W_Q.gbank[0].copy_(W_qkv0b[:cfg.d_model])
+            m.W_K.gbank[0].copy_(W_qkv0b[cfg.d_model:2 * cfg.d_model])
+            m.W_V.gbank[0].copy_(W_qkv0b[2 * cfg.d_model:])
+            x0b_vocab = qkv0b_vocab @ W_qkv0                   # (d_vocab, D)
+            xb_biased_hat = F.pad(xb_gates, (0, cfg.d_model - 3 * cfg.d_gate))
+        else:
+            m.W_Q.gbank[i].copy_(qb.mT @ x_biased_hat)
+            m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
+            m.W_V.gbank[i].copy_(vb.mT @ x_biased_hat)
 
-        xb_biased_hat = qb @ m.W_Q.w[i] + kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
-        xb_biased_hat[:, :3 * cfg.d_gate] += xb_gates
+            xb_biased_hat = qb @ m.W_Q.w[i] + kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
+            xb_biased_hat[:, :3 * cfg.d_gate] += xb_gates
 
-        # Attention input norm backward
-        if i in cfg.src_layers:
+        # Attention input norm backward. Layer 0's attention input was x0 itself.
+        if i == 0:
+            x0b = x0b + xb_biased_hat
+            xb_biased = xb_attn_out
+        elif i in cfg.source_readers:
             xb_src_hat = xb_src_hat + xb_biased_hat
             xb_biased = xb_attn_out
         else:
@@ -728,7 +756,7 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
         x0b = x0b + bf16(m.x0_lambdas.w[i] * x0_gate) * xb_biased  # TRAP: x0 feeds every layer, accumulate
         xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
 
-        # TRAP: the source layer's output (this layer's input) also fed the src_layers' attention.
+        # TRAP: the source layer's output (this layer's input) also fed the source_readers' attention.
         if i == cfg.source_layer + 1:
             xb = xb + bf16(x_src_inv_rms * (xb_src_hat.float() - (x_src_hat.float() * (x_src_hat.float() * xb_src_hat.float()).mean(dim=-1, keepdim=True))))
         stash[i] = None                          # free this layer's stash as we go
@@ -743,10 +771,24 @@ def forward_backward(idx, targets, cu_seqlens, loss_scale=1.0, backward=True):
     # it folds into x0b to give the full grad wrt the normed embedding.
     x0b = x0b + xb
 
-    # --- embedding norm + token embedding scatter ---
-    xb_embed = bf16(x_embed_inv_rms * (x0b.float() - (x0.float() * (x0.float() * x0b.float()).mean(dim=-1, keepdim=True))))
-    m.input_embeds.grad.copy_(
-        torch.ops.aten.embedding_dense_backward(xb_embed, idx, cfg.d_vocab, -1, False))
+    # --- input embeddings: every token's grad onto its vocab row, plus layer 0's projections' ---
+    x0b_vocab = torch.ops.aten.embedding_dense_backward(x0b.float(), idx, cfg.d_vocab, -1, False) + x0b_vocab.float()
+
+    # Norm backward, against the table this step's forward read.
+    x0_vocab_f = m.x0_vocab.float()
+    grad = m.x0_vocab_inv_rms * (x0b_vocab - x0_vocab_f * (x0_vocab_f * x0b_vocab).mean(dim=-1, keepdim=True))
+
+    # AdamW, inline (adamw_step_fused's math; fp32 live, no mantissa). Dense: rows outside the
+    # batch have grad 0 but still move on their momentum, so this covers all 16,384 rows.
+    p = m.input_embeds
+    p.first_mntm.mul_(p.mntm_b1_t[t_step]).add_(grad * p.grad_b1_t[t_step])           # m = beta1*m + (1 - beta1)*g
+    p.scnd_mntm.mul_(p.mntm_b2_t[t_step]).add_(grad.square() * p.grad_b2_t[t_step])   # v = beta2*v + (1 - beta2)*g^2
+    w = p.w * p.wd_t[t_step] + p.lr_bc_t[t_step] * (p.first_mntm / (p.scnd_mntm.sqrt() + p.eps_t[t_step]))
+    p.w.copy_(w)
+
+    # The next step's forward norm.
+    m.x0_vocab_inv_rms.copy_((w.square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt())
+    m.x0_vocab.copy_(bf16(w * m.x0_vocab_inv_rms))
 
     return loss
 
@@ -935,8 +977,8 @@ scalar_grad_mult_t = np.ones(cfg.num_steps)
 scalar_configs = [
 #   name,               weights,        lr schedule,     peak lr,  b1_grad,   b2_grad,    wd,
     ("resid_lambdas",   resid_lambdas,  lr_mult_t,       0.008,    0.2,        0.05,   0.0),
-    ("x0_lambdas",      x0_lambdas,     muon_lr_mult_t,  1.2,      0.04,       0.05,   0.002),
-    ("x0_gates",        x0_gates,       muon_lr_mult_t,  1.2,      0.04,       0.05,   0.002),
+    ("x0_lambdas",      x0_lambdas,     muon_lr_mult_t * np.minimum(1.0, steps_1idx / 20),  1.2,  0.04,  0.05,  0.002),
+    ("x0_gates",        x0_gates,       muon_lr_mult_t * np.minimum(1.0, steps_1idx / 20),  1.2,  0.04,  0.05,  0.002),
     ("pool_lambda",     pool_lambda,    lr_mult_t,       0.06,     0.04,       0.05,   0.0),
 ]
 
@@ -988,8 +1030,7 @@ for (name, w, sched_t, peak_lr, b1_grad, b2_grad, wd) in scalar_configs:
 # §§ Embeddings
 # ------------------------------------------------------------------------------
 
-input_embeds =     bf16_empty(cfg.d_vocab, cfg.d_model)
-input_embeds.copy_(fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=1.0))
+input_embeds =     fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=1.0)   # fp32: only its update reads it
 value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
 value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
                    .uniform_(-matrix_init_s, matrix_init_s))
@@ -1009,12 +1050,13 @@ for (name, w, peak_lr, b2_grad, wd, slots) in embed_configs:
     # Derive the momentum buffer's decay.
     b2_mntm = 1 - b2_grad
 
-    grad = bf16_zeros(w.shape) # Embeddings can handle bf16 accumulation fine
+    # Embeddings can handle bf16 accumulation fine. input_embeds steps inline in forward_backward.
+    grad = None if name == "input_embeds" else bf16_zeros(w.shape)
 
     p = Param(
         # Weight
         name         = name,
-        w            = w,          # bf16 live, no fp32 master
+        w            = w,          # bf16 live (input_embeds fp32), no master
         mantissa     = None,
 
         # Gradients
@@ -1252,6 +1294,10 @@ for (name, w, peak_lr, rdim) in muon_configs:
     # Add the parameter to the "model" container.
     setattr(m, name, p)
 
+# The normed table the forward gathers from, kept current from here on by input_embeds' update.
+m.x0_vocab_inv_rms = (m.input_embeds.w.square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+m.x0_vocab         = bf16(m.input_embeds.w * m.x0_vocab_inv_rms)
+
 # The Params own everything now: free the fp32 draws, drop the adopted names.
 del lm_head, input_embeds, value_embeds, ngram_values, resid_lambdas, x0_lambdas, x0_gates, pool_lambda, W_Q, W_K, W_V, W_O, head_gate, ve_gate, ngram_gate, W_in, W_out
 
@@ -1339,7 +1385,6 @@ class RunResult:
     train_time:         float        = 0.0
     val_time:           float        = 0.0
     compile_time:       float        = 0.0
-    init_time:          float        = 0.0
     wall_time:          float        = 0.0
 
     # The rate
@@ -1527,7 +1572,7 @@ for step in range(cfg.num_steps + 1):
         muon_step_fused(p, p.grad, t_step)
 
     # AdamW
-    for p in (m.lm_head, m.input_embeds, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
+    for p in (m.lm_head, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
               m.x0_gates, m.pool_lambda):
         # Run AdamW
         adamw_step_fused(p, p.grad, t_step)
@@ -1630,7 +1675,7 @@ wandb_run.log({"step": cfg.num_steps,
 print0(f"== {result.run_name} ==", console=True)
 if result.val_bpb is not None:
     print0(f"  val_bpb {result.val_bpb:.6f} | min {result.min_val_bpb:.6f} | slack {result.slack:+,} vs {VAL_BPB_TARGET:.3f}", console=True)
-print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | init {result.init_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
+print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
     print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
 print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
