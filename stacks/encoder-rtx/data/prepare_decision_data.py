@@ -63,9 +63,10 @@ TOKENIZER = CACHE / "climbmix_unigram16k_14_170" / "tokenizer" / "tokenizer.json
 KEV_HF_REPO, KEV_HF_REV = "jaredpalmer/kev-suites", "cc4bac803e73112689ec327ffa481c519cbc7a05"
 KEV_GH = "https://raw.githubusercontent.com/jaredpalmer/kev/2074cc44256200bb37540103fa4572901faa10f3/evals"
 
-# Output split -> the files it concatenates, each (where, path). "train" is exactly what
-# Kev-4B trained on (its card's five stages). transfer_test is Kev's locked test: keep it
-# out of development reads.
+# Output split -> the files it concatenates, each (where, path): "hf" is Kev's Hub repo and
+# "gh" its GitHub evals/ folder, both pinned above; "hf:<repo>@<revision>" is any other Hub
+# dataset repo; "local" a path on disk. "train" is exactly what Kev-4B trained on (its
+# card's five stages). transfer_test is Kev's locked test: keep it out of development reads.
 SPLITS = {
     "train": [("hf", "v7/decision-v7/train.jsonl"),          # ten public datasets + generated policy/rules
               ("gh", "night2/dates_unknowable.jsonl"),       # dates, and cases with the evidence removed
@@ -80,9 +81,10 @@ SPLITS = {
 }
 
 # Soft labels from a teacher, joined onto the records by (record id, question name): split ->
-# a parquet with columns `id`, `question` and `probs` (option name -> probability, as JSON
-# text or a map). A question with a table entry gets that target in place of its own.
-LABELS: dict[str, Path] = {}
+# (where, path) of a parquet with columns `id`, `question` and `probs` (option name ->
+# probability, as JSON text or a map). A question with a table entry gets that target in
+# place of its own.
+LABELS: dict[str, tuple] = {}
 
 # ------------------------------------------------------------------------------
 # Special tokens
@@ -202,6 +204,13 @@ def fetch(where: str, path: str) -> Path:
     """The raw file, downloaded once into RAW_DIR at the pinned revision (or a local path)."""
     if where == "local":
         return Path(path).expanduser()
+    if where.startswith("hf:"):
+        repo, _, revision = where[3:].partition("@")
+        local_dir = RAW_DIR / repo
+        local = local_dir / path
+        if not local.exists():
+            hf_hub_download(repo, path, repo_type="dataset", revision=revision or None, local_dir=local_dir)
+        return local
     local = RAW_DIR / path
     if not local.exists():
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -227,7 +236,7 @@ def load_labels(split: str) -> dict:
     if split not in LABELS:
         return {}
     table = {}
-    for row in pq.read_table(LABELS[split]).to_pylist():
+    for row in pq.read_table(fetch(*LABELS[split])).to_pylist():
         probs = row["probs"]
         probs = json.loads(probs) if isinstance(probs, str) else dict(probs)
         table[(row["id"], row["question"])] = probs

@@ -64,7 +64,9 @@ their first 2,048 tokens, since the base never saw a longer document. That cut a
 
 **Data:** `data/prepare_decision_data.py` tokenizes anything in Kev's suite schema, one
 JSON record per line, into `~/.cache/encoder-rtx/decision16k/<split>.parquet`. `SPLITS`
-lists the sources. `LABELS` joins a teacher's soft labels on (record id, question name).
+lists the sources: Kev's pinned Hub and GitHub files, a file in any other Hub dataset repo
+(`hf:<repo>@<revision>`), or a local path. `LABELS` joins a teacher's soft labels on
+(record id, question name), from a parquet at any of the same kinds of source.
 
 ## Phase 0: `train_encoder.py`
 
