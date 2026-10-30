@@ -47,7 +47,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from tokenizers import Tokenizer
 
 CACHE = Path.home() / ".cache" / "encoder-rtx"
@@ -62,6 +62,7 @@ TOKENIZER = CACHE / "climbmix_unigram16k_14_170" / "tokenizer" / "tokenizer.json
 # repo's evals/ folder.
 KEV_HF_REPO, KEV_HF_REV = "jaredpalmer/kev-suites", "cc4bac803e73112689ec327ffa481c519cbc7a05"
 KEV_GH = "https://raw.githubusercontent.com/jaredpalmer/kev/2074cc44256200bb37540103fa4572901faa10f3/evals"
+PHASE1 = "hf:ChrisMcCormick/encoder-rtx-phase1@4fc7009f7ad9961d1f8db343efbb868320410700"
 
 # Output split -> the files it concatenates, each (where, path): "hf" is Kev's Hub repo and
 # "gh" its GitHub evals/ folder, both pinned above; "hf:<repo>@<revision>" is any other Hub
@@ -78,13 +79,22 @@ SPLITS = {
     "calibration":    [("gh", "v7/decision-v7/calibration.jsonl")],
     "transfer_dev":   [("gh", "v4/transfer-v4/development.jsonl")],
     "transfer_test":  [("gh", "v4/transfer-v4/test.jsonl")],
+    # Phase 1 (agent-ops-stacks encoder-rtx/2026-10-29_0724pm_phase1-instruction-data): labelled
+    # NLP datasets with many phrasings per task. This revision predates the review's fixes.
+    "phase1_train":    [(PHASE1, "data/train.jsonl")],       # 27 families
+    "phase1_holdout":  [(PHASE1, "data/holdout.jsonl")],     # clinc150, formality, health_fact: never in train
+    "phase1_jevbench": [(PHASE1, "data/jevbench.jsonl")],    # JevBench v1.2's 231 public items, eval only
 }
 
-# Soft labels from a teacher, joined onto the records by (record id, question name): split ->
-# (where, path) of a parquet with columns `id`, `question` and `probs` (option name ->
-# probability, as JSON text or a map). A question with a table entry gets that target in
-# place of its own.
+# Soft labels from a teacher, joined onto a split's records: split -> (where, path) of a
+# parquet with columns `id`, `question` and `probs` (option name -> probability, as JSON
+# text or a map), joined on (record id, question name); or ("d3", <source>), every shard of
+# d3-flash's labels for that source in D3_LABELS_REPO (agent-ops-stacks encoder-rtx/
+# 2026-10-29_0724pm_d3-teacher-labels), whose source reads the split's files in the same
+# order: joined on (record index, question name), each record's line checked by its sha256.
+# A question with a table entry gets that target in place of its own.
 LABELS: dict[str, tuple] = {}
+D3_LABELS_REPO, D3_LABELS_REV = "ChrisMcCormick/encoder-rtx-labels", None
 
 # ------------------------------------------------------------------------------
 # Special tokens
@@ -231,16 +241,31 @@ def load_tokenizer():
     return tok
 
 
-def load_labels(split: str) -> dict:
-    """(record id, question name) -> {option name: probability}, from LABELS[split]."""
+def load_labels(split: str) -> tuple[dict, list]:
+    """-> ({(record id or index, question name): (line sha256[:16] or None, {option name:
+    probability})}, the files the labels were made from as [(path, sha256)], or [])."""
     if split not in LABELS:
-        return {}
+        return {}, []
+    where, path = LABELS[split]
+    if where != "d3":
+        table = {}
+        for row in pq.read_table(fetch(where, path)).to_pylist():
+            probs = row["probs"]
+            probs = json.loads(probs) if isinstance(probs, str) else dict(probs)
+            table[(row["id"], row["question"])] = (None, probs)
+        return table, []
+    root = Path(snapshot_download(D3_LABELS_REPO, repo_type="dataset", revision=D3_LABELS_REV,
+                                  allow_patterns=[f"labels/{path}/*"], local_dir=RAW_DIR / D3_LABELS_REPO))
+    root = root / "labels" / path
+    manifest = json.loads((root / "manifest.json").read_text())
+    shards = sorted(root.glob("shard-*.parquet"))
+    assert len(shards) == manifest["shards"], f"d3 {path}: {len(shards)} of {manifest['shards']} shards"
     table = {}
-    for row in pq.read_table(fetch(*LABELS[split])).to_pylist():
-        probs = row["probs"]
-        probs = json.loads(probs) if isinstance(probs, str) else dict(probs)
-        table[(row["id"], row["question"])] = probs
-    return table
+    for shard in shards:
+        for row in pq.read_table(shard, columns=["rec", "rec_sha", "q_name", "keys", "probs", "error"]).to_pylist():
+            if row["error"] is None:   # d3 gave no answer: the question keeps its hard label
+                table[(row["rec"], row["q_name"])] = (row["rec_sha"], dict(zip(row["keys"], row["probs"])))
+    return table, [(x["path"], x["sha256"]) for x in manifest["inputs"]]
 
 
 def decode(tok, ids: list[int]) -> str:
@@ -269,7 +294,7 @@ def pct(xs: list[int], p: float) -> int:
 def build(tok, split: str, files: list) -> dict:
     cols = {c: [] for c in ("id", "file", "line", "source", "variant", "group", "state_ids", "q_name",
                             "q_type", "q_prefix", "q_options", "q_label", "q_target")}
-    labels = load_labels(split)
+    labels, labelled_files = load_labels(split)
     sources, by_type, by_source = {}, Counter(), Counter()
     state_lens, question_lens = [], []
     joined = 0
@@ -280,6 +305,7 @@ def build(tok, split: str, files: list) -> dict:
             if not line.strip():
                 continue
             r = json.loads(line)
+            rec = len(cols["id"])   # the record's index in the split, as d3's labels number it
             meta = r.get("_meta", {})
             state = encode(tok, [BOS_ID, STATE] + text_pieces(r["state"]))
             cols["id"].append(str(meta.get("id", f"{path}:{line_no}")))
@@ -293,8 +319,12 @@ def build(tok, split: str, files: list) -> dict:
             names, types, prefixes, options, q_labels, targets = [], [], [], [], [], []
             for name, q in r["questions"].items():
                 prefix, opts, label, target, opt_names = render_question(tok, q)
-                if (cols["id"][-1], name) in labels:
-                    target = target_list(labels[(cols["id"][-1], name)], opt_names)
+                key = (rec, name) if labelled_files else (cols["id"][-1], name)
+                if key in labels:
+                    line_sha, probs = labels[key]
+                    assert line_sha in (None, hashlib.sha256(line.strip().encode()).hexdigest()[:16]), \
+                        f"{split}: labels for record {rec} were made from a different line"
+                    target = target_list(probs, opt_names)
                     joined += 1
                 names.append(name); types.append(q["type"]); prefixes.append(prefix)
                 options.append(opts); q_labels.append(label); targets.append(target)
@@ -304,6 +334,9 @@ def build(tok, split: str, files: list) -> dict:
             for c, v in zip(("q_name", "q_type", "q_prefix", "q_options", "q_label", "q_target"),
                             (names, types, prefixes, options, q_labels, targets)):
                 cols[c].append(v)
+    if labelled_files:
+        assert labelled_files == [(path, sources[path]["sha256"]) for _, path in files], \
+            f"{split}: the d3 labels were made from other files: {labelled_files}"
 
     flat = [i for s in cols["state_ids"] for i in s[1:]]
     flat += [i for ps in cols["q_prefix"] for p in ps for i in p]
@@ -372,7 +405,8 @@ def main():
     meta = dict(bos_id=BOS_ID, d_tokenizer=D_TOKENIZER, d_input_vocab=D_INPUT_VOCAB, special_tokens=SPECIAL_IDS,
                 tokenizer=f"{CLIMBMIX_REPO}@{CLIMBMIX_REV}:tokenizer/tokenizer.json",
                 kev_hf=f"{KEV_HF_REPO}@{KEV_HF_REV}", kev_github=KEV_GH,
-                labels={s: str(p) for s, p in LABELS.items()}, splits={})
+                labels={s: str(p) for s, p in LABELS.items()}, d3_labels=f"{D3_LABELS_REPO}@{D3_LABELS_REV}",
+                splits={})
     for split, files in SPLITS.items():
         meta["splits"][split] = build(tok, split, files)
     (OUT_DIR / "meta.json").write_text(json.dumps(meta, indent=1))
