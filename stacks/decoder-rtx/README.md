@@ -2,7 +2,7 @@
 
 To encourage more exploration/hacking of the backward pass, I ran a single-GPU pre-training speedrun for the month of September 2026. 
 
-The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU). The final baseline, Baseline 6, trains in 12m 21s, down from 26m 51s.
+The metric is the time to 0.90 val bpb on an RTX Pro 6000 (a 96GB Blackwell GPU). The final baseline, Baseline 6, trains in 12m 09s, down from 26m 51s.
 
 Baseline 1's 12 layer model (same scale as [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and pipeline came from [nanochat](https://github.com/karpathy/nanochat).
 
@@ -65,11 +65,11 @@ python train_stack.py
 | 2026-09-14 - Baseline 3 | 24m 21s | -2m 30s | 837 | [#4](https://github.com/chrisjmccormick/stacks/pull/4) |
 | 2026-09-21 - Baseline 4 | 15m 47s | -11m 04s | 920 | [#5](https://github.com/chrisjmccormick/stacks/pull/5) |
 | 2026-09-28 - Baseline 5 | 14m 52s | -11m 59s | 1,531 | [#6](https://github.com/chrisjmccormick/stacks/pull/6) |
-| 2026-09-30 - Baseline 6 | 12m 21s | -14m 30s | 917 | [#7](https://github.com/chrisjmccormick/stacks/pull/7) |
+| 2026-09-30 - Baseline 6 | 12m 09s | -14m 43s | 476 | [#7](https://github.com/chrisjmccormick/stacks/pull/7) |
 
 Each baseline's PR has the write-up of what it changed. The baseline runs can all be viewed on wandb, [here](https://wandb.ai/chrismccormick/decoderstack_rtx).
 
-Baseline 6 switches to priml's 16K Unigram tokenizer, scored on the same validation documents as Baselines 1-5. Its tokens cover about 5.5% fewer bytes each, so compare step and token counts only within Baselines 1-5. The leaderboard also has "2026-09-30 - Baseline Priml" (13m 05s, slack 651): priml's recipe as first ported, before Baseline 6's RoPE changes.
+Baseline 6 switches to priml's 16K Unigram tokenizer, scored on the same validation documents as Baselines 1-5. Its tokens cover about 5.5% fewer bytes each, so compare step and token counts only within Baselines 1-5.
 
 ### Acknowledgements
 
@@ -87,5 +87,5 @@ TODO - I'd like to try and carry forward crediting the individual algorithm and 
 - A handwritten backward for the whole model, priml's recipe included: no autograd.
 - Priml's per-layer hashed n-gram value memories (bigram on layers 1, 3, 5, 7; trigram on 1, 5, 7), 14 slots of 2,097,152 rows x 384, 22.5GB in bf16. They have no `.grad` buffers: their sparse RMSProp step is inlined into the backward, on the rows the batch touched. Skipping those buffers is what fits them on the 96GB card; priml's own layout adds ~45GB of fp32 gradient buffers for them. See [#7](https://github.com/chrisjmccormick/stacks/pull/7).
 - Selectively re-computing parts of the forward activations (the `LayerStash` table in `train_stack.py`) keeps each 192K-token step a single micro-batch.
-- RoPE written as `x * [cos, cos] + roll(x, 64) * [sin, -sin]`, so the per-head QK norm and the rotation fuse into one kernel, and nothing holds an fp32 copy of the rotated q and k for the backward. See [#7](https://github.com/chrisjmccormick/stacks/pull/7).
+- Layer 0 attends from the token alone, so its q, k, v projections run once over the 16,384 normed vocabulary rows instead of the 196,608 tokens, and each token gathers its row. See [#7](https://github.com/chrisjmccormick/stacks/pull/7).
 - Earlier baselines' own techniques (the bigram-distribution initialization, the residual bigram table, the frozen trigram "pair code", the document-length curriculum) are written up in their PRs. Baseline 6 set them aside for priml's recipe.
