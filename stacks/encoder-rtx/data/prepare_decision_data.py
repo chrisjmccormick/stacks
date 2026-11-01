@@ -93,8 +93,16 @@ SPLITS = {
 # 2026-10-29_0724pm_d3-teacher-labels), whose source reads the split's files in the same
 # order: joined on (record index, question name), each record's line checked by its sha256.
 # A question with a table entry gets that target in place of its own.
-LABELS: dict[str, tuple] = {}
-D3_LABELS_REPO, D3_LABELS_REV = "ChrisMcCormick/encoder-rtx-labels", None
+LABELS: dict[str, tuple] = {"phase1_train": ("d3", "phase1_train")}
+D3_LABELS_REPO, D3_LABELS_REV = "ChrisMcCormick/encoder-rtx-labels", "26f5c25caea8624620253b8ca7f2297cde12b429"   # phase1_train's 86 shards done
+
+# Yes/no questions balanced to 0.5 true within each source, for the splits listed here. Recast
+# NLP's renderer asks a by-label noul about the gold class half the time and a random class
+# (gold included) otherwise, so its two-class families are ~0.75 true whatever the template,
+# and a two-class yes/no phrasing predicts "yes" (agent-ops-stacks encoder-rtx/
+# 2026-11-01_1203am_decision-data-arms, R4 / R4b). The majority side's nouls are dropped, each
+# kept or not by a hash of (record id, question name); a record left with no question goes.
+BALANCE_NOULS = {"phase1_train"}
 
 # ------------------------------------------------------------------------------
 # Special tokens
@@ -316,7 +324,7 @@ def build(tok, split: str, files: list) -> dict:
             cols["group"].append(str(meta.get("group_id") or meta.get("id") or meta.get("family_id") or ""))
             cols["state_ids"].append(state)
             state_lens.append(len(state))
-            names, types, prefixes, options, q_labels, targets = [], [], [], [], [], []
+            names, types, prefixes, options, q_labels, targets, from_table = [], [], [], [], [], [], []
             for name, q in r["questions"].items():
                 prefix, opts, label, target, opt_names = render_question(tok, q)
                 key = (rec, name) if labelled_files else (cols["id"][-1], name)
@@ -326,17 +334,48 @@ def build(tok, split: str, files: list) -> dict:
                         f"{split}: labels for record {rec} were made from a different line"
                     target = target_list(probs, opt_names)
                     joined += 1
+                from_table.append(key in labels)
                 names.append(name); types.append(q["type"]); prefixes.append(prefix)
                 options.append(opts); q_labels.append(label); targets.append(target)
                 question_lens.append(len(prefix) + sum(len(o) for o in opts))
                 by_type[q["type"]] += 1
                 by_source[meta.get("source", "?")] += 1
-            for c, v in zip(("q_name", "q_type", "q_prefix", "q_options", "q_label", "q_target"),
-                            (names, types, prefixes, options, q_labels, targets)):
-                cols[c].append(v)
+            for c, v in zip(("q_name", "q_type", "q_prefix", "q_options", "q_label", "q_target", "q_from_table"),
+                            (names, types, prefixes, options, q_labels, targets, from_table)):
+                cols.setdefault(c, []).append(v)
     if labelled_files:
         assert labelled_files == [(path, sources[path]["sha256"]) for _, path in files], \
             f"{split}: the d3 labels were made from other files: {labelled_files}"
+
+    if split in BALANCE_NOULS:
+        q_cols = ("q_name", "q_type", "q_prefix", "q_options", "q_label", "q_target", "q_from_table")
+        counts = {}   # source -> [true, false]; a noul's label 0 is "true"
+        for source, kinds, q_labels in zip(cols["source"], cols["q_type"], cols["q_label"]):
+            for kind, label in zip(kinds, q_labels):
+                if kind == "noul":
+                    counts.setdefault(source, [0, 0])[label] += 1
+        keep = {(source, side): min(c) / c[side] if c[side] else 1.0 for source, c in counts.items() for side in (0, 1)}
+        uniform = lambda rid, name: int(hashlib.sha256(f"{rid}:{name}".encode()).hexdigest()[:8], 16) / 2 ** 32
+        kept_cols = {c: [] for c in cols}
+        for i in range(len(cols["id"])):
+            kept = [j for j, (kind, label, name) in enumerate(zip(cols["q_type"][i], cols["q_label"][i], cols["q_name"][i]))
+                    if kind != "noul" or uniform(cols["id"][i], name) < keep[(cols["source"][i], label)]]
+            if not kept:
+                continue
+            for c in cols:
+                kept_cols[c].append([cols[c][i][j] for j in kept] if c in q_cols else cols[c][i])
+        n_before = (len(cols["id"]), sum(len(n) for n in cols["q_name"]), sum(sum(c) for c in counts.values()))
+        cols = kept_cols
+        state_lens = [len(st) for st in cols["state_ids"]]
+        question_lens = [len(pr) + sum(len(o) for o in opts) for prs, oss in zip(cols["q_prefix"], cols["q_options"])
+                         for pr, opts in zip(prs, oss)]
+        by_type = Counter(t for ts in cols["q_type"] for t in ts)
+        by_source = Counter(src for src, ts in zip(cols["source"], cols["q_type"]) for _ in ts)
+        joined = sum(f for fs in cols["q_from_table"] for f in fs)
+        true_kept = sum(lab == 0 for ts, ls in zip(cols["q_type"], cols["q_label"]) for t, lab in zip(ts, ls) if t == "noul")
+        print(f"[{split}] nouls balanced per source: {sum(c[0] for c in counts.values()):,} true / "
+              f"{sum(c[1] for c in counts.values()):,} false -> {true_kept:,} / {by_type['noul'] - true_kept:,}; "
+              f"records {n_before[0]:,} -> {len(cols['id']):,}, questions {n_before[1]:,} -> {sum(len(n) for n in cols['q_name']):,}")
 
     flat = [i for s in cols["state_ids"] for i in s[1:]]
     flat += [i for ps in cols["q_prefix"] for p in ps for i in p]

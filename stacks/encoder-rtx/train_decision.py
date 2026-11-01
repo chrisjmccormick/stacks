@@ -174,11 +174,11 @@ class StackConfig:
     eval_targets:     int = 64      # per decision evaluation pack (their MLM goes unread)
 
     # Packs (§ Data). The static sizes are derived from the planned packs.
-    decision_frac:   float = 0.90   # share of each pack given to decision records; the rest is MLM filler
+    decision_frac:   float = 0.50   # share of each pack given to decision records; the rest is MLM filler
     decision_weight: float = 1.0    # decision loss (nats per question) against MLM loss (nats per masked token)
     soft_weight:     float = 1.0    # where a question has a soft target: its weight against the hard label's
-    epochs:          float = 1.0    # passes over the training records; sets num_steps
-    train_splits:    tuple = ("train",)  # data/prepare_decision_data.py splits trained on
+    epochs:          float = 2.0    # passes over the training records; sets num_steps
+    train_splits:    tuple = ("train", "phase1_train")  # data/prepare_decision_data.py splits: Kev's records and Recast NLP's (d3-labelled, nouls balanced)
     state_cap:       int = 8192     # a state's first tokens kept: the 8K base's context
     filler_shard:    int = 8        # the filler starts at this train shard: the 8K MLM base read 1-6
     cu_width:        int            # cu_self entries   (the training packs'; the evaluation

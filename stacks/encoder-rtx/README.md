@@ -11,9 +11,11 @@ one RTX PRO 6000. `train_mlm.py` pre-trains the encoder on masked LM -- decoder-
 Baseline 6 made bidirectional, reading documents of up to 8,192 tokens -- in 13.7 minutes of
 training (val MLM 1.779 nats per corrupted position). Its checkpoint is `runs/mlm-base8k/` in
 the private model repo `ChrisMcCormick/encoder-rtx`. `train_decision.py` starts from it and
-trains on decision records: one epoch of Kev's records at a 0.5 decision share (145
-steps, 46 s of training at 0.318 s/step) reaches decision-dev accuracy 0.64, transfer-dev
-0.50 and JevBench 0.43, against 0.33 / 0.39 / 0.32 for uniform guessing. `train_encoder.py`,
+trains on decision records: two passes over Kev's records and Recast NLP's (d3-flash's
+labels, yes/no questions balanced per source) at a 0.5 decision share (616 steps, 3.4 min of
+training at 0.328 s/step) reach decision-dev accuracy 0.70-0.73, transfer-dev 0.50-0.51 and
+JevBench 0.45-0.49, against 0.33 / 0.39 / 0.32 for uniform guessing (Kev's records alone,
+one pass: 0.64 / 0.50 / 0.38-0.44). `train_encoder.py`,
 at the bottom, is Phase 0's
 single-stage fork (joint MLM + decision from scratch on the 32K BPE), superseded by the two
 stages and kept for reference. The proposal, the sessions and their logs are in
@@ -87,7 +89,7 @@ On an RTX PRO 6000, in the `stacks` env:
 python data/prepare_decision_data.py   # once: Kev's suites (+ Phase 1's) -> ~/.cache/encoder-rtx/decision16k/
 # the 8K MLM base, once (private repo; HF_TOKEN):
 huggingface-cli download ChrisMcCormick/encoder-rtx --include 'runs/mlm-base8k/*' --local-dir ~/.cache/encoder-rtx/hub
-EPOCHS=1 DECISION_FRAC=0.5 LR_SCALE=0.3 RUN_NAME=dec-f50-e1 python train_decision.py
+RUN_NAME=decision python train_decision.py   # defaults: Kev + Recast NLP, two passes, share 0.5, LR_SCALE 0.3
 ```
 
 It is stage 1's script with Phase 0's decision path brought in:
@@ -120,13 +122,29 @@ It is stage 1's script with Phase 0's decision path brought in:
   of decision-v7 and transfer-v4 development, Phase 1's holdout families (clinc150,
   formality, health_fact) and JevBench's 231 public items, with accuracy by source and by
   state length (over / under 2,048 tokens) at the end.
-- Knobs from the environment, logged: `EPOCHS` (1), `DECISION_FRAC` (0.9), `LR_SCALE`
-  (0.3), `SOFT_WEIGHT` (1.0), `DECISION_WEIGHT` (1.0), `TRAIN_SPLITS` (`train`; add
-  splits the data prep writes, e.g. `train,phase1_train`), `STATE_CAP` (8192), `INIT_FROM`,
+- Knobs from the environment, logged: `EPOCHS` (2), `DECISION_FRAC` (0.5), `LR_SCALE`
+  (0.3), `SOFT_WEIGHT` (1.0), `DECISION_WEIGHT` (1.0), `TRAIN_SPLITS` (`train,phase1_train`:
+  any splits the data prep writes; `train` alone is Kev's records), `STATE_CAP` (8192), `INIT_FROM`,
   `VAL_EVERY` (25), `MASK_RATE` (0.50), `RUN_NAME`, `USE_WANDB`, `ABORT_STEP`,
   `SAVE_CHECKPOINT`.
 
-One epoch of Kev's records, `DECISION_FRAC=0.5 LR_SCALE=0.3` (accuracy on the clean rows):
+**The default mix** (accuracy on the clean rows; Phase 1 holdout = Recast NLP's held-out
+families at `bd5ae231`; agent-ops-stacks `encoder-rtx/2026-11-01_1203am_decision-data-arms`):
+
+| training records | runs | val MLM | decision-dev | transfer-dev | Phase 1 holdout | JevBench | steps | s/step |
+|---|---|---|---|---|---|---|---|---|
+| Kev's, one pass (the previous default, `TRAIN_SPLITS=train EPOCHS=1`) | 3 seeds | 1.835 | 0.638 / 0.635 / 0.646 | 0.508 / 0.497 / 0.494 | 0.443 / 0.445 / 0.449 | 0.437 / 0.381 / 0.398 | 145 | 0.318 |
+| **Kev's + Recast NLP's (d3 labels, nouls balanced), two passes** | 3 seeds (session) | 1.822 | 0.718 / 0.726 / 0.718 | 0.512 / 0.502 / 0.497 | 0.531 / 0.538 / 0.547 | 0.485 / 0.446 / 0.472 | 616 | 0.330 |
+| the same, the committed defaults | 1 | 1.820 | 0.704 | 0.508 | 0.527 | 0.468 | 616 | 0.328 |
+
+The new mix lifts every in-distribution and Jev-shaped number at every seed and holds
+transfer-dev (seed means +0.08 decision-dev, +0.09 Phase 1 holdout, +0.06 JevBench, +0.004
+transfer-dev); on Cookbook-dev (TypeSafe's cookbooks as decision records, eval only) its
+many-option choices beat every Kev-only run. Transfer-dev doesn't move with any mix tried:
+on most of its families the stage answers one constant per family, so its accuracy reads
+priors, and the same config moves ~0.015 between seeds.
+
+The earlier table, one epoch of Kev's records, `DECISION_FRAC=0.5 LR_SCALE=0.3`:
 
 | base | states cut at | val MLM | decision-dev | transfer-dev | Phase 1 holdout | JevBench | s/step |
 |---|---|---|---|---|---|---|---|
@@ -150,10 +168,16 @@ none in the evaluation splits (JevBench's longest state is 4,170 tokens).
 **Data:** `data/prepare_decision_data.py` tokenizes anything in Kev's suite schema, one
 JSON record per line, into `~/.cache/encoder-rtx/decision16k/<split>.parquet`. `SPLITS`
 lists the sources: Kev's pinned Hub and GitHub files, a file in any other Hub dataset repo
-(`hf:<repo>@<revision>`), or a local path; Phase 1's three splits are listed, pinned. `LABELS`
-joins a teacher's soft labels on (record id, question name), from a parquet at any of the same
-kinds of source, or d3-flash's labels for a split as `("d3", <source>)`, joined on
-(record index, question name) with each record's line hash and the source files checked.
+(`hf:<repo>@<revision>`), or a local path; Phase 1's (Recast NLP's) three splits are listed,
+pinned at `bd5ae231`. `LABELS` joins a teacher's soft labels on (record id, question name),
+from a parquet at any of the same kinds of source, or d3-flash's labels for a split as
+`("d3", <source>)`, joined on (record index, question name) with each record's line hash and
+the source files checked; `phase1_train` carries d3-flash's labels by default (all 121,503 of
+its questions). `BALANCE_NOULS` balances a split's yes/no questions to 0.5 true within each
+source (`phase1_train`: Recast NLP's renderer makes a two-class family's yes/no questions
+~0.75 true whatever the template, and that phrasing prior cost transfer-dev's yes/no families);
+the majority side is dropped by a hash of (record id, question name): 85,627 records ->
+81,953.
 
 ## Phase 0: `train_encoder.py`
 
