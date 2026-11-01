@@ -71,7 +71,7 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens_q, cu_seql
 REPO_ID = "ChrisMcCormick/climbmix_unigram16k_14_170"
 DATASET_DIR = os.path.expanduser("~/.cache/encoder-rtx/climbmix_unigram16k_14_170")
 
-NUM_TRAIN_SHARDS   = 10      # 100M raw tokens each; a 15-minute run reads about 7
+NUM_TRAIN_SHARDS   = 10      # 100M raw tokens each; a 2,605-step run reads about 6 (documents cut at 8,192)
 EVAL_BUFFER_TOKENS = 65536   # tokens per validation micro-batch
 
 

@@ -120,7 +120,7 @@ class StackConfig:
     d_vo:       int = 128   # Note: FA2 requires d_qk == d_vo, FA3 does not.
 
     # Context and Sliding Window Attention
-    seq_len:          int = 2048
+    seq_len:          int = 8192    # documents cut here; layers 3 and 7 see the whole of it
     short_win_size:   int = 256     # each way: the window is 2 x 256 + 1 wide
     full_ctxt_layers: list[int] = [3, 7]
     window_sizes:     list[tuple[int, int]]  # Derived below.
@@ -180,7 +180,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "encoderstack_rtx_dev"
-    run_name:        str = "mlm-base"  # both wandb and log files
+    run_name:        str = "mlm-base8k"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -204,16 +204,18 @@ ABORT_STEP = None
 # ui.perfetto.dev.
 PROFILE = False
 
-# Session knobs, from the environment (values logged below). Stripped once settled.
-cfg.num_steps  = int(os.environ.get("NUM_STEPS", cfg.num_steps))
+# Knobs, from the environment (values logged below).
 cfg.run_name   = os.environ.get("RUN_NAME", cfg.run_name)
 cfg.mask_rate  = float(os.environ.get("MASK_RATE", cfg.mask_rate))
 cfg.use_wandb  = bool(int(os.environ.get("USE_WANDB", int(cfg.use_wandb))))
 cfg.save_checkpoint = bool(int(os.environ.get("SAVE_CHECKPOINT", int(cfg.save_checkpoint))))
-LR_SCALE       = float(os.environ.get("LR_SCALE", 0.7))
 ABORT_STEP     = int(os.environ["ABORT_STEP"]) if "ABORT_STEP" in os.environ else ABORT_STEP
-print(f"Knobs: num_steps {cfg.num_steps} | run_name {cfg.run_name} | mask_rate {cfg.mask_rate} | "
-      f"use_wandb {cfg.use_wandb} | ABORT_STEP {ABORT_STEP} | LR_SCALE {LR_SCALE} | save_checkpoint {cfg.save_checkpoint}")
+print(f"Knobs: run_name {cfg.run_name} | mask_rate {cfg.mask_rate} | use_wandb {cfg.use_wandb} | "
+      f"ABORT_STEP {ABORT_STEP} | save_checkpoint {cfg.save_checkpoint}")
+
+# Every peak rate (Muon, AdamW, the scalars, the n-gram tables; the weight decays follow) at
+# 0.7x Baseline 6's: the MLM speedrun's fold. train_decision.py's lr_scale multiplies this.
+LR_SCALE = 0.7
 
 if cfg.use_wandb:
     assert "WANDB_API_KEY" in os.environ, "cfg.use_wandb=True but WANDB_API_KEY not set"
@@ -1659,7 +1661,7 @@ for step in range(cfg.num_steps + 1):
     if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
         torch.cuda.synchronize()
         val_t0 = time.perf_counter()
-        val_loader = data_generator("val", cfg.seq_len, cfg.train_batch_tokens)
+        val_loader = data_generator("val", 2048, cfg.train_batch_tokens)   # the standard validation: documents cut at 2,048, the same 3.30M positions every run
         total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
         total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
         for i in range(cfg.val_steps):
