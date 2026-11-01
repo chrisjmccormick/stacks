@@ -331,7 +331,10 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB
+    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB  (every layer at every row)
+    Layers 5-7, the source_readers, hold the read rows' (R, the corrupted positions) x_in,
+    y_inv_rms, x_attn_out and MLP activations, and layer 7 its q_hat, y and lse too: at
+    the 0.50 mask rate R = T/2, so they hold about 21GB in all.
     """
     #                                                            Stash (Tiny) Recompute
     x_in:               Tensor    # (L,  T,    D)             2.25GB
@@ -358,12 +361,12 @@ class LayerStash(NamedTuple):
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          288MB    layer-blend backward
-#   x_pool             (T, D)          288MB    pooling backward
-#   x_final_hat        (T, D)          288MB    final-norm backward
-#   x_final_inv_rms    (T, 1)   fp32   (0.8MB)
-#   x_mlm_hat          (M, D)          144MB    lm_head grad
+#   x_src_hat          (T, D)          288MB    the source_readers' attention input
+#   x_pool             (R, D)          144MB    pooling backward
+#   x_final_hat        (R, D)          144MB    lm_head grad + final-norm backward
+#   x_final_inv_rms    (R, 1)   fp32   (0.4MB)
 #   ngram_ids          (4, 2, T) int64  13MB    the n-gram tables' rows
-#                               TOTAL: 1.0GB
+#                               TOTAL: 0.9GB
 
 # Cast shorthands for the bodies below: the fp32 scalars/gates need explicit
 # bf16 casts at their use sites (see forward_backward's docstring), and the
@@ -401,7 +404,8 @@ def corrupt(tokens, num_targets, gen):
 @torch.no_grad()
 def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True):
     """One micro-batch through the model: the corrupted tokens `idx`, read out at
-    the M positions `pos` against `labels`. Use backward=False for validation."""
+    the M positions `pos` against `labels`. Use backward=False for validation (and
+    inference): the forward is the same."""
 
     # Direction naming:
     # A bare name is the forward pass; a 'b' on its leading symbol is the
@@ -419,8 +423,7 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
     # x_biased   - Layer input scaled by resid_lambda, biased by x0
     # x_src      - The source_layer's output, the source_readers' attention input
     # x_attn_out - Post-attention stream, the MLP's input
-    # x_final    - Post-pooling stream, feeding the lm_head
-    # x_mlm      - The final stream at the corrupted positions
+    # x_final    - Post-pooling stream, feeding the lm_head (at the read rows)
     #
     # RMS naming:
     # *_inv_rms  - 1/rms, used by RMS norm fwd and bwd.
@@ -443,9 +446,18 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
     assert T <= m.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {m.cos.size(1)}"
 
     cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, d_qk): [cos, cos] and [sin, -sin]
+
+    # The source_readers (layers 5-7) take Q, K, V and every gate from the source layer's
+    # output, so past the source layer only the rows whose final stream the loss reads need
+    # a stream of their own: here the corrupted positions, sorted. K and V stay at every row.
+    # cu_read counts the read rows before each segment boundary, for the FA2 calls whose
+    # queries are the read rows alone.
+    read = pos
+    cu_read = torch.searchsorted(read, cu_seqlens.long(), out_int32=True)
+    cos_read, sin_read = cos[read], sin[read]
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
     x_pool = None
-    x_src_hat = None
+    x_src_hat = x_src_hat_read = None
 
     # The n-gram memories' rows: each slot hashes the (corrupted) tokens at its offsets
     # from the position, the micro-batch's edges padded with their own token.
@@ -471,6 +483,7 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
 
     # The residual stream starts as the normed embedding.
     x = x0
+    x0_read = x0[read]
 
     # One LayerStash of forward activations per layer
     stash = []
@@ -479,9 +492,10 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
     for i in range(cfg.n_layers):
         x_in = x
 
-        # Scale residual stream, add gated input embedding
+        # Scale residual stream, add gated input embedding. The source_readers' stream is at the read rows.
+        x0_rows = x0_read if i in cfg.source_readers else x0
         x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
-        x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
+        x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0_rows
 
         # Attention input norm. Layer 0 attends from x0, the source_readers from the source stream.
         if i == 0:
@@ -492,12 +506,20 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
             x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
             x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
 
+        # The source_readers' queries and head gate are at the read rows. The full-context
+        # reader computes its queries there alone; FA2 places a window by row index, so the
+        # windowed readers compute theirs at every row and keep the read rows' output.
+        gather_q = i in cfg.source_readers and cfg.window_sizes[i] == (-1, -1)
+        q_in = x_src_hat_read if gather_q else x_biased_hat
+        head_in = x_src_hat_read if i in cfg.source_readers else x_biased_hat
+        q_cos, q_sin = (cos_read, sin_read) if gather_q else (cos, sin)
+
         # QKV Projections. Layer 0 looks its q, k, v up by token.
         if i == 0:
             q, k = F.embedding(idx, qkv0_vocab[:, :2 * cfg.d_model]).view(T, 2, cfg.n_qo_heads, cfg.d_qk).unbind(1)  # n_qo == n_kv
             v = F.embedding(idx, qkv0_vocab[:, 2 * cfg.d_model:]).view(T, cfg.n_kv_heads, cfg.d_vo)
         else:
-            q = (x_biased_hat @ m.W_Q.w[i].mT).view(T, cfg.n_qo_heads, cfg.d_qk)
+            q = (q_in @ m.W_Q.w[i].mT).view(-1, cfg.n_qo_heads, cfg.d_qk)
             k = (x_biased_hat @ m.W_K.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_qk)
             v = (x_biased_hat @ m.W_V.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_vo)
 
@@ -520,20 +542,22 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
         q_inv_rms = (q.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         k_inv_rms = (k.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         q, k = q.float() * q_inv_rms, k.float() * k_inv_rms
-        q_hat = bf16(q * cos + torch.roll(q, half, dims=-1) * sin)
+        q_hat = bf16(q * q_cos + torch.roll(q, half, dims=-1) * q_sin)
         k_hat = bf16(k * cos + torch.roll(k, half, dims=-1) * sin)
 
         # Read V from the residual streams both ways by matching their K.
-        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cu_seqlens, cfg.seq_len, cfg.seq_len, cfg.window_sizes[i])
+        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_read if gather_q else cu_seqlens, cu_seqlens,
+                                           cfg.seq_len, cfg.seq_len, cfg.window_sizes[i])
         y = y.contiguous()
+        y_out = y[read] if (i in cfg.source_readers and not gather_q) else y   # the rows that continue
 
         # Per-head output norm and gate
-        y_inv_rms = (y.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
-        head_gate_a = 2 * torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T, n_qo_heads)
-        y_gated = bf16(y.float() * y_inv_rms * head_gate_a.unsqueeze(-1))
+        y_inv_rms = (y_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        head_gate_a = 2 * torch.sigmoid(head_in[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T or R, n_qo_heads)
+        y_gated = bf16(y_out.float() * y_inv_rms * head_gate_a.unsqueeze(-1))
 
         # Project value heads onto their output heads.
-        attn_out = y_gated.view(T, -1) @ m.W_O.w[i].mT
+        attn_out = y_gated.flatten(1) @ m.W_O.w[i].mT
 
         # Write back to the stream.
         x_attn_out = x_biased + attn_out
@@ -552,10 +576,12 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
         # Write back to the stream.
         x = x_attn_out + mlp_out_hat        # the residual stream; appears as xb in bwd
 
-        # The source layer's output is the source_readers' attention input.
+        # The source layer's output is the source_readers' attention input. Past it, the
+        # stream continues at the read rows only.
         if i == cfg.source_layer:
             x_src_inv_rms = (x.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
             x_src_hat = bf16(x.float() * x_src_inv_rms)
+            x, x_src_hat_read = x[read], x_src_hat[read]
 
         # Stash the pool layer's output, to add it onto the final stream.
         if i == cfg.pool_layer:
@@ -578,8 +604,8 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
     # -----------------------------
     #           MLM Head
     # -----------------------------
-    # Only the corrupted positions are read out, M of them.
-    x_mlm_hat = x_final_hat[pos]    # (M, D)
+    # Only the corrupted positions are read out, M of them: the read rows.
+    x_mlm_hat = x_final_hat         # (M, D)
     tgt = labels.unsqueeze(1)       # (M, 1)
 
     # ==== Forward ====
@@ -622,8 +648,8 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
     m.lm_head.grad.copy_((logitsb.mT @ x_mlm_hat).float()) # (d_vocab, M) @ (M, d_model) --> (d_vocab, d_model)
 
     # The backward streams start as weighted sums of the head embeddings
-    # that they (meaningfully) predicted, at the corrupted positions; zero elsewhere.
-    xb_final_hat = torch.zeros_like(x_final_hat).index_copy_(0, pos, logitsb @ m.lm_head.w) # (T, d_model)
+    # that they (meaningfully) predicted, at the corrupted positions (the read rows).
+    xb_final_hat = logitsb @ m.lm_head.w   # (M, d_model)
     del logitsb
 
     # -----------------------------
@@ -651,9 +677,9 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
     m.pool_lambda.grad.copy_(sum32(xb_final * x_pool))  # (T, d_model)
 
     # xb updates every layer, keep xb_final for the pool layer.
-    xb = xb_final                       # grad wrt layer num_layers-1's output
-    x0b = torch.zeros_like(x0)          # accumulates over layers
-    xb_src_hat = torch.zeros_like(x0)   # accumulates over the source_readers
+    xb = xb_final                       # grad wrt layer num_layers-1's output, at the read rows
+    x0b = torch.zeros_like(x0_read)     # accumulates over layers; at the read rows down to the source_readers
+    xb_src_hat = torch.zeros_like(x0)   # accumulates over the source_readers, at every row
 
     # For each layer in reverse order,
     for i in reversed(range(cfg.n_layers)):
@@ -690,33 +716,49 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
 
         xb_attn_out = xb + bf16(x_attn_out_inv_rms * (xb_attn_out_hat.float() - (x_attn_out_hat.float() * (x_attn_out_hat.float() * xb_attn_out_hat.float()).mean(dim=-1, keepdim=True))))
 
-        # Attention backward
+        # Attention backward. The source_readers' output, queries and head gate are at the
+        # read rows; their keys and values at every row.
         x_biased_hat = st.x_biased_hat
-        y_hat = st.y.float() * st.y_inv_rms
-        head_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T, n_qo_heads)
-        m.W_O.gbank[i].copy_(xb_attn_out.mT @ bf16(y_hat * (2 * head_gate_sig).unsqueeze(-1)).view(T, -1))
-        yb_gated = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo).float()
+        gather_q = i in cfg.source_readers and cfg.window_sizes[i] == (-1, -1)
+        head_in = x_src_hat_read if i in cfg.source_readers else x_biased_hat
+        y_out = st.y[read] if (i in cfg.source_readers and not gather_q) else st.y
+        y_hat = y_out.float() * st.y_inv_rms
+        head_gate_sig = torch.sigmoid(head_in[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T or R, n_qo_heads)
+        m.W_O.gbank[i].copy_(xb_attn_out.mT @ bf16(y_hat * (2 * head_gate_sig).unsqueeze(-1)).flatten(1))
+        yb_gated = (xb_attn_out @ m.W_O.w[i]).view(-1, cfg.n_qo_heads, cfg.d_vo).float()
 
         # Head gate backward
-        head_gateb_z = bf16((yb_gated * y_hat).sum(dim=-1) * (2 * head_gate_sig * (1 - head_gate_sig)))   # (T, n_qo_heads)
-        m.head_gate.gbank[i].copy_(head_gateb_z.mT @ x_biased_hat[..., :cfg.d_gate])
+        head_gateb_z = bf16((yb_gated * y_hat).sum(dim=-1) * (2 * head_gate_sig * (1 - head_gate_sig)))   # (T or R, n_qo_heads)
+        m.head_gate.gbank[i].copy_(head_gateb_z.mT @ head_in[..., :cfg.d_gate])
         yb_hat = yb_gated * (2 * head_gate_sig).unsqueeze(-1)
         yb = bf16(st.y_inv_rms * (yb_hat - y_hat * (y_hat * yb_hat).mean(dim=-1, keepdim=True)))
 
-        # Grads w.r.t. the gate slices of x_biased_hat
+        # Grads w.r.t. the gate slices of x_biased_hat (the source_readers' head gate's go with their queries')
         xb_gates = torch.zeros(T, 3 * cfg.d_gate, dtype=torch.bfloat16, device=device)
-        xb_gates[:, :cfg.d_gate] += head_gateb_z @ m.head_gate.w[i]
+        xb_head_gate = head_gateb_z @ m.head_gate.w[i]
+        if i not in cfg.source_readers:
+            xb_gates[:, :cfg.d_gate] += xb_head_gate
 
+        # A windowed reader's queries ran at every row: its output grad is zero off the read rows.
+        if i in cfg.source_readers and not gather_q:
+            yb = torch.zeros_like(st.y).index_copy_(0, read, yb)
         qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
-            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_seqlens, cu_seqlens, cfg.seq_len, cfg.seq_len,
-            cfg.window_sizes[i])
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_read if gather_q else cu_seqlens, cu_seqlens,
+            cfg.seq_len, cfg.seq_len, cfg.window_sizes[i])
+
+        # The queries' grads at the rows they continue from (zero elsewhere).
+        q_hat, q_inv_rms, q_cos, q_sin = st.q_hat, st.q_inv_rms, cos, sin
+        if i in cfg.source_readers:
+            q_cos, q_sin = cos_read, sin_read
+            if not gather_q:
+                qb_hat, q_hat, q_inv_rms = qb_hat[read], q_hat[read], q_inv_rms[read]
 
         # per-(token, head) norm backward
-        qb = bf16(st.q_inv_rms * (qb_hat.float() - st.q_hat.float() * (st.q_hat.float() * qb_hat.float()).mean(dim=-1, keepdim=True)))
+        qb = bf16(q_inv_rms * (qb_hat.float() - q_hat.float() * (q_hat.float() * qb_hat.float()).mean(dim=-1, keepdim=True)))
         kb = bf16(st.k_inv_rms * (kb_hat.float() - st.k_hat.float() * (st.k_hat.float() * kb_hat.float()).mean(dim=-1, keepdim=True)))
 
         # rotary backward = rotation by -theta (transpose of the forward rotation)
-        qb = qb * cos - torch.roll(qb, half, dims=-1) * sin
+        qb = qb * q_cos - torch.roll(qb, half, dims=-1) * q_sin
         kb = kb * cos - torch.roll(kb, half, dims=-1) * sin
 
         # --- VE gate backward (ve and ve_gate_sig recomputed) ---
@@ -768,7 +810,7 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
                     + m.ngram_values.lr_bc_t[t_step] * (ngram_grad / (ngram_mntm.sqrt() + m.ngram_values.eps_t[t_step]))))
 
         # vb passes through the value adds unchanged: v = v0 + ve_gate_a*ve + ...
-        qb = qb.view(T, cfg.n_qo_heads * cfg.d_qk)
+        qb = qb.flatten(1)
         kb = kb.view(T, cfg.n_kv_heads * cfg.d_qk)
         vb = vb.reshape(T, cfg.n_kv_heads * cfg.d_vo)
 
@@ -782,6 +824,17 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
             m.W_V.gbank[0].copy_(W_qkv0b[2 * cfg.d_model:])
             x0b_vocab = qkv0b_vocab @ W_qkv0                   # (d_vocab, D)
             xb_biased_hat = F.pad(xb_gates, (0, cfg.d_model - 3 * cfg.d_gate))
+        elif i in cfg.source_readers:
+            # Keys and values read every row of the source stream; queries and the head gate the read rows.
+            m.W_Q.gbank[i].copy_(qb.mT @ head_in)
+            m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
+            m.W_V.gbank[i].copy_(vb.mT @ x_biased_hat)
+
+            xb_biased_hat = kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
+            xb_biased_hat[:, :3 * cfg.d_gate] += xb_gates
+            xb_read_hat = qb @ m.W_Q.w[i]
+            xb_read_hat[:, :cfg.d_gate] += xb_head_gate
+            xb_biased_hat.index_add_(0, read, xb_read_hat)
         else:
             m.W_Q.gbank[i].copy_(qb.mT @ x_biased_hat)
             m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
@@ -802,9 +855,10 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
 
         # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0_gate*x0,
         #     x0_gate = 2*sigmoid(x0_gates[i] * mean_c(x_in)) ---
+        x0_rows    = x0_read if i in cfg.source_readers else x0
         x_in_mean  = st.x_in.float().mean(dim=-1, keepdim=True)                         # (T, 1)
         x0_gate    = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in_mean)                   # (T, 1)
-        x0_dot     = (xb_biased * x0).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
+        x0_dot     = (xb_biased * x0_rows).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
         x0_gateb_z = x0_dot * m.x0_lambdas.w[i] * x0_gate * (1.0 - 0.5 * x0_gate)       # (T, 1)
         g_resid.append(sum32(xb_biased * st.x_in))
         g_x0.append((x0_dot * x0_gate).sum())
@@ -813,8 +867,11 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
         xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
 
         # TRAP: the source layer's output (this layer's input) also fed the source_readers' attention.
+        # Below them every row has a stream again: the read rows' grads scatter back into it.
         if i == cfg.source_layer + 1:
+            xb = torch.zeros_like(x0).index_copy_(0, read, xb)
             xb = xb + bf16(x_src_inv_rms * (xb_src_hat.float() - (x_src_hat.float() * (x_src_hat.float() * xb_src_hat.float()).mean(dim=-1, keepdim=True))))
+            x0b = torch.zeros_like(x0).index_copy_(0, read, x0b)
         stash[i] = None                          # free this layer's stash as we go
 
     # Land the per-layer resid/x0/x0-gate scalar sums (collected in REVERSED
