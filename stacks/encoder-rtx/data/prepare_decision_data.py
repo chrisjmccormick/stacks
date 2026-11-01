@@ -62,7 +62,7 @@ TOKENIZER = CACHE / "climbmix_unigram16k_14_170" / "tokenizer" / "tokenizer.json
 # repo's evals/ folder.
 KEV_HF_REPO, KEV_HF_REV = "jaredpalmer/kev-suites", "cc4bac803e73112689ec327ffa481c519cbc7a05"
 KEV_GH = "https://raw.githubusercontent.com/jaredpalmer/kev/2074cc44256200bb37540103fa4572901faa10f3/evals"
-PHASE1 = "hf:ChrisMcCormick/encoder-rtx-phase1@4fc7009f7ad9961d1f8db343efbb868320410700"
+PHASE1 = "hf:ChrisMcCormick/encoder-rtx-phase1@bd5ae2311ba3da440a1183fc80c68d678786b505"
 
 # Output split -> the files it concatenates, each (where, path): "hf" is Kev's Hub repo and
 # "gh" its GitHub evals/ folder, both pinned above; "hf:<repo>@<revision>" is any other Hub
@@ -80,8 +80,8 @@ SPLITS = {
     "transfer_dev":   [("gh", "v4/transfer-v4/development.jsonl")],
     "transfer_test":  [("gh", "v4/transfer-v4/test.jsonl")],
     # Phase 1 (agent-ops-stacks encoder-rtx/2026-10-29_0724pm_phase1-instruction-data): labelled
-    # NLP datasets with many phrasings per task. This revision predates the review's fixes.
-    "phase1_train":    [(PHASE1, "data/train.jsonl")],       # 27 families
+    # NLP datasets with many phrasings per task. This revision has the review's fixes (review/FIXES.md there).
+    "phase1_train":    [(PHASE1, "data/train.jsonl")],       # 27 families, 85,627 records
     "phase1_holdout":  [(PHASE1, "data/holdout.jsonl")],     # clinc150, formality, health_fact: never in train
     "phase1_jevbench": [(PHASE1, "data/jevbench.jsonl")],    # JevBench v1.2's 231 public items, eval only
 }
