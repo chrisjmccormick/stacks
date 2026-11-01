@@ -120,8 +120,11 @@ It is stage 1's script with Phase 0's decision path brought in:
 - **Evaluation:** the base's own MLM validation, on the same 3.30M corrupted positions (the
   loaded 8K base reads its run's 1.7790). Plus accuracy and Brier score on the clean rows
   of decision-v7 and transfer-v4 development, Phase 1's holdout families (clinc150,
-  formality, health_fact) and JevBench's 231 public items, with accuracy by source and by
-  state length (over / under 2,048 tokens) at the end.
+  formality, health_fact), JevBench's 231 public items and Cookbook-dev (798 records shaped
+  like TypeSafe's cookbooks: a 194-way skill choice, 10-Ks over 75 SIC groups, a same-product
+  yes/no with a 0.849 majority, citation checks; eval only), with accuracy by source and by
+  state length (over / under 2,048 tokens) at the end. Read Cookbook-dev by source: its
+  overall figure follows entity_alignment's yes/no lean, which flips between runs.
 - Knobs from the environment, logged: `EPOCHS` (2), `DECISION_FRAC` (0.5), `LR_SCALE`
   (0.3), `SOFT_WEIGHT` (1.0), `DECISION_WEIGHT` (1.0), `TRAIN_SPLITS` (`train,phase1_train`:
   any splits the data prep writes; `train` alone is Kev's records), `STATE_CAP` (8192), `INIT_FROM`,
@@ -136,6 +139,10 @@ families at `bd5ae231`; agent-ops-stacks `encoder-rtx/2026-11-01_1203am_decision
 | Kev's, one pass (the previous default, `TRAIN_SPLITS=train EPOCHS=1`) | 3 seeds | 1.835 | 0.638 / 0.635 / 0.646 | 0.508 / 0.497 / 0.494 | 0.443 / 0.445 / 0.449 | 0.437 / 0.381 / 0.398 | 145 | 0.318 |
 | **Kev's + Recast NLP's (d3 labels, nouls balanced), two passes** | 3 seeds (session) | 1.822 | 0.718 / 0.726 / 0.718 | 0.512 / 0.502 / 0.497 | 0.531 / 0.538 / 0.547 | 0.485 / 0.446 / 0.472 | 616 | 0.330 |
 | the same, the committed data prep (seed 42: the defaults with no knobs; 43 / 44: the session's variant with a seed knob) | 3 seeds | 1.820 | 0.704 / 0.714 / 0.710 | 0.508 / 0.488 / 0.482 | 0.527 / 0.532 / 0.546 | 0.468 / 0.472 / 0.498 | 616 | 0.328 |
+
+On Cookbook-dev the committed defaults read 0.535 overall: skill suggestion 33 / 280 (d3-flash
+0.929; majority 0.029), the 10-K question 13 / 60 (0.650; 0.167), entity_alignment 378 / 450
+(0.913; 0.849), citation_check 3 / 8; Kev-only runs read 27-30 and 3 on the first two.
 
 The new mix lifts every in-distribution and Jev-shaped number at every seed and holds
 transfer-dev (the committed data path against Kev-only, seed means: +0.07 decision-dev, +0.09

@@ -84,6 +84,9 @@ SPLITS = {
     "phase1_train":    [(PHASE1, "data/train.jsonl")],       # 27 families, 85,627 records
     "phase1_holdout":  [(PHASE1, "data/holdout.jsonl")],     # clinc150, formality, health_fact: never in train
     "phase1_jevbench": [(PHASE1, "data/jevbench.jsonl")],    # JevBench v1.2's 231 public items, eval only
+    # Cookbook-dev (agent-ops-stacks encoder-rtx/2026-11-01_1208am_cookbook-dev-eval): TypeSafe's
+    # cookbooks as decision records, one gold question each, eval only (never train on it).
+    "cookbook_dev":    [("hf:ChrisMcCormick/encoder-rtx-cookbook-dev@406c2af0245737cd29c83f0d941be63156ba5990", "data/cookbook_dev.jsonl")],
 }
 
 # Soft labels from a teacher, joined onto a split's records: split -> (where, path) of a

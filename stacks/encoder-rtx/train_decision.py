@@ -1159,7 +1159,7 @@ rng = np.random.default_rng(cfg.seed)
 # base never read.
 val_docs = doc_stream("val", bos_id)
 eval_records = {split: load_records(split, cfg.state_cap, cfg.soft_weight)
-                for split in ("decision_dev", "transfer_dev", "phase1_holdout", "phase1_jevbench")}
+                for split in ("decision_dev", "transfer_dev", "phase1_holdout", "phase1_jevbench", "cookbook_dev")}
 eval_plans = {split: plan_packs(records, val_docs, cfg.train_batch_tokens, 0.9, cfg.seq_len, rng)
               for split, records in eval_records.items()}
 train_records = [r for split in cfg.train_splits for r in load_records(split, cfg.state_cap, cfg.soft_weight)]
@@ -2014,11 +2014,13 @@ for step in range(cfg.num_steps + 1):
         stats.xfer_acc, stats.xfer_brier, n_xfer, *_ = dec["transfer_dev"]
         stats.p1_acc, stats.p1_brier, n_p1, *_ = dec["phase1_holdout"]
         stats.jev_acc, stats.jev_brier, n_jev, *_ = dec["phase1_jevbench"]
+        cook_acc, cook_brier, n_cook, *_ = dec["cookbook_dev"]   # read it per source: see the last validation's breakdown
         print0(f"step:{step}/{cfg.num_steps} val_mlm:{val_mlm:.4f} val_mbpb:{val_mbpb:.4f} | decision_dev acc:{stats.dec_acc:.4f} "
                f"brier:{stats.dec_brier:.4f} (n={n_dec}) | transfer_dev acc:{stats.xfer_acc:.4f} "
                f"brier:{stats.xfer_brier:.4f} (n={n_xfer}) | phase1_holdout acc:{stats.p1_acc:.4f} "
                f"brier:{stats.p1_brier:.4f} (n={n_p1}) | jevbench acc:{stats.jev_acc:.4f} "
-               f"brier:{stats.jev_brier:.4f} (n={n_jev}) | val_time:{val_elapsed:.2f}s", console=True)
+               f"brier:{stats.jev_brier:.4f} (n={n_jev}) | cookbook_dev acc:{cook_acc:.4f} brier:{cook_brier:.4f} "
+               f"(n={n_cook}) | val_time:{val_elapsed:.2f}s", console=True)
         if last_step:
             for split, (*_, by_source, by_variant, by_state_len) in dec.items():
                 print0(f"  {split} accuracy by source: " + ", ".join(
