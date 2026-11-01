@@ -289,7 +289,8 @@ def load_records(split, state_cap, soft_weight):
     state's ids (its first state_cap tokens), and per question its prefix ids, its
     options' ids (each ending in its readout token) and a target distribution over the
     options -- soft_weight x the record's soft target + the rest on the label, where it
-    has a soft target, else the label one-hot."""
+    has a soft target, else the label one-hot -- plus the soft target itself (`soft`, or
+    None), which validation scores the KL against."""
     import pyarrow.parquet as pq
     records = []
     for r in pq.read_table(os.path.join(DECISION_DIR, f"{split}.parquet")).to_pylist():
@@ -302,7 +303,8 @@ def load_records(split, state_cap, soft_weight):
                 prefix=np.array(prefix, dtype=np.int32),
                 options=[np.array(o, dtype=np.int32) for o in options],
                 target=(soft_weight * np.array(target, dtype=np.float32) + (1 - soft_weight) * hard
-                        if target else hard)))
+                        if target else hard),
+                soft=np.array(target, dtype=np.float32) if target else None))
         records.append(dict(split=split, id=r["id"], source=r["source"], variant=r["variant"],
                             state=np.array(r["state_ids"][:state_cap], dtype=np.int32),
                             state_len=len(r["state_ids"]), questions=questions))

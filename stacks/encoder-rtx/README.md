@@ -136,6 +136,15 @@ It is stage 1's script with Phase 0's decision path brought in:
   yes/no with a 0.849 majority, citation checks; eval only), with accuracy by source and by
   state length (over / under 2,048 tokens) at the end. Read Cookbook-dev by source: its
   overall figure follows entity_alignment's yes/no lean, which flips between runs.
+- **Continuous scores beside accuracy:** each split also reports log loss against the label
+  and the KL from d3-flash's distribution, both in nats per question. The data prep joins d3's
+  labels (`encoder-rtx-labels`) onto every evaluation split for this; accuracy, Brier and log
+  loss still read the labels. Accuracy flips when a yes/no lean crosses 0.5. Across seeds, log
+  loss and the KL separate two configs where accuracy doesn't (agent-ops-stacks
+  `encoder-rtx/2026-11-01_0703am_mlm-token-ladder`, `metric_noise.py`): screen on them.
+  d3-flash's own scores on the clean rows (accuracy / Brier / log loss): decision-dev 0.845 /
+  0.214 / 0.401, transfer-dev 0.840 / 0.237 / 0.486, Phase 1 holdout 0.775 / 0.296 / 0.494,
+  JevBench 0.823 / 0.214 / 0.361, Cookbook-dev 0.900 / 0.152 / 0.337.
 - Knobs from the environment, logged: `EPOCHS` (2), `DECISION_FRAC` (0.5), `LR_SCALE`
   (0.3), `SOFT_WEIGHT` (1.0), `DECISION_WEIGHT` (1.0), `TRAIN_SPLITS` (`train,phase1_train`:
   any splits the data prep writes; `train` alone is Kev's records), `STATE_CAP` (8192), `INIT_FROM`,

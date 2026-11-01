@@ -1724,18 +1724,28 @@ class StepStats:
     tok_per_sec:  int   | None = None   # "
     mfu:          float | None = None   # "
 
-    # Validation, on val steps only: the MLM base's MLM validation, and accuracy and
-    # Brier score (summed over options) on the clean rows of each decision split
+    # Validation, on val steps only: the MLM base's MLM validation, and on the clean rows of
+    # each decision split accuracy, Brier score (summed over options) and log loss against the
+    # label, and the KL from d3-flash's distribution (nats per question; the data prep joins
+    # d3's labels onto every evaluation split)
     mlm:          float | None = None   # nats per corrupted position
     mbpb:         float | None = None   # bits per byte of the corrupted positions' tokens
     dec_acc:      float | None = None   # decision-v7 development
     dec_brier:    float | None = None
+    dec_logloss:  float | None = None
+    dec_kl:       float | None = None
     xfer_acc:     float | None = None   # transfer-v4 development (Kev-0.8B: 0.648)
     xfer_brier:   float | None = None
-    p1_acc:       float | None = None   # Phase 1's holdout families (d3-flash: not yet scored)
+    xfer_logloss: float | None = None
+    xfer_kl:      float | None = None
+    p1_acc:       float | None = None   # Phase 1's holdout families
     p1_brier:     float | None = None
+    p1_logloss:   float | None = None
+    p1_kl:        float | None = None
     jev_acc:      float | None = None   # JevBench's public items (d3-flash: 0.823, Kev-27B: 0.887)
     jev_brier:    float | None = None
+    jev_logloss:  float | None = None
+    jev_kl:       float | None = None
     eval_seconds: float | None = None
 
     # Run clocks, in minutes; stamped by log_step
@@ -1746,8 +1756,9 @@ class StepStats:
 
 # Field -> wandb panel. A field not named here lands under `train/`.
 WANDB_GROUPS = {
-    "val":  ("mlm", "mbpb", "dec_acc", "dec_brier", "xfer_acc", "xfer_brier", "p1_acc", "p1_brier",
-             "jev_acc", "jev_brier", "eval_seconds"),
+    "val":  ("mlm", "mbpb", "dec_acc", "dec_brier", "dec_logloss", "dec_kl", "xfer_acc", "xfer_brier",
+             "xfer_logloss", "xfer_kl", "p1_acc", "p1_brier", "p1_logloss", "p1_kl",
+             "jev_acc", "jev_brier", "jev_logloss", "jev_kl", "eval_seconds"),
     "time": ("train_total", "wall_total", "eta"),
 }
 _WANDB_PREFIX = {f: g for g, fs in WANDB_GROUPS.items() for f in fs}
@@ -1769,12 +1780,20 @@ class RunResult:
     val_mbpb:           float | None = None
     dec_acc:            float | None = None
     dec_brier:          float | None = None
+    dec_logloss:        float | None = None
+    dec_kl:             float | None = None
     xfer_acc:           float | None = None
     xfer_brier:         float | None = None
+    xfer_logloss:       float | None = None
+    xfer_kl:            float | None = None
     p1_acc:             float | None = None
     p1_brier:           float | None = None
+    p1_logloss:         float | None = None
+    p1_kl:              float | None = None
     jev_acc:            float | None = None
     jev_brier:          float | None = None
+    jev_logloss:        float | None = None
+    jev_kl:             float | None = None
 
     # The cost, in minutes
     train_time:         float        = 0.0
@@ -1929,8 +1948,10 @@ val_rest = dict(pos=torch.arange(EVAL_BUFFER_TOKENS, dtype=torch.int32, device=d
 def validate():
     """The MLM base's validation -- nats per corrupted position and bits per corrupted
     byte, on the same 3.30M positions as the base's own run -- and, on each decision
-    split's clean rows, (accuracy, Brier score summed over options, questions, accuracy
-    by source, accuracy by variant over every row) from the evaluation packs."""
+    split's clean rows, (accuracy, Brier score summed over options, questions, log loss
+    against the label, KL from the soft target (d3-flash's distribution) where a question
+    has one, how many do, accuracy by source, by variant over every row, by state length)
+    from the evaluation packs."""
     val_loader = val_generator(2048, cfg.train_batch_tokens)   # the MLM base's validation: documents cut at 2,048
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
     total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
@@ -1946,8 +1967,8 @@ def validate():
 
     result = {}
     for split, (packs, scored) in eval_packs.items():
-        right = total = 0
-        brier = 0.0
+        right = total = n_soft = 0
+        brier = nll = kl = 0.0
         by_source, by_variant, by_state_len = {}, {}, {}
         for i, pk in enumerate(pack_loader(packs)):
             e_idx, e_pos, e_labels = corrupt(pk.tokens, cfg.eval_targets, val_gen.manual_seed(2000 + i), pk.filler_start)
@@ -1967,13 +1988,19 @@ def validate():
                 right += hit
                 total += 1
                 brier += float(((probs - np.eye(n)[label]) ** 2).sum())
+                nll -= math.log(max(float(probs[label]), 1e-9))
+                if q["soft"] is not None:   # the teacher's distribution, to the pack's option order
+                    t = q["soft"][perm].astype(np.float64)
+                    kl += float((t * (np.log(np.maximum(t, 1e-12)) - np.log(np.maximum(probs, 1e-9)))).sum())
+                    n_soft += 1
                 source = by_source.setdefault(r["source"], [0, 0])
                 source[0] += hit
                 source[1] += 1
                 length = by_state_len.setdefault("state > 2,048" if r["state_len"] > 2048 else "state <= 2,048", [0, 0])
                 length[0] += hit
                 length[1] += 1
-        result[split] = (right / total, brier / total, total, by_source, by_variant, by_state_len)
+        result[split] = (right / total, brier / total, total, nll / total, kl / n_soft if n_soft else float("nan"),
+                         n_soft, by_source, by_variant, by_state_len)
     return val_mlm, val_mbpb, result
 
 
@@ -2010,16 +2037,18 @@ for step in range(cfg.num_steps + 1):
         val_elapsed = time.perf_counter() - val_t0
         total_val_time += val_elapsed
         stats.mlm, stats.mbpb, stats.eval_seconds = val_mlm, val_mbpb, val_elapsed
-        stats.dec_acc, stats.dec_brier, n_dec, *_ = dec["decision_dev"]
-        stats.xfer_acc, stats.xfer_brier, n_xfer, *_ = dec["transfer_dev"]
-        stats.p1_acc, stats.p1_brier, n_p1, *_ = dec["phase1_holdout"]
-        stats.jev_acc, stats.jev_brier, n_jev, *_ = dec["phase1_jevbench"]
-        cook_acc, cook_brier, n_cook, *_ = dec["cookbook_dev"]   # read it per source: see the last validation's breakdown
+        stats.dec_acc, stats.dec_brier, n_dec, stats.dec_logloss, stats.dec_kl, *_ = dec["decision_dev"]
+        stats.xfer_acc, stats.xfer_brier, n_xfer, stats.xfer_logloss, stats.xfer_kl, *_ = dec["transfer_dev"]
+        stats.p1_acc, stats.p1_brier, n_p1, stats.p1_logloss, stats.p1_kl, *_ = dec["phase1_holdout"]
+        stats.jev_acc, stats.jev_brier, n_jev, stats.jev_logloss, stats.jev_kl, *_ = dec["phase1_jevbench"]
+        cook_acc, cook_brier, n_cook, cook_logloss, cook_kl, *_ = dec["cookbook_dev"]   # read it per source: see the last validation's breakdown
         print0(f"step:{step}/{cfg.num_steps} val_mlm:{val_mlm:.4f} val_mbpb:{val_mbpb:.4f} | decision_dev acc:{stats.dec_acc:.4f} "
-               f"brier:{stats.dec_brier:.4f} (n={n_dec}) | transfer_dev acc:{stats.xfer_acc:.4f} "
-               f"brier:{stats.xfer_brier:.4f} (n={n_xfer}) | phase1_holdout acc:{stats.p1_acc:.4f} "
-               f"brier:{stats.p1_brier:.4f} (n={n_p1}) | jevbench acc:{stats.jev_acc:.4f} "
-               f"brier:{stats.jev_brier:.4f} (n={n_jev}) | cookbook_dev acc:{cook_acc:.4f} brier:{cook_brier:.4f} "
+               f"brier:{stats.dec_brier:.4f} logloss:{stats.dec_logloss:.4f} kl_d3:{stats.dec_kl:.4f} (n={n_dec}) | "
+               f"transfer_dev acc:{stats.xfer_acc:.4f} brier:{stats.xfer_brier:.4f} logloss:{stats.xfer_logloss:.4f} "
+               f"kl_d3:{stats.xfer_kl:.4f} (n={n_xfer}) | phase1_holdout acc:{stats.p1_acc:.4f} brier:{stats.p1_brier:.4f} "
+               f"logloss:{stats.p1_logloss:.4f} kl_d3:{stats.p1_kl:.4f} (n={n_p1}) | jevbench acc:{stats.jev_acc:.4f} "
+               f"brier:{stats.jev_brier:.4f} logloss:{stats.jev_logloss:.4f} kl_d3:{stats.jev_kl:.4f} (n={n_jev}) | "
+               f"cookbook_dev acc:{cook_acc:.4f} brier:{cook_brier:.4f} logloss:{cook_logloss:.4f} kl_d3:{cook_kl:.4f} "
                f"(n={n_cook}) | val_time:{val_elapsed:.2f}s", console=True)
         if last_step:
             for split, (*_, by_source, by_variant, by_state_len) in dec.items():
@@ -2152,10 +2181,9 @@ result = RunResult(
 result.init_time = packs_time / 60
 if final_val is not None:
     result.val_mlm, result.val_mbpb = final_val.mlm, final_val.mbpb
-    result.dec_acc, result.dec_brier = final_val.dec_acc, final_val.dec_brier
-    result.xfer_acc, result.xfer_brier = final_val.xfer_acc, final_val.xfer_brier
-    result.p1_acc, result.p1_brier = final_val.p1_acc, final_val.p1_brier
-    result.jev_acc, result.jev_brier = final_val.jev_acc, final_val.jev_brier
+    for f in ("dec", "xfer", "p1", "jev"):
+        for metric in ("acc", "brier", "logloss", "kl"):
+            setattr(result, f"{f}_{metric}", getattr(final_val, f"{f}_{metric}"))
 
 row = asdict(result)
 with open(result_path, "w") as f:
@@ -2167,10 +2195,10 @@ wandb_run.log({"step": cfg.num_steps,
 print0(f"== {result.run_name} ==", console=True)
 if result.val_mlm is not None:
     print0(f"  val_mlm {result.val_mlm:.4f} nats per corrupted position | val_mbpb {result.val_mbpb:.4f} | "
-           f"decision_dev acc {result.dec_acc:.4f} brier {result.dec_brier:.4f} | "
-           f"transfer_dev acc {result.xfer_acc:.4f} brier {result.xfer_brier:.4f} (Kev-0.8B: 0.648) | "
-           f"phase1_holdout acc {result.p1_acc:.4f} brier {result.p1_brier:.4f} | "
-           f"jevbench acc {result.jev_acc:.4f} brier {result.jev_brier:.4f} (d3-flash: 0.823)", console=True)
+           f"decision_dev acc {result.dec_acc:.4f} brier {result.dec_brier:.4f} logloss {result.dec_logloss:.4f} kl_d3 {result.dec_kl:.4f} | "
+           f"transfer_dev acc {result.xfer_acc:.4f} brier {result.xfer_brier:.4f} logloss {result.xfer_logloss:.4f} kl_d3 {result.xfer_kl:.4f} (Kev-0.8B: 0.648) | "
+           f"phase1_holdout acc {result.p1_acc:.4f} brier {result.p1_brier:.4f} logloss {result.p1_logloss:.4f} kl_d3 {result.p1_kl:.4f} | "
+           f"jevbench acc {result.jev_acc:.4f} brier {result.jev_brier:.4f} logloss {result.jev_logloss:.4f} kl_d3 {result.jev_kl:.4f} (d3-flash: 0.823)", console=True)
 print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | init {result.init_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
 if timed:
     print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)

@@ -96,8 +96,15 @@ SPLITS = {
 # 2026-10-29_0724pm_d3-teacher-labels), whose source reads the split's files in the same
 # order: joined on (record index, question name), each record's line checked by its sha256.
 # A question with a table entry gets that target in place of its own.
-LABELS: dict[str, tuple] = {"phase1_train": ("d3", "phase1_train")}
-D3_LABELS_REPO, D3_LABELS_REV = "ChrisMcCormick/encoder-rtx-labels", "26f5c25caea8624620253b8ca7f2297cde12b429"   # phase1_train's 86 shards done
+# The evaluation splits carry d3's distributions too, for train_decision.py's KL-to-teacher score;
+# their accuracy, Brier and log loss still read the labels.
+LABELS: dict[str, tuple] = {"phase1_train":    ("d3", "phase1_train"),
+                            "decision_dev":    ("d3", "kev_decision_dev"),
+                            "transfer_dev":    ("d3", "kev_transfer_dev"),
+                            "phase1_holdout":  ("d3", "phase1_holdout"),
+                            "phase1_jevbench": ("d3", "phase1_jevbench"),
+                            "cookbook_dev":    ("d3", "cookbook_dev")}
+D3_LABELS_REPO, D3_LABELS_REV = "ChrisMcCormick/encoder-rtx-labels", "05b90afee81808824fff9092391766fb494c34af"   # + phase1_holdout / phase1_jevbench
 
 # Yes/no questions balanced to 0.5 true within each source, for the splits listed here. Recast
 # NLP's renderer asks a by-label noul about the gold class half the time and a random class
