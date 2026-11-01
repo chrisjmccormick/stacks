@@ -77,7 +77,7 @@ REPO_ID = "ChrisMcCormick/climbmix_unigram16k_14_170"
 DATASET_DIR = os.path.expanduser("~/.cache/encoder-rtx/climbmix_unigram16k_14_170")
 DECISION_DIR = os.path.expanduser("~/.cache/encoder-rtx/decision16k")   # data/prepare_decision_data.py writes here
 
-NUM_TRAIN_SHARDS   = 10      # 100M raw tokens each; the MLM base read 1-7
+NUM_TRAIN_SHARDS   = 10      # 100M raw tokens each; the MLM base read 1-6 (1-7 at 2,048)
 EVAL_BUFFER_TOKENS = 65536   # tokens per MLM validation micro-batch
 
 
@@ -416,7 +416,8 @@ def pack_caps(plans):
 def materialize_packs(plans, tokens_per_pack, cfg, pin=True):
     """Lay out every planned pack into pinned host tensors (see Pack), and return
     them with each pack's questions' (record, question, option order) for scoring.
-    cfg carries the static sizes: cu_width, rec_width, ro_cap, q_cap."""
+    cfg carries the static sizes: cu_width, rec_width, ro_cap, q_cap (the trainer's
+    cfg for the training packs, its eval_sizes for the evaluation packs)."""
     T, n = tokens_per_pack, len(plans)
     alloc = lambda *shape, dtype: torch.empty(*shape, dtype=dtype, pin_memory=pin)
     out = dict(tokens=alloc(n, T, dtype=torch.int32), pos=alloc(n, T, dtype=torch.int32),

@@ -48,6 +48,7 @@ import json
 import math
 import time
 from dataclasses import asdict, dataclass, fields
+from types import SimpleNamespace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -121,7 +122,7 @@ class StackConfig:
     d_vo:       int = 128   # Note: FA2 requires d_qk == d_vo, FA3 does not.
 
     # Context and Sliding Window Attention
-    seq_len:          int = 2048
+    seq_len:          int = 8192    # filler documents cut here, as in the 8K MLM base
     short_win_size:   int = 256     # each way: the window is 2 x 256 + 1 wide
     full_ctxt_layers: list[int] = [3, 7]
     window_sizes:     list[tuple[int, int]]  # Derived below.
@@ -178,12 +179,12 @@ class StackConfig:
     soft_weight:     float = 1.0    # where a question has a soft target: its weight against the hard label's
     epochs:          float = 1.0    # passes over the training records; sets num_steps
     train_splits:    tuple = ("train",)  # data/prepare_decision_data.py splits trained on
-    state_cap:       int = 2048     # a state's first tokens kept: the MLM base never saw a document past 2,048
-    filler_shard:    int = 8        # the filler starts at this train shard: the MLM base read 1-7
-    cu_width:        int            # cu_self entries
-    rec_width:       int            # cu_q / cu_k entries
+    state_cap:       int = 8192     # a state's first tokens kept: the 8K base's context
+    filler_shard:    int = 8        # the filler starts at this train shard: the 8K MLM base read 1-6
+    cu_width:        int            # cu_self entries   (the training packs'; the evaluation
+    rec_width:       int            # cu_q / cu_k entries   packs have their own, eval_sizes)
     ro_cap:          int            # readout positions per pack
-    q_cap:           int            # questions per pack
+    q_cap:           int            # questions per pack, every pack
     max_seg_len:     int            # FA2 max_seqlen bounds: any segment,
     max_qblock_len:  int            # one record's questions,
     max_state_len:   int            # one state
@@ -192,7 +193,7 @@ class StackConfig:
     num_steps: int                  # Derived from epochs (§ Data)
 
     # Two stages: this one starts from the MLM base
-    init_from:       str = "~/.cache/encoder-rtx/hub/runs/mlm-base4gb/model_step002605.pt"
+    init_from:       str = "~/.cache/encoder-rtx/hub/runs/mlm-base8k/model_step002605.pt"
     lr_scale:        float = 0.3    # every pre-trained weight's peak rate, times the MLM recipe's
 
     # Evaluation and logging
@@ -202,7 +203,7 @@ class StackConfig:
 
     # Logging
     wandb_project:   str = "encoderstack_rtx_dev"
-    run_name:        str = "decision-base4gb"  # both wandb and log files
+    run_name:        str = "decision-base8k"  # both wandb and log files
     use_wandb:       bool = True
 
     save_checkpoint: bool = False
@@ -1167,20 +1168,25 @@ train_plans = plan_packs(train_records, doc_stream("train", bos_id, cfg.filler_s
 cfg.num_steps = len(train_plans) - 1   # the last pack is the loop's prefetch
 
 all_eval_plans = [plan for plans in eval_plans.values() for plan in plans]
-caps = pack_caps(train_plans + all_eval_plans)
+caps, train_caps, eval_caps = pack_caps(train_plans + all_eval_plans), pack_caps(train_plans), pack_caps(all_eval_plans)
 round_up = lambda x, k: k * math.ceil(x / k)
 # Corrupted positions per training pack, from the pack with the least filler.
-cfg.train_targets  = 64 * int(cfg.mask_rate * pack_caps(train_plans)["min_filler"] / 64)
-assert pack_caps(all_eval_plans)["min_filler"] >= cfg.eval_targets
-cfg.cu_width       = round_up(caps["segments"] + 2, 64)
-cfg.rec_width      = round_up(caps["records"] + 1, 64)
-cfg.ro_cap         = round_up(caps["readouts"], 64)
+cfg.train_targets  = 64 * int(cfg.mask_rate * train_caps["min_filler"] / 64)
+assert eval_caps["min_filler"] >= cfg.eval_targets
+# Each kind of pack is padded to its own widths: FA2 launches blocks for every segment slot
+# up to max_seqlen, and every readout slot is a read row, so the evaluation packs' ~4x larger
+# widths would cost every training step. The question cap and FA2's bounds are shared.
+cfg.cu_width       = round_up(train_caps["segments"] + 2, 64)
+cfg.rec_width      = round_up(train_caps["records"] + 1, 64)
+cfg.ro_cap         = round_up(train_caps["readouts"], 64)
 cfg.q_cap          = round_up(caps["questions"], 64)
-cfg.max_seg_len    = round_up(max(caps["seg_len"], cfg.seq_len), 128)   # the MLM validation's documents too
+eval_sizes = SimpleNamespace(cu_width=round_up(eval_caps["segments"] + 2, 64), rec_width=round_up(eval_caps["records"] + 1, 64),
+                             ro_cap=round_up(eval_caps["readouts"], 64), q_cap=cfg.q_cap)
+cfg.max_seg_len    = round_up(max(caps["seg_len"], 2048), 128)   # the MLM validation's documents too
 cfg.max_qblock_len = round_up(caps["qblock_len"], 128)
 cfg.max_state_len  = round_up(caps["state_len"], 128)
 
-eval_packs = {split: materialize_packs(plans, cfg.train_batch_tokens, cfg) for split, plans in eval_plans.items()}
+eval_packs = {split: materialize_packs(plans, cfg.train_batch_tokens, eval_sizes) for split, plans in eval_plans.items()}
 train_packs, _ = materialize_packs(train_plans, cfg.train_batch_tokens, cfg)
 
 placed = sum(len(chosen) for chosen, _ in train_plans[:-1])
@@ -1194,7 +1200,8 @@ data_report = (
     f"  states capped at {cfg.state_cap}: {len(capped):,} training records "
     f"({sum(r['state_len'] - cfg.state_cap for r in capped) / 1e6:.2f}M state tokens cut)\n"
     f"  per pack: {cfg.train_targets:,} corrupted filler positions ({cfg.eval_targets} in evaluation) | "
-    f"caps: segments {cfg.cu_width}, records {cfg.rec_width}, readouts {cfg.ro_cap}, questions {cfg.q_cap} | "
+    f"caps: segments {cfg.cu_width}, records {cfg.rec_width}, readouts {cfg.ro_cap} (evaluation {eval_sizes.cu_width}, "
+    f"{eval_sizes.rec_width}, {eval_sizes.ro_cap}), questions {cfg.q_cap} | "
     f"max_seqlen: segment {cfg.max_seg_len}, question block {cfg.max_qblock_len}, state {cfg.max_state_len}")
 # Uniform guessing on each split's clean questions, the floor the accuracies read against.
 chance = {split: np.mean([1 / len(q["options"]) for r in records if r["variant"] == "clean" for q in r["questions"]])
@@ -1924,7 +1931,7 @@ def validate():
     byte, on the same 3.30M positions as the base's own run -- and, on each decision
     split's clean rows, (accuracy, Brier score summed over options, questions, accuracy
     by source, accuracy by variant over every row) from the evaluation packs."""
-    val_loader = val_generator(cfg.seq_len, cfg.train_batch_tokens)
+    val_loader = val_generator(2048, cfg.train_batch_tokens)   # the MLM base's validation: documents cut at 2,048
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
     total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
     for i in range(cfg.val_steps):
@@ -1941,7 +1948,7 @@ def validate():
     for split, (packs, scored) in eval_packs.items():
         right = total = 0
         brier = 0.0
-        by_source, by_variant = {}, {}
+        by_source, by_variant, by_state_len = {}, {}, {}
         for i, pk in enumerate(pack_loader(packs)):
             e_idx, e_pos, e_labels = corrupt(pk.tokens, cfg.eval_targets, val_gen.manual_seed(2000 + i), pk.filler_start)
             _, ro_p = forward_backward(pk, e_idx, e_pos, e_labels, backward=False)
@@ -1963,7 +1970,10 @@ def validate():
                 source = by_source.setdefault(r["source"], [0, 0])
                 source[0] += hit
                 source[1] += 1
-        result[split] = (right / total, brier / total, total, by_source, by_variant)
+                length = by_state_len.setdefault("state > 2,048" if r["state_len"] > 2048 else "state <= 2,048", [0, 0])
+                length[0] += hit
+                length[1] += 1
+        result[split] = (right / total, brier / total, total, by_source, by_variant, by_state_len)
     return val_mlm, val_mbpb, result
 
 
@@ -2010,11 +2020,13 @@ for step in range(cfg.num_steps + 1):
                f"brier:{stats.p1_brier:.4f} (n={n_p1}) | jevbench acc:{stats.jev_acc:.4f} "
                f"brier:{stats.jev_brier:.4f} (n={n_jev}) | val_time:{val_elapsed:.2f}s", console=True)
         if last_step:
-            for split, (*_, by_source, by_variant) in dec.items():
+            for split, (*_, by_source, by_variant, by_state_len) in dec.items():
                 print0(f"  {split} accuracy by source: " + ", ".join(
                     f"{s} {h}/{n}" for s, (h, n) in sorted(by_source.items())), console=True)
                 print0(f"  {split} accuracy by variant (every row): " + ", ".join(
                     f"{v} {h}/{n}" for v, (h, n) in sorted(by_variant.items())), console=True)
+                print0(f"  {split} accuracy by state length: " + ", ".join(
+                    f"{v} {h}/{n}" for v, (h, n) in sorted(by_state_len.items())), console=True)
         final_val = stats
 
     # --------------- Checkpoint -----------------
