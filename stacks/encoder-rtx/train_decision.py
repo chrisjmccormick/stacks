@@ -374,7 +374,10 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB
+    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB  (every layer at every row)
+    Layers 5-7, the source_readers, hold the read rows' (R: the corrupted filler positions
+    and the readouts) x_in, y_inv_rms, x_attn_out and MLP activations, and layer 7 its
+    q_hat, y and lse too.
     """
     #                                                            Stash (Tiny) Recompute
     x_in:               Tensor    # (L,  T,    D)             2.25GB
@@ -401,12 +404,11 @@ class LayerStash(NamedTuple):
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          288MB    layer-blend backward
-#   x_pool             (T, D)          288MB    pooling backward
-#   x_final_hat        (T, D)          288MB    final-norm backward
-#   x_final_inv_rms    (T, 1)   fp32   (0.8MB)
-#   x_mlm_hat          (M, D)          144MB    lm_head grad
+#   x_src_hat          (T, D)          288MB    the source_readers' attention input
+#   x_pool             (R, D)                   pooling backward
+#   x_final_hat        (R, D)                   lm_head / readout grads + final-norm backward
+#   x_final_inv_rms    (R, 1)   fp32
 #   ngram_ids          (4, 2, T) int64  13MB    the n-gram tables' rows
-#                               TOTAL: 1.0GB
 
 # Cast shorthands for the bodies below: the fp32 scalars/gates need explicit
 # bf16 casts at their use sites (see forward_backward's docstring), and the
@@ -448,8 +450,8 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     """One pack through the model: the corrupted tokens `idx`, the MLM head read out
     at the M positions `mlm_pos` against `labels`, and the decision readout at the
     pack's readout positions. Returns (MLM loss, decision loss) for training, or each
-    corrupted position's MLM nats and each readout's probability for validation
-    (backward=False)."""
+    corrupted position's MLM nats and each readout's probability for validation and
+    inference (backward=False): the forward is the same."""
 
     # Direction naming:
     # A bare name is the forward pass; a 'b' on its leading symbol is the
@@ -467,7 +469,7 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     # x_biased   - Layer input scaled by resid_lambda, biased by x0
     # x_src      - The source_layer's output, the source_readers' attention input
     # x_attn_out - Post-attention stream, the MLP's input
-    # x_final    - Post-pooling stream, feeding the lm_head and the readout
+    # x_final    - Post-pooling stream, feeding the lm_head and the readout (at the read rows)
     # x_mlm      - The final stream at the corrupted positions
     # x_ro       - The final stream at the readout positions
     #
@@ -497,7 +499,24 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     cos, sin = m.cos[0, pk.pos], m.sin[0, pk.pos]  # (T, 1, d_qk): [cos, cos] and [sin, -sin]
     ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_input_vocab, -1)
     x_pool = None
-    x_src_hat = None
+    x_src_hat = x_src_hat_read = None
+
+    # The source_readers (layers 5-7) take Q, K, V and every gate from the source layer's
+    # output, so past the source layer only the rows whose final stream the loss reads need
+    # a stream of their own: the readouts and the corrupted positions, sorted into `read`;
+    # read_slot is where each of them landed. K and V stay at every row. The cu tables
+    # count the read rows before each boundary, for the FA2 calls whose queries are the
+    # read rows alone. Padding readouts are keyed -1: they sort first, before every query
+    # segment (so FA2 skips them -- up to ro_cap of them would not fit one segment's
+    # max_seqlen), read row 0's stream elsewhere, and carry no gradient.
+    read_key, read_order = torch.cat([torch.where(pk.ro_qid < cfg.q_cap, pk.ro_pos, -1), mlm_pos]).sort()
+    read, read_pad = read_key.clamp_min(0), read_key < 0
+    read_slot = torch.empty_like(read_order).scatter_(0, read_order, torch.arange(read.size(0), device=device))
+    ro_slot, mlm_slot = read_slot[:pk.ro_pos.size(0)], read_slot[pk.ro_pos.size(0):]
+    cu_self_read = torch.searchsorted(read_key, pk.cu_self.long(), out_int32=True)
+    cu_q_read = torch.searchsorted(read_key, pk.cu_q.long(), out_int32=True)
+    is_q_read = pk.is_q[read]
+    cos_read, sin_read = cos[read], sin[read]
 
     # The n-gram memories' rows: each slot hashes the (corrupted) tokens at its offsets
     # from the position, the micro-batch's edges padded with their own token.
@@ -523,6 +542,7 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
 
     # The residual stream starts as the normed embedding.
     x = x0
+    x0_read = x0[read]
 
     # One LayerStash of forward activations per layer
     stash = []
@@ -531,9 +551,10 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     for i in range(cfg.n_layers):
         x_in = x
 
-        # Scale residual stream, add gated input embedding
+        # Scale residual stream, add gated input embedding. The source_readers' stream is at the read rows.
+        x0_rows = x0_read if i in cfg.source_readers else x0
         x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
-        x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
+        x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0_rows
 
         # Attention input norm. Layer 0 attends from x0, the source_readers from the source stream.
         if i == 0:
@@ -544,12 +565,21 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
             x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
             x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
 
+        # The source_readers' queries and head gate are at the read rows. The full-context
+        # reader computes its queries there alone; FA2 places a window by row index, so the
+        # windowed readers compute theirs at every row and keep the read rows' output.
+        gather_q = i in cfg.source_readers and cfg.window_sizes[i] == (-1, -1)
+        q_in = x_src_hat_read if gather_q else x_biased_hat
+        head_in = x_src_hat_read if i in cfg.source_readers else x_biased_hat
+        q_cos, q_sin = (cos_read, sin_read) if gather_q else (cos, sin)
+        cu_self_q, cu_q_q, is_q_q = (cu_self_read, cu_q_read, is_q_read) if gather_q else (pk.cu_self, pk.cu_q, pk.is_q)
+
         # QKV Projections. Layer 0 looks its q, k, v up by token.
         if i == 0:
             q, k = F.embedding(idx, qkv0_vocab[:, :2 * cfg.d_model]).view(T, 2, cfg.n_qo_heads, cfg.d_qk).unbind(1)  # n_qo == n_kv
             v = F.embedding(idx, qkv0_vocab[:, 2 * cfg.d_model:]).view(T, cfg.n_kv_heads, cfg.d_vo)
         else:
-            q = (x_biased_hat @ m.W_Q.w[i].mT).view(T, cfg.n_qo_heads, cfg.d_qk)
+            q = (q_in @ m.W_Q.w[i].mT).view(-1, cfg.n_qo_heads, cfg.d_qk)
             k = (x_biased_hat @ m.W_K.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_qk)
             v = (x_biased_hat @ m.W_V.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_vo)
 
@@ -572,12 +602,12 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
         q_inv_rms = (q.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         k_inv_rms = (k.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
         q, k = q.float() * q_inv_rms, k.float() * k_inv_rms
-        q_hat = bf16(q * cos + torch.roll(q, half, dims=-1) * sin)
+        q_hat = bf16(q * q_cos + torch.roll(q, half, dims=-1) * q_sin)
         k_hat = bf16(k * cos + torch.roll(k, half, dims=-1) * sin)
 
         # Read V from the residual streams both ways by matching their K. Every
         # segment -- state, question, filler document -- attends to itself.
-        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, pk.cu_self, pk.cu_self,
+        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_self_q, pk.cu_self,
                                            cfg.max_seg_len, cfg.max_seg_len, cfg.window_sizes[i])
 
         # Each record's questions also read its whole state. The two calls are
@@ -585,21 +615,24 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
         # each one's share of the merged normalizer, exp(lse - lse_merged). The
         # cross call leaves rows outside its segments unwritten: merge on question
         # rows only. The merged output is what the per-head norm below reads.
-        y_x, lse_x = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, pk.cu_q, pk.cu_k,
+        y_x, lse_x = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_q_q, pk.cu_k,
                                                cfg.max_qblock_len, cfg.max_state_len, (-1, -1))
-        lse_merged = torch.logaddexp(lse, lse_x)    # (H, T)
+        lse_merged = torch.logaddexp(lse, lse_x)    # (H, T or R)
         y_merged = (y.float() * (lse - lse_merged).exp().T.unsqueeze(-1)
                     + y_x.float() * (lse_x - lse_merged).exp().T.unsqueeze(-1))
-        y = torch.where(pk.is_q[:, None, None], bf16(y_merged), y).contiguous()
-        lse = torch.where(pk.is_q, lse_merged, lse)
+        y = torch.where(is_q_q[:, None, None], bf16(y_merged), y).contiguous()
+        lse = torch.where(is_q_q, lse_merged, lse)
+        if gather_q:
+            y = y.masked_fill(read_pad[:, None, None], 0)   # the padding readouts: outside every segment, unwritten
+        y_out = y[read] if (i in cfg.source_readers and not gather_q) else y   # the rows that continue
 
         # Per-head output norm and gate
-        y_inv_rms = (y.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
-        head_gate_a = 2 * torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T, n_qo_heads)
-        y_gated = bf16(y.float() * y_inv_rms * head_gate_a.unsqueeze(-1))
+        y_inv_rms = (y_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        head_gate_a = 2 * torch.sigmoid(head_in[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T or R, n_qo_heads)
+        y_gated = bf16(y_out.float() * y_inv_rms * head_gate_a.unsqueeze(-1))
 
         # Project value heads onto their output heads.
-        attn_out = y_gated.view(T, -1) @ m.W_O.w[i].mT
+        attn_out = y_gated.flatten(1) @ m.W_O.w[i].mT
 
         # Write back to the stream.
         x_attn_out = x_biased + attn_out
@@ -618,10 +651,12 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
         # Write back to the stream.
         x = x_attn_out + mlp_out_hat        # the residual stream; appears as xb in bwd
 
-        # The source layer's output is the source_readers' attention input.
+        # The source layer's output is the source_readers' attention input. Past it, the
+        # stream continues at the read rows only.
         if i == cfg.source_layer:
             x_src_inv_rms = (x.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
             x_src_hat = bf16(x.float() * x_src_inv_rms)
+            x, x_src_hat_read = x[read], x_src_hat[read]
 
         # Stash the pool layer's output, to add it onto the final stream.
         if i == cfg.pool_layer:
@@ -645,7 +680,7 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     #           MLM Head
     # -----------------------------
     # Only the corrupted positions are read out, M of them.
-    x_mlm_hat = x_final_hat[mlm_pos]    # (M, D)
+    x_mlm_hat = x_final_hat[mlm_slot]   # (M, D)
     tgt = labels.unsqueeze(1)           # (M, 1)
 
     # ==== Forward ====
@@ -676,7 +711,7 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     # Each option's logit is the readout vector dotted with its readout token's
     # stream; a softmax runs over each question's options. Padding readouts
     # belong to a dummy question, q_cap, and carry no target and no gradient.
-    x_ro_hat = x_final_hat[pk.ro_pos]                               # (Rc, D)
+    x_ro_hat = x_final_hat[ro_slot]                                 # (Rc, D)
     ro_logit = x_ro_hat.float() @ m.readout.w[0]                    # (Rc,)
     ro_max = torch.full((cfg.q_cap + 1,), -math.inf, device=device).scatter_reduce(
         0, pk.ro_qid, ro_logit, "amax")                             # (Qc + 1,)
@@ -714,9 +749,9 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
 
     # The backward streams start as weighted sums of the head embeddings that they
     # (meaningfully) predicted, at the corrupted positions, and as the readout vector
-    # at the readout positions; zero elsewhere. Padding readouts add zeros at row 0.
-    xb_final_hat = torch.zeros_like(x_final_hat).index_copy_(0, mlm_pos, logitsb @ m.lm_head.w) # (T, d_model)
-    xb_final_hat.index_put_((pk.ro_pos,), bf16(ro_logitb.unsqueeze(1) * m.readout.w), accumulate=True)
+    # at the readout positions: every read row. Padding readouts' rows get zeros.
+    xb_final_hat = torch.zeros_like(x_final_hat).index_copy_(0, mlm_slot, logitsb @ m.lm_head.w) # (R, d_model)
+    xb_final_hat.index_copy_(0, ro_slot, bf16(ro_logitb.unsqueeze(1) * m.readout.w))
     del logitsb
 
     # -----------------------------
@@ -744,9 +779,9 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
     m.pool_lambda.grad.copy_(sum32(xb_final * x_pool))  # (T, d_model)
 
     # xb updates every layer, keep xb_final for the pool layer.
-    xb = xb_final                       # grad wrt layer num_layers-1's output
-    x0b = torch.zeros_like(x0)          # accumulates over layers
-    xb_src_hat = torch.zeros_like(x0)   # accumulates over the source_readers
+    xb = xb_final                       # grad wrt layer num_layers-1's output, at the read rows
+    x0b = torch.zeros_like(x0_read)     # accumulates over layers; at the read rows down to the source_readers
+    xb_src_hat = torch.zeros_like(x0)   # accumulates over the source_readers, at every row
 
     # For each layer in reverse order,
     for i in reversed(range(cfg.n_layers)):
@@ -783,41 +818,59 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
 
         xb_attn_out = xb + bf16(x_attn_out_inv_rms * (xb_attn_out_hat.float() - (x_attn_out_hat.float() * (x_attn_out_hat.float() * xb_attn_out_hat.float()).mean(dim=-1, keepdim=True))))
 
-        # Attention backward
+        # Attention backward. The source_readers' output, queries and head gate are at the
+        # read rows; their keys and values at every row.
         x_biased_hat = st.x_biased_hat
-        y_hat = st.y.float() * st.y_inv_rms
-        head_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T, n_qo_heads)
-        m.W_O.gbank[i].copy_(xb_attn_out.mT @ bf16(y_hat * (2 * head_gate_sig).unsqueeze(-1)).view(T, -1))
-        yb_gated = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo).float()
+        gather_q = i in cfg.source_readers and cfg.window_sizes[i] == (-1, -1)
+        head_in = x_src_hat_read if i in cfg.source_readers else x_biased_hat
+        cu_self_q, cu_q_q = (cu_self_read, cu_q_read) if gather_q else (pk.cu_self, pk.cu_q)
+        y_out = st.y[read] if (i in cfg.source_readers and not gather_q) else st.y
+        y_hat = y_out.float() * st.y_inv_rms
+        head_gate_sig = torch.sigmoid(head_in[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T or R, n_qo_heads)
+        m.W_O.gbank[i].copy_(xb_attn_out.mT @ bf16(y_hat * (2 * head_gate_sig).unsqueeze(-1)).flatten(1))
+        yb_gated = (xb_attn_out @ m.W_O.w[i]).view(-1, cfg.n_qo_heads, cfg.d_vo).float()
 
         # Head gate backward
-        head_gateb_z = bf16((yb_gated * y_hat).sum(dim=-1) * (2 * head_gate_sig * (1 - head_gate_sig)))   # (T, n_qo_heads)
-        m.head_gate.gbank[i].copy_(head_gateb_z.mT @ x_biased_hat[..., :cfg.d_gate])
+        head_gateb_z = bf16((yb_gated * y_hat).sum(dim=-1) * (2 * head_gate_sig * (1 - head_gate_sig)))   # (T or R, n_qo_heads)
+        m.head_gate.gbank[i].copy_(head_gateb_z.mT @ head_in[..., :cfg.d_gate])
         yb_hat = yb_gated * (2 * head_gate_sig).unsqueeze(-1)
         yb = bf16(st.y_inv_rms * (yb_hat - y_hat * (y_hat * yb_hat).mean(dim=-1, keepdim=True)))
 
-        # Grads w.r.t. the gate slices of x_biased_hat
+        # Grads w.r.t. the gate slices of x_biased_hat (the source_readers' head gate's go with their queries')
         xb_gates = torch.zeros(T, 3 * cfg.d_gate, dtype=torch.bfloat16, device=device)
-        xb_gates[:, :cfg.d_gate] += head_gateb_z @ m.head_gate.w[i]
+        xb_head_gate = head_gateb_z @ m.head_gate.w[i]
+        if i not in cfg.source_readers:
+            xb_gates[:, :cfg.d_gate] += xb_head_gate
+
+        # A windowed reader's queries ran at every row: its output grad is zero off the read rows.
+        if i in cfg.source_readers and not gather_q:
+            yb = torch.zeros_like(st.y).index_copy_(0, read, yb)
 
         # Each call's backward, given the MERGED output and LSE: its softmax weights
         # exp(s - lse) are then its share of the merged softmax, and FA2's row term
         # rowsum(yb * y) is the merged one, so the two calls' grads sum to the exact
         # grad of the union. The cross call's grads are zero outside its rows.
         qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
-            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, pk.cu_self, pk.cu_self,
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_self_q, pk.cu_self,
             cfg.max_seg_len, cfg.max_seg_len, cfg.window_sizes[i])
         qb_x, kb_x, vb_x = flash_attn_varlen_bwd(
-            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, pk.cu_q, pk.cu_k,
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_q_q, pk.cu_k,
             cfg.max_qblock_len, cfg.max_state_len, (-1, -1))
         qb_hat, kb_hat, vb = qb_hat + qb_x, kb_hat + kb_x, vb + vb_x
 
+        # The queries' grads at the rows they continue from (zero elsewhere).
+        q_hat, q_inv_rms, q_cos, q_sin = st.q_hat, st.q_inv_rms, cos, sin
+        if i in cfg.source_readers:
+            q_cos, q_sin = cos_read, sin_read
+            if not gather_q:
+                qb_hat, q_hat, q_inv_rms = qb_hat[read], q_hat[read], q_inv_rms[read]
+
         # per-(token, head) norm backward
-        qb = bf16(st.q_inv_rms * (qb_hat.float() - st.q_hat.float() * (st.q_hat.float() * qb_hat.float()).mean(dim=-1, keepdim=True)))
+        qb = bf16(q_inv_rms * (qb_hat.float() - q_hat.float() * (q_hat.float() * qb_hat.float()).mean(dim=-1, keepdim=True)))
         kb = bf16(st.k_inv_rms * (kb_hat.float() - st.k_hat.float() * (st.k_hat.float() * kb_hat.float()).mean(dim=-1, keepdim=True)))
 
         # rotary backward = rotation by -theta (transpose of the forward rotation)
-        qb = qb * cos - torch.roll(qb, half, dims=-1) * sin
+        qb = qb * q_cos - torch.roll(qb, half, dims=-1) * q_sin
         kb = kb * cos - torch.roll(kb, half, dims=-1) * sin
 
         # --- VE gate backward (ve and ve_gate_sig recomputed) ---
@@ -869,7 +922,7 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
                     + m.ngram_values.lr_bc_t[t_step] * (ngram_grad / (ngram_mntm.sqrt() + m.ngram_values.eps_t[t_step]))))
 
         # vb passes through the value adds unchanged: v = v0 + ve_gate_a*ve + ...
-        qb = qb.view(T, cfg.n_qo_heads * cfg.d_qk)
+        qb = qb.flatten(1)
         kb = kb.view(T, cfg.n_kv_heads * cfg.d_qk)
         vb = vb.reshape(T, cfg.n_kv_heads * cfg.d_vo)
 
@@ -883,6 +936,17 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
             m.W_V.gbank[0].copy_(W_qkv0b[2 * cfg.d_model:])
             x0b_vocab = qkv0b_vocab @ W_qkv0                   # (d_input_vocab, D)
             xb_biased_hat = F.pad(xb_gates, (0, cfg.d_model - 3 * cfg.d_gate))
+        elif i in cfg.source_readers:
+            # Keys and values read every row of the source stream; queries and the head gate the read rows.
+            m.W_Q.gbank[i].copy_(qb.mT @ head_in)
+            m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
+            m.W_V.gbank[i].copy_(vb.mT @ x_biased_hat)
+
+            xb_biased_hat = kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
+            xb_biased_hat[:, :3 * cfg.d_gate] += xb_gates
+            xb_read_hat = qb @ m.W_Q.w[i]
+            xb_read_hat[:, :cfg.d_gate] += xb_head_gate
+            xb_biased_hat.index_add_(0, read, xb_read_hat)
         else:
             m.W_Q.gbank[i].copy_(qb.mT @ x_biased_hat)
             m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
@@ -903,9 +967,10 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
 
         # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0_gate*x0,
         #     x0_gate = 2*sigmoid(x0_gates[i] * mean_c(x_in)) ---
+        x0_rows    = x0_read if i in cfg.source_readers else x0
         x_in_mean  = st.x_in.float().mean(dim=-1, keepdim=True)                         # (T, 1)
         x0_gate    = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in_mean)                   # (T, 1)
-        x0_dot     = (xb_biased * x0).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
+        x0_dot     = (xb_biased * x0_rows).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
         x0_gateb_z = x0_dot * m.x0_lambdas.w[i] * x0_gate * (1.0 - 0.5 * x0_gate)       # (T, 1)
         g_resid.append(sum32(xb_biased * st.x_in))
         g_x0.append((x0_dot * x0_gate).sum())
@@ -914,8 +979,12 @@ def forward_backward(pk: Pack, idx, mlm_pos, labels, backward=True):
         xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
 
         # TRAP: the source layer's output (this layer's input) also fed the source_readers' attention.
+        # Below them every row has a stream again: the read rows' grads scatter back into it
+        # (the padding readouts' copies of row 0 all carry zeros, so their order does not matter).
         if i == cfg.source_layer + 1:
+            xb = torch.zeros_like(x0).index_copy_(0, read, xb)
             xb = xb + bf16(x_src_inv_rms * (xb_src_hat.float() - (x_src_hat.float() * (x_src_hat.float() * xb_src_hat.float()).mean(dim=-1, keepdim=True))))
+            x0b = torch.zeros_like(x0).index_copy_(0, read, x0b)
         stash[i] = None                          # free this layer's stash as we go
 
     # Land the per-layer resid/x0/x0-gate scalar sums (collected in REVERSED
@@ -1837,16 +1906,16 @@ warmup = []  # Those first 11 steps, where the compile lives.
 train_gen = torch.Generator(device=device).manual_seed(cfg.seed)
 val_gen = torch.Generator(device=device)
 
-# The MLM validation's micro-batches are packs of filler alone: no records, so the cross
-# call runs on ghost segments and the merge keeps the self call's rows as they are.
+# The MLM validation's micro-batches are packs of filler alone: no records and no readouts,
+# so the cross call runs on ghost segments and the merge keeps the self call's rows as they are.
 val_rest = dict(pos=torch.arange(EVAL_BUFFER_TOKENS, dtype=torch.int32, device=device),
                 is_q=torch.zeros(EVAL_BUFFER_TOKENS, dtype=torch.bool, device=device),
                 cu_q=torch.zeros(cfg.rec_width, dtype=torch.int32, device=device),
                 cu_k=torch.zeros(cfg.rec_width, dtype=torch.int32, device=device),
                 filler_start=torch.zeros(1, dtype=torch.int64, device=device),
-                ro_pos=torch.zeros(cfg.ro_cap, dtype=torch.int64, device=device),
-                ro_qid=torch.full((cfg.ro_cap,), cfg.q_cap, dtype=torch.int64, device=device),
-                ro_tgt=torch.zeros(cfg.ro_cap, dtype=torch.float32, device=device),
+                ro_pos=torch.zeros(0, dtype=torch.int64, device=device),
+                ro_qid=torch.zeros(0, dtype=torch.int64, device=device),
+                ro_tgt=torch.zeros(0, dtype=torch.float32, device=device),
                 n_q=torch.zeros(1, dtype=torch.float32, device=device))
 
 
