@@ -9,13 +9,14 @@ predictions distilled from an open decision model, beginning from
 **Status (Nov 1, 2026):** two stages, each a single file with a handwritten backward, on
 one RTX PRO 6000. `train_mlm.py` pre-trains the encoder on masked LM -- decoder-rtx's
 Baseline 6 made bidirectional, reading documents of up to 8,192 tokens -- in 13.7 minutes of
-training (val MLM 1.779 nats per corrupted position). Its checkpoint is `runs/mlm-base8k/` in
-the private model repo `ChrisMcCormick/encoder-rtx`. `train_decision.py` starts from it and
-trains on decision records: two passes over Kev's records and Recast NLP's (d3-flash's
-labels, yes/no questions balanced per source) at a 0.5 decision share (616 steps, 3.4 min of
-training at 0.328 s/step) reach decision-dev accuracy 0.70-0.73, transfer-dev 0.48-0.51 and
-JevBench 0.45-0.50, against 0.33 / 0.39 / 0.32 for uniform guessing (Kev's records alone,
-one pass: 0.64 / 0.50 / 0.38-0.44). `train_encoder.py`,
+training (val MLM 1.779 nats per corrupted position, 512M tokens). The same recipe run 4x
+longer (10,420 steps, 2.05B tokens, 55 min) reaches 1.524, and that checkpoint,
+`runs/mlm-base8k-2b/` in the model repo `ChrisMcCormick/encoder-rtx` (public), is the one
+`train_decision.py` starts from. It trains on decision records: two passes over Kev's
+records and Recast NLP's (d3-flash's labels, yes/no questions balanced per source) at a 0.5
+decision share (616 steps, 3.3 min of training at 0.328 s/step) reach decision-dev accuracy
+0.72-0.74, transfer-dev 0.51-0.52 and JevBench 0.44-0.48, against 0.33 / 0.39 / 0.32 for
+uniform guessing (on the 512M base: 0.70-0.73 / 0.48-0.51 / 0.45-0.50). `train_encoder.py`,
 at the bottom, is Phase 0's
 single-stage fork (joint MLM + decision from scratch on the 32K BPE), superseded by the two
 stages and kept for reference. The proposal, the sessions and their logs are in
@@ -69,6 +70,16 @@ tokenizer) made bidirectional and trained on MLM alone:
 | `mlm-bigrams590k` / `mlm-base4gb` (the 4 GB base, before Baseline 6's last fold) | 2,048 | 1.7669 / 1.7756 | -- | 0.349 | 15.1 min |
 | `mlm-b6fold-2k` (this script at 2,048) | 2,048 | 1.7649 | 1.8082 | 0.302 | 13.1 min |
 | **`mlm-base8k`** (this script) | 8,192 | 1.7790 | **1.7637** | 0.316 | 13.7 min |
+| `mlm-base8k-1b` (this script at 5,210 steps, 1.02B tokens) | 8,192 | 1.6298 | 1.6153 | 0.317 | 27.5 min |
+| **`mlm-base8k-2b`** (this script at 10,420 steps, 2.05B tokens: the decision stage's base) | 8,192 | **1.5236** | **1.5148** | 0.317 | 55.1 min |
+
+**Longer bases** change only `cfg.num_steps`. The schedules are fractions of the run, so they
+stretch with it, and `utils_mlm.py`'s `NUM_TRAIN_SHARDS` has to cover the run: 12 shards at
+5,210 steps, 23 at 10,420. Each doubling still pays (-0.149, then -0.106), evenly along the
+document: the gain from reading a long document whole over 2,048-token chunks is the same at
+every length of training (0.078 / 0.079 / 0.074). The script itself stays at 2,605 steps.
+`mlm-base8k-1b` and `mlm-base8k-2b` are checkpoints on the hub (weights and optimizer
+state). The hub's ClimbMix 16K dataset holds 31 train shards.
 
 "Long documents" is the val shard's 2,709 documents over 2,048 tokens, cut at 8,192, each
 corrupted once at 30% and read whole. By place in the document the 8K model leads the 2K
@@ -87,8 +98,8 @@ On an RTX PRO 6000, in the `stacks` env:
 
 ```bash
 python data/prepare_decision_data.py   # once: Kev's suites (+ Phase 1's) -> ~/.cache/encoder-rtx/decision16k/
-# the 8K MLM base, once (private repo; HF_TOKEN):
-huggingface-cli download ChrisMcCormick/encoder-rtx --include 'runs/mlm-base8k/*' --local-dir ~/.cache/encoder-rtx/hub
+# the 2B-token MLM base, once (public repo):
+hf download ChrisMcCormick/encoder-rtx --include 'runs/mlm-base8k-2b/*' --local-dir ~/.cache/encoder-rtx/hub
 RUN_NAME=decision python train_decision.py   # defaults: Kev + Recast NLP, two passes, share 0.5, LR_SCALE 0.3
 ```
 
@@ -97,7 +108,7 @@ It is stage 1's script with Phase 0's decision path brought in:
 - **Packs** of decision records and ClimbMix filler, as in Phase 0 (below): every state,
   question and filler document is its own segment, and a question's RoPE positions
   continue its state's. The filler is trained on MLM at the base's 0.50 rate, cut at 8,192
-  like the base's documents, and starts at train shard 8, past what the base read. `EPOCHS`
+  like the base's documents, and starts at train shard 24, past what the base read (1-22). `EPOCHS`
   passes over the records set the step count. Training packs and evaluation packs are each
   padded to their own static widths (segment slots, records, readout slots): FA2 launches
   blocks for every segment slot up to `max_seqlen`, so padding the training packs to the
@@ -118,7 +129,7 @@ It is stage 1's script with Phase 0's decision path brought in:
   warmup included). `LR_SCALE` multiplies stage 1's rates on every pre-trained weight. The
   readout is new and keeps its own rate.
 - **Evaluation:** the base's own MLM validation, on the same 3.30M corrupted positions (the
-  loaded 8K base reads its run's 1.7790). Plus accuracy and Brier score on the clean rows
+  loaded 2B base reads its run's 1.5236). Plus accuracy and Brier score on the clean rows
   of decision-v7 and transfer-v4 development, Phase 1's holdout families (clinc150,
   formality, health_fact), JevBench's 231 public items and Cookbook-dev (798 records shaped
   like TypeSafe's cookbooks: a 194-way skill choice, 10-Ks over 75 SIC groups, a same-product
@@ -131,7 +142,7 @@ It is stage 1's script with Phase 0's decision path brought in:
   `VAL_EVERY` (25), `MASK_RATE` (0.50), `RUN_NAME`, `USE_WANDB`, `ABORT_STEP`,
   `SAVE_CHECKPOINT`.
 
-**The default mix** (accuracy on the clean rows; Phase 1 holdout = Recast NLP's held-out
+**The default mix**, on the 512M base `mlm-base8k` (accuracy on the clean rows; Phase 1 holdout = Recast NLP's held-out
 families at `bd5ae231`; agent-ops-stacks `encoder-rtx/2026-11-01_1203am_decision-data-arms`):
 
 | training records | runs | val MLM | decision-dev | transfer-dev | Phase 1 holdout | JevBench | steps | s/step |
@@ -140,9 +151,30 @@ families at `bd5ae231`; agent-ops-stacks `encoder-rtx/2026-11-01_1203am_decision
 | **Kev's + Recast NLP's (d3 labels, nouls balanced), two passes** | 3 seeds (session) | 1.822 | 0.718 / 0.726 / 0.718 | 0.512 / 0.502 / 0.497 | 0.531 / 0.538 / 0.547 | 0.485 / 0.446 / 0.472 | 616 | 0.330 |
 | the same, the committed data prep (seed 42: the defaults with no knobs; 43 / 44: the session's variant with a seed knob) | 3 seeds | 1.820 | 0.704 / 0.714 / 0.710 | 0.508 / 0.488 / 0.482 | 0.527 / 0.532 / 0.546 | 0.468 / 0.472 / 0.498 | 616 | 0.328 |
 
-On Cookbook-dev the committed defaults read 0.535 overall: skill suggestion 33 / 280 (d3-flash
+On Cookbook-dev the defaults on the 512M base read 0.535 overall: skill suggestion 33 / 280 (d3-flash
 0.929; majority 0.029), the 10-K question 13 / 60 (0.650; 0.167), entity_alignment 378 / 450
 (0.913; 0.849), citation_check 3 / 8; Kev-only runs read 27-30 and 3 on the first two.
+
+**The base** (the default mix on each base, three seeds of runs with the per-question dump:
+the session variants' seed and filler-shard knobs, otherwise these defaults;
+agent-ops-stacks `encoder-rtx/2026-11-01_0703am_mlm-token-ladder`). Balanced =
+transfer-dev's mean over its eight families of the recall averaged over gold classes (a
+constant answer scores ~0.386); skill = Cookbook-dev's 194-way skill suggestion, of 280:
+
+| base | base val MLM | decision-dev | transfer-dev | transfer balanced | Phase 1 holdout | JevBench | skill |
+|---|---|---|---|---|---|---|---|
+| `mlm-base8k` (512M tokens) | 1.7790 | 0.706 / 0.714 / 0.710 | 0.511 / 0.488 / 0.482 | 0.483 / 0.471 / 0.477 | 0.534 / 0.532 / 0.546 | 0.459 / 0.472 / 0.498 | 36 / 62 / 38 |
+| `mlm-base8k-1b` | 1.6298 | 0.712 / 0.718 / 0.739 | 0.483 / 0.537 / 0.485 | 0.490 / 0.504 / 0.481 | 0.565 / 0.560 / 0.551 | 0.455 / 0.468 / 0.459 | 83 / 84 / 78 |
+| **`mlm-base8k-2b`** | **1.5236** | **0.719 / 0.732 / 0.727** | 0.509 / 0.514 / 0.521 | **0.526 / 0.518 / 0.513** | 0.576 / 0.561 / 0.547 | 0.480 / 0.442 / 0.459 | **98 / 86 / 78** |
+
+Above every 512M seed with the 2B base: decision-dev, transfer-dev's balanced accuracy, and
+Cookbook-dev's skill suggestion (~2x), with Phase 1 holdout up from clinc150's 150-way
+choice. Inside the seed spread: transfer-dev's and JevBench's accuracy (JevBench's log loss
+is lower). 2B is level with 1B on every split. The committed defaults with no knobs (seed 42)
+read decision-dev 0.741, transfer-dev 0.509, Phase 1 holdout 0.569, JevBench 0.468, and on
+Cookbook-dev skill suggestion 87 / 280, the 10-K question 14 / 60, citation_check 2 / 8. entity_alignment answers "yes" (71 / 450;
+gold 15% "yes"), so Cookbook-dev's overall figure, 0.218, follows that lean: read it by
+source. The stage raises the base's val MLM by +0.094 on 2B, against +0.041 on 512M.
 
 The new mix lifts every in-distribution and Jev-shaped number at every seed and holds
 transfer-dev (the committed data path against Kev-only, seed means: +0.07 decision-dev, +0.09

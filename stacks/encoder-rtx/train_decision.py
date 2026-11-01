@@ -180,7 +180,7 @@ class StackConfig:
     epochs:          float = 2.0    # passes over the training records; sets num_steps
     train_splits:    tuple = ("train", "phase1_train")  # data/prepare_decision_data.py splits: Kev's records and Recast NLP's (d3-labelled, nouls balanced)
     state_cap:       int = 8192     # a state's first tokens kept: the 8K base's context
-    filler_shard:    int = 8        # the filler starts at this train shard: the 8K MLM base read 1-6
+    filler_shard:    int = 24       # the filler starts at this train shard: the 2B-token MLM base read 1-22
     cu_width:        int            # cu_self entries   (the training packs'; the evaluation
     rec_width:       int            # cu_q / cu_k entries   packs have their own, eval_sizes)
     ro_cap:          int            # readout positions per pack
@@ -193,7 +193,7 @@ class StackConfig:
     num_steps: int                  # Derived from epochs (§ Data)
 
     # Two stages: this one starts from the MLM base
-    init_from:       str = "~/.cache/encoder-rtx/hub/runs/mlm-base8k/model_step002605.pt"
+    init_from:       str = "~/.cache/encoder-rtx/hub/runs/mlm-base8k-2b/model_step010420.pt"
     lr_scale:        float = 0.3    # every pre-trained weight's peak rate, times the MLM recipe's
 
     # Evaluation and logging

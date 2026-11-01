@@ -77,7 +77,7 @@ REPO_ID = "ChrisMcCormick/climbmix_unigram16k_14_170"
 DATASET_DIR = os.path.expanduser("~/.cache/encoder-rtx/climbmix_unigram16k_14_170")
 DECISION_DIR = os.path.expanduser("~/.cache/encoder-rtx/decision16k")   # data/prepare_decision_data.py writes here
 
-NUM_TRAIN_SHARDS   = 10      # 100M raw tokens each; the MLM base read 1-6 (1-7 at 2,048)
+NUM_TRAIN_SHARDS   = 26      # 100M raw tokens each; the 2B-token MLM base read 1-22, the filler starts at 24
 EVAL_BUFFER_TOKENS = 65536   # tokens per MLM validation micro-batch
 
 
