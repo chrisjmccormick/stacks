@@ -6,61 +6,146 @@ TypeSafe's System One API). The starting idea is to train jointly on MLM and on
 predictions distilled from an open decision model, beginning from
 [`decoder-rtx`](../decoder-rtx/)'s code.
 
-**Status (Oct 30, 2026):** the decision stage runs on the MLM base. `train_decision.py`
-takes the 4 GB MLM base (decoder-rtx's `baseline-6` made bidirectional and trained on MLM
-alone; its checkpoint is `runs/mlm-base4gb/` in the private model repo
-`ChrisMcCormick/encoder-rtx`) and trains it on decision records. One epoch of Kev's
-records (72 steps, 23 s on an RTX Pro 6000) reaches decision-dev accuracy 0.585 and
-transfer-dev 0.514, against 0.33 / 0.39 for uniform guessing. `train_encoder.py`, below
-it, is Phase 0: a fork of decoder-rtx's `sep-28-baseline` on the 32K BPE, trained jointly
-from scratch (decision-dev 0.56, transfer-dev at chance). The proposal and the discussion
-behind both are in `agent-ops-stacks/encoder-rtx/` (private).
+**Status (Nov 1, 2026):** two stages, each a single file with a handwritten backward, on
+one RTX PRO 6000. `train_mlm.py` pre-trains the encoder on masked LM -- decoder-rtx's
+Baseline 6 made bidirectional, reading documents of up to 8,192 tokens -- in 13.7 minutes of
+training (val MLM 1.779 nats per corrupted position). Its checkpoint is `runs/mlm-base8k/` in
+the private model repo `ChrisMcCormick/encoder-rtx`. `train_decision.py` starts from it and
+trains on decision records: one epoch of Kev's records at a 0.5 decision share (145
+steps, 46 s of training at 0.318 s/step) reaches decision-dev accuracy 0.64, transfer-dev
+0.50 and JevBench 0.43, against 0.33 / 0.39 / 0.32 for uniform guessing. `train_encoder.py`,
+at the bottom, is Phase 0's
+single-stage fork (joint MLM + decision from scratch on the 32K BPE), superseded by the two
+stages and kept for reference. The proposal, the sessions and their logs are in
+`agent-ops-stacks/encoder-rtx/` (private).
 
-## The decision stage: `train_decision.py`
+## Stage 1: masked-LM pre-training, `train_mlm.py`
 
-On an RTX Pro 6000, in the `stacks` env:
+On an RTX PRO 6000, in the `stacks` env:
 
 ```bash
-python data/prepare_decision_data.py   # once: Kev's suites -> ~/.cache/encoder-rtx/decision16k/
-# the MLM base, once (private repo; HF_TOKEN):
-huggingface-cli download ChrisMcCormick/encoder-rtx --include 'runs/mlm-base4gb/*' --local-dir ~/.cache/encoder-rtx/hub
-EPOCHS=1 DECISION_FRAC=0.9 LR_SCALE=0.3 RUN_NAME=dec-f90-e1 python train_decision.py
+SAVE_CHECKPOINT=1 RUN_NAME=mlm-base8k python train_mlm.py   # downloads the ClimbMix shards on first run
 ```
 
-It is the MLM base's script (`train_mlm-28-base4gb.py` in the ops repo) with Phase 0's
-decision path brought in:
+The model is decoder-rtx's Baseline 6 (8 layers, d768, priml's recipe on the 16K Unigram
+tokenizer) made bidirectional and trained on MLM alone:
 
-- **Packs** of decision records and ClimbMix filler, as in Phase 0 (below). The filler is
-  trained on MLM at the base's 0.50 rate and starts at train shard 8, past what the base
-  read. `EPOCHS` passes over the records set the step count.
+- **Attention** looks both ways within each document (FA2 varlen, `causal=False`): 256
+  tokens each side on layers 0-2 and 4-6, the whole document on layers 3 and 7. Documents
+  are cut at 8,192 tokens. RoPE (base 3,000,000) runs on positions across the micro-batch;
+  it is relative, so a document reads the same wherever it sits.
+- **Layer 0** attends from the token's normed embedding itself, so its q, k and v are
+  projected once per vocabulary row and gathered per token.
+- **Layers 5-7 attend from layer 4's output** (their Q, K, V and gates all read it), so past
+  layer 4 only the rows the loss reads need a stream of their own: the corrupted
+  positions. Those layers compute K and V at every row and everything else -- Q, W_O, the
+  MLP, the pooled layer-6 output -- at the corrupted rows alone. Layer 7 (whole document)
+  runs its queries at those rows only. Layers 5-6 (windowed) run theirs at every row and
+  keep the corrupted rows' output, since FA2 places a window by row index. The change is
+  exact (checked in fp64 against the unrestricted path), and the evaluation forward,
+  which is the inference path, gets it too.
+- **Value memories:** value-embedding tables on layers 1, 3, 5 and 7, and four bigram
+  n-gram memories on the same layers (two hash slots of 589,824 rows each, keyed on
+  (prev, curr) of the corrupted input): the ~4 GB model.
+- **MLM:** each step corrupts 50% of the non-BOS positions (80% `[MASK]`, 10% a random
+  token, 10% unchanged), and the LM head runs on the corrupted positions only. The n-gram
+  memories hash the corrupted input, so no key sees a target.
+- **Recipe:** Baseline 6's optimizers -- Muon on the matrices, AdamW on the embedding
+  tables, head and scalars (the input embeddings stepped inside the backward), row-wise
+  RMSProp on the touched n-gram rows -- with every peak rate at 0.7x, a 20-step warmup on
+  the x0 scalars, and 2,605 steps of 196,608 tokens (512M).
+- **Validation:** 168 x 65,536 tokens of the val shard, documents cut at 2,048, corrupted at
+  30% / 80-10-10 by a generator re-seeded per micro-batch, so every run scores the same 3.30M
+  positions: `val_mlm` in nats per corrupted position, `val_mbpb` the same over the
+  corrupted tokens' bytes, in bits.
+- Knobs from the environment, logged: `RUN_NAME`, `MASK_RATE` (0.50), `USE_WANDB`,
+  `SAVE_CHECKPOINT` (the final weights and optimizer state to
+  `~/.cache/encoder-rtx/runs/<run_name>/`), `ABORT_STEP`.
+
+| run | documents cut at | val MLM | long documents, whole | s/step | training |
+|---|---|---|---|---|---|
+| `mlm-bigrams590k` / `mlm-base4gb` (the 4 GB base, before Baseline 6's last fold) | 2,048 | 1.7669 / 1.7756 | -- | 0.349 | 15.1 min |
+| `mlm-b6fold-2k` (this script at 2,048) | 2,048 | 1.7649 | 1.8082 | 0.302 | 13.1 min |
+| **`mlm-base8k`** (this script) | 8,192 | 1.7790 | **1.7637** | 0.316 | 13.7 min |
+
+"Long documents" is the val shard's 2,709 documents over 2,048 tokens, cut at 8,192, each
+corrupted once at 30% and read whole. By place in the document the 8K model leads the 2K
+one by 0.019 nats at 0-2K, 0.050 at 2-4K and 0.107 at 4-8K. Read in 2,048-token chunks
+instead, the two models are level (1.842 / 1.840), so the lead comes from the context. The
+standard validation, whose documents are cut at 2,048, is 0.014 worse at 8K. Under the 16K
+tokenizer 3.3% of ClimbMix's documents run past 2,048 tokens and hold 23% of its tokens;
+0.3% run past 8,192 and hold 7.5%.
+
+Same-seed runs of a config differ by up to ~0.009 val MLM (the kernels' nondeterminism),
+and two seeds by ~0.025.
+
+## Stage 2: decision training, `train_decision.py`
+
+On an RTX PRO 6000, in the `stacks` env:
+
+```bash
+python data/prepare_decision_data.py   # once: Kev's suites (+ Phase 1's) -> ~/.cache/encoder-rtx/decision16k/
+# the 8K MLM base, once (private repo; HF_TOKEN):
+huggingface-cli download ChrisMcCormick/encoder-rtx --include 'runs/mlm-base8k/*' --local-dir ~/.cache/encoder-rtx/hub
+EPOCHS=1 DECISION_FRAC=0.5 LR_SCALE=0.3 RUN_NAME=dec-f50-e1 python train_decision.py
+```
+
+It is stage 1's script with Phase 0's decision path brought in:
+
+- **Packs** of decision records and ClimbMix filler, as in Phase 0 (below): every state,
+  question and filler document is its own segment, and a question's RoPE positions
+  continue its state's. The filler is trained on MLM at the base's 0.50 rate, cut at 8,192
+  like the base's documents, and starts at train shard 8, past what the base read. `EPOCHS`
+  passes over the records set the step count. Training packs and evaluation packs are each
+  padded to their own static widths (segment slots, records, readout slots): FA2 launches
+  blocks for every segment slot up to `max_seqlen`, so padding the training packs to the
+  evaluation packs' ~4x larger widths cost ~20% of the step at 8K.
 - **The question-to-state FA2 call**, merged with the self call by the softmax LSEs before
-  baseline-6's per-head output norm and gate. The self call keeps the base's windows
-  (256 each way, full on layers 3 and 7), and the cross call reads the whole state. The
-  n-gram memories hash as in the base, across segment boundaries: a segment's first
-  token pairs with the previous segment's last. No label is ever an input, so no label
-  crosses.
+  Baseline 6's per-head output norm and gate. The self call keeps the base's windows
+  (256 each way, the whole segment on layers 3 and 7), and the cross call reads the whole
+  state. The n-gram memories hash as in the base, across segment boundaries: a segment's
+  first token pairs with the previous segment's last. No label is ever an input, so no
+  label crosses.
+- **Layers 5-7 at the read rows**, as in stage 1: here the corrupted filler positions and
+  the readouts. Padding readout slots sit outside every gathered query segment.
 - **The readout** is Phase 0's single vector, trained by cross-entropy against each
   question's target. That target is the hard label, or `SOFT_WEIGHT` x a soft target
   (the record's own, or a teacher's joined in by the data prep) + the rest on the label.
 - **Init from the base** (`INIT_FROM`): the weights, with exact fp32 masters. Optimizer
-  state is fresh, and the step count and schedules are this run's. `LR_SCALE` multiplies
-  the recipe's rates on every pre-trained weight. The readout is new and keeps its own
-  rate.
-- **Evaluation:** the base's own MLM validation, on the same 3.30M corrupted positions
-  (the loaded base scores its run's 1.7756). Plus accuracy and Brier score on the clean
-  rows of decision-v7 and transfer-v4 development.
+  state is fresh, and the step count and schedules are this run's (the x0 scalars' 20-step
+  warmup included). `LR_SCALE` multiplies stage 1's rates on every pre-trained weight. The
+  readout is new and keeps its own rate.
+- **Evaluation:** the base's own MLM validation, on the same 3.30M corrupted positions (the
+  loaded 8K base reads its run's 1.7790). Plus accuracy and Brier score on the clean rows
+  of decision-v7 and transfer-v4 development, Phase 1's holdout families (clinc150,
+  formality, health_fact) and JevBench's 231 public items, with accuracy by source and by
+  state length (over / under 2,048 tokens) at the end.
 - Knobs from the environment, logged: `EPOCHS` (1), `DECISION_FRAC` (0.9), `LR_SCALE`
   (0.3), `SOFT_WEIGHT` (1.0), `DECISION_WEIGHT` (1.0), `TRAIN_SPLITS` (`train`; add
-  splits the data prep writes), `STATE_CAP` (2048), `INIT_FROM`, `VAL_EVERY` (25),
-  `MASK_RATE` (0.50), `RUN_NAME`, `USE_WANDB`, `ABORT_STEP`, `SAVE_CHECKPOINT`.
+  splits the data prep writes, e.g. `train,phase1_train`), `STATE_CAP` (8192), `INIT_FROM`,
+  `VAL_EVERY` (25), `MASK_RATE` (0.50), `RUN_NAME`, `USE_WANDB`, `ABORT_STEP`,
+  `SAVE_CHECKPOINT`.
+
+One epoch of Kev's records, `DECISION_FRAC=0.5 LR_SCALE=0.3` (accuracy on the clean rows):
+
+| base | states cut at | val MLM | decision-dev | transfer-dev | Phase 1 holdout | JevBench | s/step |
+|---|---|---|---|---|---|---|---|
+| `mlm-base4gb` (before Baseline 6's last fold, shared pack widths) | 2,048 | 1.830 | 0.619 | 0.514 | 0.438 | 0.424 | 0.399 |
+| `mlm-base8k` | 2,048 | 1.834 | 0.634 / 0.634 | 0.485 / 0.480 | 0.433 / 0.439 | 0.463 / 0.437 | 0.312 |
+| **`mlm-base8k`** | 8,192 | 1.835 | 0.645 / 0.638 | 0.499 / 0.511 | 0.442 / 0.439 | 0.442 / 0.433 | 0.318 |
+
+Two runs each for the 8K base. The same config run twice differs by up to 0.03 on JevBench
+(n = 231) and 0.01-0.02 elsewhere, so whole states and cut ones are level here: JevBench's 36
+states over 2,048 scored 12 whole against 13 cut. Kev-0.8B scores 0.648 on transfer-dev,
+d3-flash 0.823 on JevBench.
 
 **Input format** under the base's 16K Unigram tokenizer: Phase 0's (below), with the
 state opening with BOS. `<|mask|>` is the base's `[MASK]` (16,369). The other 18 special
 tokens take ids 16,384-16,401, so the input embeddings and value embeddings grow to
 16,448 rows. Each new row starts from the base's rows for the word that names its token.
 The LM head stays at 16,384, since MLM never targets a special token. States are cut to
-their first 2,048 tokens, since the base never saw a longer document. That cut affects
-1,057 training records and none in the dev splits.
+their first `STATE_CAP` tokens: at 8,192, 2 of Kev's 30,540 training records are cut, and
+none in the evaluation splits (JevBench's longest state is 4,170 tokens).
 
 **Data:** `data/prepare_decision_data.py` tokenizes anything in Kev's suite schema, one
 JSON record per line, into `~/.cache/encoder-rtx/decision16k/<split>.parquet`. `SPLITS`
@@ -71,6 +156,8 @@ kinds of source, or d3-flash's labels for a split as `("d3", <source>)`, joined 
 (record index, question name) with each record's line hash and the source files checked.
 
 ## Phase 0: `train_encoder.py`
+
+Superseded by the two stages above and kept for reference; nothing below is maintained.
 
 On an RTX Pro 6000, in the `stacks` env (decoder-rtx's `requirements-x86.txt` covers it):
 
