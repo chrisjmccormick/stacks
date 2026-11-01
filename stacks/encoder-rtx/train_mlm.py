@@ -1,0 +1,1761 @@
+# train_mlm.py
+#
+# Stage 1 of encoder-rtx: masked-language-model pre-training of the encoder (decoder-rtx's
+# Baseline 6 made bidirectional), as a single forward_backward with a handwritten backward.
+# README.md describes the model, the recipe and its numbers; train_decision.py is stage 2.
+#
+# Downloads the required number of pre-tokenized Climbmix dataset shards if not
+# already present.
+#
+# Style:
+# - Minimal helpers and classes to consolidate math and reduce redirects. 
+# - Config `cfg` and model tensor container `m` are globals.
+# - Optimizer state and learning schedules are attached to their parameters.
+# - Initialization of weight values, schedules, and optimizer state is done
+#   together. Everything is created directly on device.
+#
+# Config:
+# - "WANDB_API_KEY" is the one environment variable you need to set.
+# - Recommend setting cfg.run_name (for both wandb and log files) on every run.
+# - For shorter tests, see these flags:
+#     ABORT_STEP
+#     cfg.use_wandb
+# - SAVE_CHECKPOINT=1 writes the final weights to ~/.cache/encoder-rtx/runs/<run_name>/,
+#   the base train_decision.py starts from.
+#
+# Grep for "§" to retrieve the document outline
+# ("§ " marks a chapter, "§§ " a subsection).
+
+# ==============================================================================
+# § Setup
+# ==============================================================================
+
+import os
+import sys
+import time as _time
+run_wall_t0 = _time.perf_counter()
+del _time
+
+with open(sys.argv[0], 'r') as f:
+    code = f.read()   # the run section logs the script source to wandb
+# utils_mlm.py holds the data loader; log its source too.
+with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "utils_mlm.py"), 'r') as f:
+    code += "\n\n# " + "=" * 78 + "\n# utils_mlm.py\n# " + "=" * 78 + "\n\n" + f.read()
+
+import csv
+import functools
+import gc
+import json
+import math
+import time
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import NamedTuple
+
+import numpy as np
+import wandb
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,pinned_use_cuda_host_register:True,pinned_num_register_threads:16"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+import torch
+import torch._dynamo as dynamo
+import torch.nn.functional as F
+from torch import Tensor
+
+from torch._inductor.codecache import CacheBase
+
+from utils_mlm import (DATASET_DIR, EVAL_BUFFER_TOKENS, data_generator, download_dataset,
+                       flash_attn_varlen_fwd_lse, flash_attn_varlen_bwd)
+
+dynamo.config.recompile_limit = 64
+
+# Matmul backend chosen per shape, read from the cache shipped beside this script.
+torch._inductor.config.max_autotune_gemm = True
+torch._inductor.config.autotune_in_subproc = False
+
+# Confirm Ampere or newer
+assert torch.cuda.is_available(), "no GPU -- Runtime > Change runtime type > A100"
+
+props = torch.cuda.get_device_properties(0)
+print(f"{props.name} | {props.total_memory / 2**30:.1f} GiB | sm{props.major}{props.minor}")
+assert props.major >= 8, f"needs Ampere or newer (got sm{props.major}{props.minor})"
+
+device = torch.device("cuda", 0)
+torch.cuda.set_device(device)
+
+# Install the shipped autotune cache, if it was measured on this GPU, triton and CUDA.
+autotune_cache = Path(CacheBase.get_local_cache_path())
+shipped_cache = json.loads((Path(sys.argv[0]).resolve().parent / "autotune_cache.json").read_text())
+if not autotune_cache.is_file() and shipped_cache["system"] == CacheBase.get_system():
+    autotune_cache.parent.mkdir(parents=True, exist_ok=True)
+    autotune_cache.write_text(json.dumps(shipped_cache))
+
+# ==============================================================================
+# § Configuration
+# ==============================================================================
+
+class StackConfig:
+    """Model architecture constants and training configuration. Weight 
+    initialization, scheduling, and optimizer parameters are defined directly in
+    their code instead. This codebase generally only includes the codepath 
+    executed during the run, without togglable features; the "config" is for
+    referencing constants and documenting key settings."""
+
+    # ---- Architecture ----
+
+    # Model
+    n_layers:   int = 8
+    d_model:    int = 768
+
+    pool_layer: int = 6   # Its output is added, scaled, onto the final stream.
+
+    # Input
+    d_vocab:         int = 16384
+    mask_id:         int = 16369   # the first unused id after BOS (16368); never a target
+
+    # Attention
+    n_qo_heads: int = 6
+    n_kv_heads: int = 6     # n_qo == n_kv means full multihead attention.
+    d_qk:       int = 128   # Attention head size.
+    d_vo:       int = 128   # Note: FA2 requires d_qk == d_vo, FA3 does not.
+
+    # Context and Sliding Window Attention
+    seq_len:          int = 2048
+    short_win_size:   int = 256     # each way: the window is 2 x 256 + 1 wide
+    full_ctxt_layers: list[int] = [3, 7]
+    window_sizes:     list[tuple[int, int]]  # Derived below.
+
+    # Attention - Input Reuse
+    source_layer:     int = 4
+    source_readers:   list[int] = [5, 6, 7]
+
+    # Attention - Gates
+    d_gate:    int = 16  # Gate input is a 16-dim slice of the layer's attention input.
+                         # Each head has its own gate, all with same input.
+
+    # Attention - Value Embeddings
+    ve_layers: list[int] = [1, 3, 5, 7]
+    ve_index:  list[int] # Derived from ve_layers.
+    num_ves:   int
+
+    # Attention - N-gram Value Memories
+    # Each memory sits on one layer and has two hash slots, each keyed on the tokens at
+    # its offsets from the position (0 is the position itself, -1 the token before it,
+    # +1 the one after). The keys hash the corrupted input, so a slot keyed on offset 0
+    # reads [MASK] at a masked position.
+    d_ngram:        int = 36 * 16384   # rows per hash slot
+    ngram_specs:    list = [(1, (-1, 0),     (-1, 0)),
+                            (3, (-1, 0),     (-1, 0)),
+                            (5, (-1, 0),     (-1, 0)),
+                            (7, (-1, 0),     (-1, 0))]   # (layer, slot 0 offsets, slot 1 offsets)
+    num_ngrams:     int
+    ngram_memories: list[list[tuple[int, int]]]  # Derived: per layer, its (memory, gate slice) pairs.
+    touched_rows:   int = 180_000      # Bound on the distinct rows of one hash a batch touches (checked at startup).
+
+    # MLP
+    d_mlp:      list[int] = [768 * r for r in (2, 2, 3, 3, 5, 5, 6, 6)]  # per layer; mean 4x = 3072
+
+    # Model stats, for MFU and logging
+    num_params:          int                   # every trained weight, counted after init (§ Weight Init & Schedule)
+    num_flops_per_token: int = 442_000_000     # 6 * (56.6M trunk + 0.3 * 12.6M head) matmul params + attention both ways
+
+    # ---- Training ----
+
+    # Batch Size
+    train_batch_tokens: int = 96 * 2048   # 192K tokens per step
+
+    # MLM: the corrupted share of each micro-batch (BOS excluded), 80% [MASK],
+    # 10% a random token, 10% left as is. The count is fixed so the shapes are static.
+    mask_rate:        float = 0.50   # the validation's rate stays 0.30
+    train_targets:    int           # Derived: corrupted positions per training micro-batch
+    val_targets:      int           # Derived: per validation micro-batch
+
+    # Training
+    num_steps: int = 2605
+
+    # Evaluation and logging
+    val_loss_every:  int = 333
+    val_tokens:      int = 168 * 65536   # 11M tokens per validation pass
+    val_steps:       int                 # Derived: val micro-batches per pass.
+
+    # Logging
+    wandb_project:   str = "encoderstack_rtx_dev"
+    run_name:        str = "mlm-base"  # both wandb and log files
+    use_wandb:       bool = True
+
+    save_checkpoint: bool = False
+    save_steps:      tuple = ()
+
+    seed:            int  = 42      # For model initialization
+
+cfg = StackConfig() # Make config a global, don't pass it around.
+
+# ==============================================================================
+# § Derived Configs
+# ==============================================================================
+
+# Set this to run training under the normal schedule and have it abort
+# part way. Great way to test things out without changing num_steps.
+# None = run the full num_steps; 0 = validate the init and exit.
+ABORT_STEP = None
+
+# Torch profiler: trace steps 12-13 (post-compile, post step-10 log hooks),
+# then abort at 14. Rank 0 writes logs/<run_name>_trace.json.gz -- view at
+# ui.perfetto.dev.
+PROFILE = False
+
+# Session knobs, from the environment (values logged below). Stripped once settled.
+cfg.num_steps  = int(os.environ.get("NUM_STEPS", cfg.num_steps))
+cfg.run_name   = os.environ.get("RUN_NAME", cfg.run_name)
+cfg.mask_rate  = float(os.environ.get("MASK_RATE", cfg.mask_rate))
+cfg.use_wandb  = bool(int(os.environ.get("USE_WANDB", int(cfg.use_wandb))))
+cfg.save_checkpoint = bool(int(os.environ.get("SAVE_CHECKPOINT", int(cfg.save_checkpoint))))
+LR_SCALE       = float(os.environ.get("LR_SCALE", 0.7))
+ABORT_STEP     = int(os.environ["ABORT_STEP"]) if "ABORT_STEP" in os.environ else ABORT_STEP
+print(f"Knobs: num_steps {cfg.num_steps} | run_name {cfg.run_name} | mask_rate {cfg.mask_rate} | "
+      f"use_wandb {cfg.use_wandb} | ABORT_STEP {ABORT_STEP} | LR_SCALE {LR_SCALE} | save_checkpoint {cfg.save_checkpoint}")
+
+if cfg.use_wandb:
+    assert "WANDB_API_KEY" in os.environ, "cfg.use_wandb=True but WANDB_API_KEY not set"
+    wandb.login(key=os.environ["WANDB_API_KEY"])
+
+# Map layers to VE and n-gram bank slots.
+cfg.ve_index = [cfg.ve_layers.index(i) if i in cfg.ve_layers else -1 for i in range(cfg.n_layers)]
+cfg.num_ves = len(cfg.ve_layers)
+cfg.num_ngrams = len(cfg.ngram_specs)
+# A memory's gate reads the gate slice of its order (bigram 1, trigram 2); slice 0 is the head and VE gates'.
+cfg.ngram_memories = [[(n, max(len(s0), len(s1)) - 1) for n, (layer, s0, s1) in enumerate(cfg.ngram_specs) if layer == i]
+                      for i in range(cfg.n_layers)]
+
+# Per-layer window sizes for sliding window attention, defined as (left, right)
+# tuples: tokens attended to each side of the position, within the document.
+cfg.window_sizes = [(cfg.short_win_size, cfg.short_win_size)] * cfg.n_layers  # All short, ...
+for i in cfg.full_ctxt_layers:
+    cfg.window_sizes[i] = (-1, -1)                                             # ... then overwrite with full.
+
+cfg.val_steps = cfg.val_tokens // EVAL_BUFFER_TOKENS
+
+# Corrupted positions per micro-batch, a multiple of 64.
+cfg.train_targets = 64 * int(cfg.mask_rate * cfg.train_batch_tokens / 64)
+cfg.val_targets   = 64 * int(0.30 * EVAL_BUFFER_TOKENS / 64)   # the validation metric is at 30% whatever the training rate
+
+gpu_device_name = torch.cuda.get_device_name(0)   # "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+# Dense BF16 peak FLOPS of the RTX PRO 6000, the MFU denominator.
+gpu_peak_flops = 503.8e12
+
+download_dataset()
+
+
+# Reject a vocab mismatch between the .bin shards and the model.
+with open(os.path.join(DATASET_DIR, "config.json")) as f:
+    dataset_config = json.load(f)
+    assert dataset_config["vocab_size"] == cfg.d_vocab, "dataset vocab != model d_vocab"
+    bos_id = dataset_config["bos_id"]
+    assert bos_id < cfg.mask_id < cfg.d_vocab
+
+# token_bytes: per-token-id byte lengths (0 for special tokens), for the
+# vocab-size-independent bits-per-byte validation metric.
+with open(os.path.join(DATASET_DIR, "tokenizer/token_bytes.pt"), "rb") as f:
+    token_bytes = torch.load(f, map_location=device)
+assert token_bytes[cfg.mask_id] == 0 and token_bytes[bos_id] == 0, "mask_id / bos_id are not special tokens"
+
+
+# ==============================================================================
+# § Data Structures
+# ==============================================================================
+
+# NamedTuples can be passed to compiled functions.
+class Param(NamedTuple):
+    """Model parameter bundled with everything needed for training it."""
+
+    name:         str
+    w:            Tensor    # The actual weight
+
+    # Optimizer State
+    mantissa:     Tensor    # Larry Dial's trick for storing an fp32 master
+    grad:         Tensor    # Matches full weight size
+    gbank:        list      # Banked weights unbound into a list
+    first_mntm:   Tensor
+    scnd_mntm:    Tensor
+    residual_dim: int       # NorMuon only, the smaller dim of the matrix.
+
+    # Schedules (Per-Step Coefficients)
+    lr_bc_t:      Tensor    # bias-corrected learning rate
+    wd_t:         Tensor    # weight decay * non-corrected lr; AdamW/RMSProp store 1 - that
+    mntm_b1_t:    Tensor    # Beta1
+    grad_b1_t:    Tensor    # 1 - Beta1
+    mntm_b2_t:    Tensor    # Beta2
+    grad_b2_t:    Tensor    # 1 - Beta2
+    eps_t:        Tensor    # AdamW and RMSProp
+
+class Model:
+    """Container for the model's weights, plus RoPE buffers"""
+
+    # Input
+    input_embeds:     Param = None
+    x0_vocab:         Tensor  # (d_vocab, D) bf16, input_embeds RMS-normed per row
+    x0_vocab_inv_rms: Tensor  # (d_vocab, 1) fp32, its 1/rms, for the norm backward
+
+    # Attention
+    W_Q: Param
+    W_K: Param
+    W_V: Param
+    W_O: Param
+    head_gate:     Param  # Per-head gate on the normed attention output, every layer.
+    value_embeds:  Param
+    ve_gate:       Param
+    ngram_values:  Param  # The n-gram value memories: two hash slots per memory.
+    ngram_gate:    Param
+    ngram_mults:   list   # [memory][slot][offset] odd hash multipliers
+
+    # MLP -- one bank per width, W_in_<d> / W_out_<d> (see mlp_banks)
+
+    # Cross-Layer
+    x0_lambdas:     Param   # Per-layer coefficient for reading the input embedding.
+    x0_gates:       Param   # Per-layer scale on the channel-mean gate of that read.
+    resid_lambdas:  Param   # Per-layer gain on the residual stream.
+    pool_lambda:    Param   # Weight of the pool layer's output in the final stream.
+
+    # Output
+    lm_head: Param
+
+    # Rotary Cache
+    cos: Tensor
+    sin: Tensor
+
+    # `for p in m` yields every trained weight, in config-table order.
+    def __iter__(self):
+        return (v for v in vars(self).values() if isinstance(v, Param))
+
+# NamedTuples are torch.compile-friendly.
+class LayerStash(NamedTuple):
+    """One layer's forward activations, held for the backward pass.
+    Commented-out rows are what we recompute rather than hold.
+    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB
+    """
+    #                                                            Stash (Tiny) Recompute
+    x_in:               Tensor    # (L,  T,    D)             2.25GB
+    x_biased_hat:       Tensor    # (L,  T,    D)             2.25GB
+    x_biased_inv_rms:   Tensor    # (L,  T,    1)         fp32          (6MB)
+    q_hat:              Tensor    # (L,  T, n_qo, d_qk)       2.25GB
+    k_hat:              Tensor    # (L,  T, n_kv, d_qk)       2.25GB
+    q_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (36MB)
+    k_inv_rms:          Tensor    # (L,  T, n_kv,    1)   fp32         (36MB)
+    #ve:                Tensor    # (Lv, T, n_kv, d_vo)                        1.13GB
+    #ve_gate_a:         Tensor    # (Lv, T, n_kv)                                (9MB)
+    v:                  Tensor    # (L,  T, n_kv, d_vo)       2.25GB
+    y:                  Tensor    # (L,  T, n_qo, d_vo)       2.25GB
+    y_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (36MB)
+    lse:                Tensor    # (L,  n_qo,  T)        fp32         (36MB)
+    x_attn_out_hat:     Tensor    # (L,  T,     D)            2.25GB
+    x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (6MB)
+    mlp_a:              Tensor    # (L,  T, d_mlp[i])            9GB
+    #mlp_relu:          Tensor    # (L,  T, d_mlp[i])                             9GB
+    mlp_out_hat:        Tensor    # (L,  T,     D)            2.25GB
+    mlp_out_inv_rms:    Tensor    # (L,  T,     1)        fp32          (6MB)
+    #                                                         ------           ------
+    #                                                 TOTAL:    27GB           10.1GB
+
+# Model-level activations held as locals:
+#   x0                 (T, D)          288MB    layer-blend backward
+#   x_pool             (T, D)          288MB    pooling backward
+#   x_final_hat        (T, D)          288MB    final-norm backward
+#   x_final_inv_rms    (T, 1)   fp32   (0.8MB)
+#   x_mlm_hat          (M, D)          144MB    lm_head grad
+#   ngram_ids          (4, 2, T) int64  13MB    the n-gram tables' rows
+#                               TOTAL: 1.0GB
+
+# Cast shorthands for the bodies below: the fp32 scalars/gates need explicit
+# bf16 casts at their use sites (see forward_backward's docstring), and the
+# scalar-parameter grad sums accumulate in fp32.
+bf16  = lambda x: x.to(torch.bfloat16)
+sum32 = lambda x: x.sum(dtype=torch.float32)
+
+
+# ==============================================================================
+# § MLM Corruption
+# ==============================================================================
+
+def corrupt(tokens, num_targets, gen):
+    """num_targets random non-BOS positions of `tokens`, 80% of them replaced by
+    [MASK], 10% by a random token, 10% left as they are: returns (idx, pos, labels),
+    the corrupted input, the positions (sorted) and the tokens that were there."""
+    T = tokens.numel()
+    score = torch.rand(T, device=device, generator=gen) + (tokens == bos_id).float()   # BOS sorts last
+    pos = score.argsort()[:num_targets].sort().values
+    labels = tokens[pos]
+    draw = torch.rand(num_targets, device=device, generator=gen)
+    random_tokens = torch.randint(0, bos_id, (num_targets,), device=device, generator=gen, dtype=torch.int32)
+    replacement = torch.where(draw < 0.8, torch.full_like(labels, cfg.mask_id),
+                              torch.where(draw < 0.9, random_tokens, labels))
+    idx = tokens.clone()
+    idx[pos] = replacement
+    return idx, pos, labels.long()
+
+
+# ==============================================================================
+# § Train Forward + Backward
+# ==============================================================================
+
+@torch.compile(dynamic=False, fullgraph=True)
+@torch.no_grad()
+def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True):
+    """One micro-batch through the model: the corrupted tokens `idx`, read out at
+    the M positions `pos` against `labels`. Use backward=False for validation."""
+
+    # Direction naming:
+    # A bare name is the forward pass; a 'b' on its leading symbol is the
+    # backward pass -- the gradient w.r.t. that exact tensor. Any tags after
+    # the symbol carry over unchanged:
+    #   x -> xb,  q -> qb,  q_hat -> qb_hat,  x_final_hat -> xb_final_hat.
+    # The leading symbol can be more than one word -- 've_gate' is the core,
+    # so its grads are ve_gateb_*, not veb_gate_* ('veb' is the value embeds).
+    #
+    # Stream stages (forward name; each has a matching xb_* in bwd). Each is
+    # named for what was just done to it:
+    # x0_vocab   - The normed embedding table, one row per vocab entry (m.x0_vocab)
+    # x0         - The normed embedding (x0_vocab's rows), re-read by every layer
+    # x          - The running residual stream (x_in is this layer's input)
+    # x_biased   - Layer input scaled by resid_lambda, biased by x0
+    # x_src      - The source_layer's output, the source_readers' attention input
+    # x_attn_out - Post-attention stream, the MLP's input
+    # x_final    - Post-pooling stream, feeding the lm_head
+    # x_mlm      - The final stream at the corrupted positions
+    #
+    # RMS naming:
+    # *_inv_rms  - 1/rms, used by RMS norm fwd and bwd.
+    # *_hat      - RMS-normed  (x_hat = x * inv_rms)
+    #
+    # Activation naming -- the MLP and the gates share three stages:
+    # *_z        - Pre-nonlinearity, the raw matmul output. Only ever named in
+    #              bwd (mlpb_z, ve_gateb_z, ngram_gateb_z, x0_gateb_z); inlined in fwd.
+    #              ('logit' is reserved for the lm_head's output.)
+    # *_relu     - Post-relu, pre-square (MLP only; recomputed in bwd).
+    # *_sig      - Post-sigmoid, in [0, 1] (gates only; recomputed in bwd).
+    # *_a        - The final activation handed onward: mlp_a = mlp_relu^2,
+    #              ve_gate_a = 2*ve_gate_sig.
+
+    assert idx.ndim == 1
+    T = idx.size(0)
+    M = pos.size(0)
+    half = cfg.d_qk // 2
+
+    assert T <= m.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {m.cos.size(1)}"
+
+    cos, sin = m.cos[0, :T], m.sin[0, :T]  # (T, 1, d_qk): [cos, cos] and [sin, -sin]
+    ve_table = m.value_embeds.w.view(cfg.num_ves, cfg.d_vocab, -1)
+    x_pool = None
+    x_src_hat = None
+
+    # The n-gram memories' rows: each slot hashes the (corrupted) tokens at its offsets
+    # from the position, the micro-batch's edges padded with their own token.
+    curr = idx.long()
+    at = lambda off: (curr if off == 0 else
+                      torch.cat([curr[:1].expand(-off), curr[:off]]) if off < 0 else
+                      torch.cat([curr[off:], curr[-1:].expand(off)]))
+    ngram_ids = torch.stack([torch.stack([
+        functools.reduce(torch.bitwise_xor, [at(off) * mult for off, mult in zip(offsets, mults)]) % cfg.d_ngram
+        for offsets, mults in zip((s0, s1), m.ngram_mults[n])])
+        for n, (_, s0, s1) in enumerate(cfg.ngram_specs)])   # (num_ngrams, 2, T)
+
+    # -----------------------------
+    #           Forward
+    # -----------------------------
+
+    # Look up the normed input embeds; also added back to the stream at every layer.
+    x0 = F.embedding(idx, m.x0_vocab)                   # appears as x0b in bwd
+
+    # Layer 0's q, k, v, projected once per vocab row.
+    W_qkv0 = torch.cat([m.W_Q.w[0], m.W_K.w[0], m.W_V.w[0]])   # (3D, D)
+    qkv0_vocab = m.x0_vocab @ W_qkv0.mT                        # (d_vocab, 3D)
+
+    # The residual stream starts as the normed embedding.
+    x = x0
+
+    # One LayerStash of forward activations per layer
+    stash = []
+
+    # For each layer,
+    for i in range(cfg.n_layers):
+        x_in = x
+
+        # Scale residual stream, add gated input embedding
+        x0_gate = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in.float().mean(dim=-1, keepdim=True))   # (T, 1)
+        x_biased = m.resid_lambdas.w[i] * x_in + bf16(m.x0_lambdas.w[i] * x0_gate) * x0
+
+        # Attention input norm. Layer 0 attends from x0, the source_readers from the source stream.
+        if i == 0:
+            x_biased_hat, x_biased_inv_rms = x0, None
+        elif i in cfg.source_readers:
+            x_biased_hat, x_biased_inv_rms = x_src_hat, x_src_inv_rms
+        else:
+            x_biased_inv_rms = (x_biased.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+            x_biased_hat = bf16(x_biased.float() * x_biased_inv_rms)
+
+        # QKV Projections. Layer 0 looks its q, k, v up by token.
+        if i == 0:
+            q, k = F.embedding(idx, qkv0_vocab[:, :2 * cfg.d_model]).view(T, 2, cfg.n_qo_heads, cfg.d_qk).unbind(1)  # n_qo == n_kv
+            v = F.embedding(idx, qkv0_vocab[:, 2 * cfg.d_model:]).view(T, cfg.n_kv_heads, cfg.d_vo)
+        else:
+            q = (x_biased_hat @ m.W_Q.w[i].mT).view(T, cfg.n_qo_heads, cfg.d_qk)
+            k = (x_biased_hat @ m.W_K.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_qk)
+            v = (x_biased_hat @ m.W_V.w[i].mT).view(T, cfg.n_kv_heads, cfg.d_vo)
+
+        # Value Embeddings
+        j = cfg.ve_index[i]
+        if j >= 0:
+            ve = F.embedding(idx, ve_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
+            ve_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.ve_gate.w[j].mT)
+            ve_gate_a = 2 * ve_gate_sig          # (T, n_kv_heads), in [0, 2]
+            v = v + ve_gate_a.unsqueeze(-1) * ve # ve and the gate are both recomputed in bwd, not stashed
+
+        # N-gram value memories, gated like ve, each from its own slice of the input
+        for n, gate_slice in cfg.ngram_memories[i]:
+            ngram_v = torch.cat([F.embedding(ngram_ids[n, h], ngram_wbank[2 * n + h]) for h in (0, 1)],
+                                dim=-1).view(T, cfg.n_kv_heads, cfg.d_vo)
+            ngram_gate_sig = torch.sigmoid(x_biased_hat[..., gate_slice * cfg.d_gate:(gate_slice + 1) * cfg.d_gate] @ m.ngram_gate.w[n].mT)
+            v = v + (2 * ngram_gate_sig).unsqueeze(-1) * ngram_v
+
+        # QK-Norm, then RoPE
+        q_inv_rms = (q.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        k_inv_rms = (k.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        q, k = q.float() * q_inv_rms, k.float() * k_inv_rms
+        q_hat = bf16(q * cos + torch.roll(q, half, dims=-1) * sin)
+        k_hat = bf16(k * cos + torch.roll(k, half, dims=-1) * sin)
+
+        # Read V from the residual streams both ways by matching their K.
+        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cfg.seq_len, cfg.window_sizes[i])
+        y = y.contiguous()
+
+        # Per-head output norm and gate
+        y_inv_rms = (y.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        head_gate_a = 2 * torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T, n_qo_heads)
+        y_gated = bf16(y.float() * y_inv_rms * head_gate_a.unsqueeze(-1))
+
+        # Project value heads onto their output heads.
+        attn_out = y_gated.view(T, -1) @ m.W_O.w[i].mT
+
+        # Write back to the stream.
+        x_attn_out = x_biased + attn_out
+
+        # MLP input norm. Stashed, not recomputed.
+        x_attn_out_inv_rms = (x_attn_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        x_attn_out_hat = bf16(x_attn_out.float() * x_attn_out_inv_rms)
+
+        # MLP -- this layer's width has its own bank; k is the layer's slot in it
+        W_in, W_out, k = mlp_banks[i]
+        mlp_a = F.relu(x_attn_out_hat @ W_in.w[k].mT - 0.75).square()   # (T, d_mlp[i]) stashed
+        mlp_out = mlp_a @ W_out.w[k].mT
+        mlp_out_inv_rms = (mlp_out.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+        mlp_out_hat = bf16(mlp_out.float() * mlp_out_inv_rms)
+
+        # Write back to the stream.
+        x = x_attn_out + mlp_out_hat        # the residual stream; appears as xb in bwd
+
+        # The source layer's output is the source_readers' attention input.
+        if i == cfg.source_layer:
+            x_src_inv_rms = (x.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+            x_src_hat = bf16(x.float() * x_src_inv_rms)
+
+        # Stash the pool layer's output, to add it onto the final stream.
+        if i == cfg.pool_layer:
+            x_pool = x
+
+        # Stash activations for backward pass. Skipped entirely under eval.
+        if backward:
+            stash.append(LayerStash(x_in=x_in, x_biased_hat=x_biased_hat, x_biased_inv_rms=x_biased_inv_rms,
+                                    q_hat=q_hat, k_hat=k_hat, q_inv_rms=q_inv_rms, k_inv_rms=k_inv_rms,
+                                    v=v, y=y, y_inv_rms=y_inv_rms, lse=lse, x_attn_out_hat=x_attn_out_hat,
+                                    x_attn_out_inv_rms=x_attn_out_inv_rms, mlp_a=mlp_a,
+                                    mlp_out_hat=mlp_out_hat, mlp_out_inv_rms=mlp_out_inv_rms))
+
+    x_final = x + bf16(m.pool_lambda.w) * x_pool
+
+    # Final output norm
+    x_final_inv_rms = (x_final.float().square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+    x_final_hat = bf16(x_final.float() * x_final_inv_rms)
+
+    # -----------------------------
+    #           MLM Head
+    # -----------------------------
+    # Only the corrupted positions are read out, M of them.
+    x_mlm_hat = x_final_hat[pos]    # (M, D)
+    tgt = labels.unsqueeze(1)       # (M, 1)
+
+    # ==== Forward ====
+    logits_raw = x_mlm_hat @ m.lm_head.w.mT  # (M, d_vocab) bf16
+
+    # "softcap" logits to the range -15 to 15
+    logits = 15.0 * torch.tanh(logits_raw.float() / 15.0) # (M, d_vocab)
+
+    # Typically, subtract off the highest logit per token first:
+    #    max_logit = logits.amax(dim=1, keepdim=True) # (M, 1)
+    #    e = (logits - max_logit).exp()  # (M, d_vocab) = ((M, d_vocab) - (M, 1)).exp()
+    # Softcap bounds to [-15, 15], so exp() is [3.06e-7, 3.3e6], so fp32 is ok.
+    e = logits.exp()  # (M, d_vocab)
+
+    # Softmax denominator
+    ssum = e.sum(dim=1, keepdim=True) # (M, 1)
+
+    # ==== Cross Entropy ====
+    # Convert back to logit space
+    lse_ce = ssum.log().squeeze(1) # (M,)
+    # Select prediction logits for target token (one random access per row)
+    tgt_logit = logits.gather(1, tgt).squeeze(1) # (M,)
+    # If validation pass, return CE in nats.
+    if not backward:
+        return (lse_ce - tgt_logit) # (M,)
+    # Return training loss for logging.
+    loss = (lse_ce - tgt_logit).mean()   # Return for tracking training loss
+
+    # ==== Backward ====
+    onehot = torch.arange(cfg.d_vocab, device=device).unsqueeze(0) == tgt # (M, d_vocab)
+
+    # Predicted probs = e / ssum; (M, d_vocab)
+    # Standard approach to backprop is (p - 1), with optimizer update w = w - grad.
+    # We flip this to (1 - p) and w = w + grad, so that:
+    # - grads and optim state move in the same direction as their param.
+    # - target token contributes positively to stream and gradients.
+    logitsb = bf16((onehot.float() - (e / ssum)) * (1.0 - logits/15.0 * logits/15.0) * loss_scale)
+
+    # Every corrupted position updates every vocab entry.
+    m.lm_head.grad.copy_((logitsb.mT @ x_mlm_hat).float()) # (d_vocab, M) @ (M, d_model) --> (d_vocab, d_model)
+
+    # The backward streams start as weighted sums of the head embeddings
+    # that they (meaningfully) predicted, at the corrupted positions; zero elsewhere.
+    xb_final_hat = torch.zeros_like(x_final_hat).index_copy_(0, pos, logitsb @ m.lm_head.w) # (T, d_model)
+    del logitsb
+
+    # -----------------------------
+    #           Backward
+    # -----------------------------
+    # Each n-gram hash's rows, compacted for the sparse updates.
+    ngram_sorted, ngram_sort_idx = ngram_ids.sort(dim=-1)                             # (num_ngrams, 2, T)
+    ngram_segment = torch.cat([torch.ones_like(ngram_sorted[..., :1]),
+                               (ngram_sorted[..., 1:] != ngram_sorted[..., :-1]).long()], dim=-1).cumsum(dim=-1) - 1
+    torch._assert_async(ngram_segment[..., -1].max() < cfg.touched_rows, "a batch touched more than cfg.touched_rows rows of one hash")
+    ngram_inverse = torch.empty_like(ngram_segment).scatter_(-1, ngram_sort_idx, ngram_segment)
+    ngram_touched = torch.full_like(ngram_sorted, cfg.d_ngram).scatter_(-1, ngram_segment, ngram_sorted)[..., :cfg.touched_rows]
+
+    # Scalar grads are collected, grad tensors updated at the end.
+    g_resid = []; g_x0 = []; g_x0_gate = []
+
+    # Each stream's cosine similarity to the vocab signal, divided by d_model.
+    # (T, 1) = ((T, d_model) * (T, d_model)).mean()
+    res_ms = (x_final_hat.float() * xb_final_hat.float()).mean(dim=-1, keepdim=True)
+
+    # The component of xb_final_hat which is perpendicular to x_final_hat?
+    xb_final = bf16(x_final_inv_rms * (xb_final_hat.float() - (x_final_hat.float() * res_ms)))
+
+    # Dot product between final vs. pooled streams.
+    m.pool_lambda.grad.copy_(sum32(xb_final * x_pool))  # (T, d_model)
+
+    # xb updates every layer, keep xb_final for the pool layer.
+    xb = xb_final                       # grad wrt layer num_layers-1's output
+    x0b = torch.zeros_like(x0)          # accumulates over layers
+    xb_src_hat = torch.zeros_like(x0)   # accumulates over the source_readers
+
+    # For each layer in reverse order,
+    for i in reversed(range(cfg.n_layers)):
+
+        # Stashed forward activations for this layer.
+        st = stash[i]
+
+        if i == cfg.pool_layer:
+            # TRAP: x_pool gets an EXTRA contribution from the final stream
+            xb = xb + bf16(m.pool_lambda.w) * xb_final
+
+        # --- MLP output norm backward: xb is the grad w.r.t. mlp_out_hat ---
+        mlp_out_hat = st.mlp_out_hat.float()
+        mlpb_out = bf16(st.mlp_out_inv_rms * (xb.float() - mlp_out_hat * (mlp_out_hat * xb.float()).mean(dim=-1, keepdim=True)))
+
+        # --- MLP backward (relu(z - 0.75)^2: mlpb_z = 2*mlp_relu*mlpb_a, self-masking
+        #     since mlp_relu is already 0 where z < 0.75) ---
+
+        W_in, W_out, k = mlp_banks[i]
+
+        # Grad w.r.t. W_out
+        W_out.gbank[k].copy_(mlpb_out.mT @ st.mlp_a) # (d_model, T) @ (T, d_mlp[i])
+
+        # Grad w.r.t. the pre-relu matmul output (mlpb_a = mlpb_out @ W_out is inline)
+        mlp_relu = st.mlp_a * (st.mlp_a + 1e-30).rsqrt()   # = mlp_a.sqrt()
+        mlpb_z = 2.0 * mlp_relu * (mlpb_out @ W_out.w[k])
+
+        x_attn_out_inv_rms, x_attn_out_hat = st.x_attn_out_inv_rms, st.x_attn_out_hat
+
+        # Grad w.r.t. W_in
+        W_in.gbank[k].copy_(mlpb_z.mT @ x_attn_out_hat) # (d_mlp[i], T) @ (T, d_model)
+
+        xb_attn_out_hat = mlpb_z @ W_in.w[k] # (T, d_mlp[i]) @ (d_mlp[i], d_model) --> (T, d_model)
+
+        xb_attn_out = xb + bf16(x_attn_out_inv_rms * (xb_attn_out_hat.float() - (x_attn_out_hat.float() * (x_attn_out_hat.float() * xb_attn_out_hat.float()).mean(dim=-1, keepdim=True))))
+
+        # Attention backward
+        x_biased_hat = st.x_biased_hat
+        y_hat = st.y.float() * st.y_inv_rms
+        head_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.head_gate.w[i].mT)   # (T, n_qo_heads)
+        m.W_O.gbank[i].copy_(xb_attn_out.mT @ bf16(y_hat * (2 * head_gate_sig).unsqueeze(-1)).view(T, -1))
+        yb_gated = (xb_attn_out @ m.W_O.w[i]).view(T, cfg.n_qo_heads, cfg.d_vo).float()
+
+        # Head gate backward
+        head_gateb_z = bf16((yb_gated * y_hat).sum(dim=-1) * (2 * head_gate_sig * (1 - head_gate_sig)))   # (T, n_qo_heads)
+        m.head_gate.gbank[i].copy_(head_gateb_z.mT @ x_biased_hat[..., :cfg.d_gate])
+        yb_hat = yb_gated * (2 * head_gate_sig).unsqueeze(-1)
+        yb = bf16(st.y_inv_rms * (yb_hat - y_hat * (y_hat * yb_hat).mean(dim=-1, keepdim=True)))
+
+        # Grads w.r.t. the gate slices of x_biased_hat
+        xb_gates = torch.zeros(T, 3 * cfg.d_gate, dtype=torch.bfloat16, device=device)
+        xb_gates[:, :cfg.d_gate] += head_gateb_z @ m.head_gate.w[i]
+
+        qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_seqlens, cfg.seq_len,
+            cfg.window_sizes[i])
+
+        # per-(token, head) norm backward
+        qb = bf16(st.q_inv_rms * (qb_hat.float() - st.q_hat.float() * (st.q_hat.float() * qb_hat.float()).mean(dim=-1, keepdim=True)))
+        kb = bf16(st.k_inv_rms * (kb_hat.float() - st.k_hat.float() * (st.k_hat.float() * kb_hat.float()).mean(dim=-1, keepdim=True)))
+
+        # rotary backward = rotation by -theta (transpose of the forward rotation)
+        qb = qb * cos - torch.roll(qb, half, dims=-1) * sin
+        kb = kb * cos - torch.roll(kb, half, dims=-1) * sin
+
+        # --- VE gate backward (ve and ve_gate_sig recomputed) ---
+        j = cfg.ve_index[i]
+        if j >= 0:
+            # Retrieve the value embeddings
+            ve = F.embedding(idx, ve_table[j]).view(T, cfg.n_kv_heads, cfg.d_vo)
+
+            # Recompute gate forward
+            ve_gate_sig = torch.sigmoid(x_biased_hat[..., :cfg.d_gate] @ m.ve_gate.w[j].mT)
+
+            # ve_gate_a broadcasts over d_vo in v = v0 + a*ve, so its grad sums
+            # that axis back out; then d/dz[2*sigmoid(z)] = 2*sig*(1 - sig).
+            ve_gateb_a = (vb * ve).sum(dim=-1)   # (T, n_kv_heads)
+            ve_gateb_z = ve_gateb_a * (2 * ve_gate_sig * (1 - ve_gate_sig))
+
+            m.ve_gate.gbank[j].copy_(ve_gateb_z.mT @ x_biased_hat[..., :cfg.d_gate])
+
+            # Embedding gradient
+            veb = (vb * (2 * ve_gate_sig).unsqueeze(-1)).reshape(T, cfg.n_kv_heads * cfg.d_vo)
+            # embedding_dense_backward beat raw index_add_ atomics ~2x
+            m.value_embeds.gbank[j].copy_(
+                torch.ops.aten.embedding_dense_backward(veb, idx, cfg.d_vocab, -1, False))
+
+            xb_gates[:, :cfg.d_gate] += ve_gateb_z @ m.ve_gate.w[j]
+
+        # --- n-gram memory backward (ngram_v and ngram_gate_sig recomputed) ---
+        for n, gate_slice in cfg.ngram_memories[i]:
+            gate_in = x_biased_hat[..., gate_slice * cfg.d_gate:(gate_slice + 1) * cfg.d_gate]
+            ngram_v = torch.cat([F.embedding(ngram_ids[n, h], ngram_wbank[2 * n + h]) for h in (0, 1)],
+                                dim=-1).view(T, cfg.n_kv_heads, cfg.d_vo)
+            ngram_gate_sig = torch.sigmoid(gate_in @ m.ngram_gate.w[n].mT)
+            ngram_gateb_z = (vb * ngram_v).sum(dim=-1) * (2 * ngram_gate_sig * (1 - ngram_gate_sig))   # (T, n_kv_heads)
+            m.ngram_gate.gbank[n].copy_(ngram_gateb_z.mT @ gate_in)
+            xb_gates[:, gate_slice * cfg.d_gate:(gate_slice + 1) * cfg.d_gate] += ngram_gateb_z @ m.ngram_gate.w[n]
+            ngram_vb = (vb * (2 * ngram_gate_sig).unsqueeze(-1)).reshape(T, 2, -1)   # each hash's half of the values
+
+            # Sparse update: row-wise RMSProp on each hash's touched rows, fused in at its gradient.
+            for h in (0, 1):
+                slot, rows = 2 * n + h, ngram_touched[n, h]
+                ngram_grad = torch.ops.aten.embedding_dense_backward(
+                    ngram_vb[:, h].float(), ngram_inverse[n, h], cfg.touched_rows, -1, False)   # (touched_rows, 384)
+                ngram_vbank[slot].mul_(m.ngram_values.mntm_b2_t[t_step])   # (rows, 1) fp32
+                ngram_mntm = (ngram_vbank[slot].index_select(0, rows)
+                              + ngram_grad.square().mean(dim=-1, keepdim=True) * m.ngram_values.grad_b2_t[t_step])
+                ngram_vbank[slot].index_copy_(0, rows, ngram_mntm)
+                ngram_wbank[slot].index_copy_(0, rows, bf16(
+                    ngram_wbank[slot].index_select(0, rows).float()
+                    + m.ngram_values.lr_bc_t[t_step] * (ngram_grad / (ngram_mntm.sqrt() + m.ngram_values.eps_t[t_step]))))
+
+        # vb passes through the value adds unchanged: v = v0 + ve_gate_a*ve + ...
+        qb = qb.view(T, cfg.n_qo_heads * cfg.d_qk)
+        kb = kb.view(T, cfg.n_kv_heads * cfg.d_qk)
+        vb = vb.reshape(T, cfg.n_kv_heads * cfg.d_vo)
+
+        if i == 0:
+            # Layer 0's projections backward, over the vocab rows.
+            qkv0b_vocab = torch.ops.aten.embedding_dense_backward(
+                torch.cat([qb, kb, vb], dim=-1), idx, cfg.d_vocab, -1, False)   # (d_vocab, 3D)
+            W_qkv0b = qkv0b_vocab.mT @ m.x0_vocab              # (3D, D) TRAP: this step's table; the update below overwrites it
+            m.W_Q.gbank[0].copy_(W_qkv0b[:cfg.d_model])
+            m.W_K.gbank[0].copy_(W_qkv0b[cfg.d_model:2 * cfg.d_model])
+            m.W_V.gbank[0].copy_(W_qkv0b[2 * cfg.d_model:])
+            x0b_vocab = qkv0b_vocab @ W_qkv0                   # (d_vocab, D)
+            xb_biased_hat = F.pad(xb_gates, (0, cfg.d_model - 3 * cfg.d_gate))
+        else:
+            m.W_Q.gbank[i].copy_(qb.mT @ x_biased_hat)
+            m.W_K.gbank[i].copy_(kb.mT @ x_biased_hat)
+            m.W_V.gbank[i].copy_(vb.mT @ x_biased_hat)
+
+            xb_biased_hat = qb @ m.W_Q.w[i] + kb @ m.W_K.w[i] + vb @ m.W_V.w[i]
+            xb_biased_hat[:, :3 * cfg.d_gate] += xb_gates
+
+        # Attention input norm backward. Layer 0's attention input was x0 itself.
+        if i == 0:
+            x0b = x0b + xb_biased_hat
+            xb_biased = xb_attn_out
+        elif i in cfg.source_readers:
+            xb_src_hat = xb_src_hat + xb_biased_hat
+            xb_biased = xb_attn_out
+        else:
+            xb_biased = xb_attn_out + bf16(st.x_biased_inv_rms * (xb_biased_hat.float() - (x_biased_hat.float() * (x_biased_hat.float() * xb_biased_hat.float()).mean(dim=-1, keepdim=True))))
+
+        # --- blend backward: x_biased = resid_lambdas[i]*x_in + x0_lambdas[i]*x0_gate*x0,
+        #     x0_gate = 2*sigmoid(x0_gates[i] * mean_c(x_in)) ---
+        x_in_mean  = st.x_in.float().mean(dim=-1, keepdim=True)                         # (T, 1)
+        x0_gate    = 2.0 * torch.sigmoid(m.x0_gates.w[i] * x_in_mean)                   # (T, 1)
+        x0_dot     = (xb_biased * x0).sum(dim=-1, keepdim=True, dtype=torch.float32)    # (T, 1)
+        x0_gateb_z = x0_dot * m.x0_lambdas.w[i] * x0_gate * (1.0 - 0.5 * x0_gate)       # (T, 1)
+        g_resid.append(sum32(xb_biased * st.x_in))
+        g_x0.append((x0_dot * x0_gate).sum())
+        g_x0_gate.append((x0_gateb_z * x_in_mean).sum())
+        x0b = x0b + bf16(m.x0_lambdas.w[i] * x0_gate) * xb_biased  # TRAP: x0 feeds every layer, accumulate
+        xb = m.resid_lambdas.w[i] * xb_biased + bf16(x0_gateb_z * (m.x0_gates.w[i] / cfg.d_model))
+
+        # TRAP: the source layer's output (this layer's input) also fed the source_readers' attention.
+        if i == cfg.source_layer + 1:
+            xb = xb + bf16(x_src_inv_rms * (xb_src_hat.float() - (x_src_hat.float() * (x_src_hat.float() * xb_src_hat.float()).mean(dim=-1, keepdim=True))))
+        stash[i] = None                          # free this layer's stash as we go
+
+    # Land the per-layer resid/x0/x0-gate scalar sums (collected in REVERSED
+    # layer order) as one stacked copy each.
+    m.resid_lambdas.grad.copy_(torch.stack(g_resid[::-1]))
+    m.x0_lambdas.grad.copy_(torch.stack(g_x0[::-1]))
+    m.x0_gates.grad.copy_(torch.stack(g_x0_gate[::-1]))
+
+    # xb is now the grad through layer 0's input, which IS x0 (same tensor), so
+    # it folds into x0b to give the full grad wrt the normed embedding.
+    x0b = x0b + xb
+
+    # --- token embedding scatter, plus layer 0's vocab-row grads ---
+    x0b_vocab = torch.ops.aten.embedding_dense_backward(x0b.float(), idx, cfg.d_vocab, -1, False) + x0b_vocab.float()
+
+    # Embedding norm backward
+    x0_vocab_f = m.x0_vocab.float()
+    embed_grad = m.x0_vocab_inv_rms * (x0b_vocab - x0_vocab_f * (x0_vocab_f * x0b_vocab).mean(dim=-1, keepdim=True))
+
+    # AdamW, inline (adamw_step_fused's math; fp32 live, no mantissa).
+    p = m.input_embeds
+    p.first_mntm.mul_(p.mntm_b1_t[t_step]).add_(embed_grad * p.grad_b1_t[t_step])           # m = beta1*m + (1 - beta1)*g
+    p.scnd_mntm.mul_(p.mntm_b2_t[t_step]).add_(embed_grad.square() * p.grad_b2_t[t_step])   # v = beta2*v + (1 - beta2)*g^2
+    w = p.w * p.wd_t[t_step] + p.lr_bc_t[t_step] * (p.first_mntm / (p.scnd_mntm.sqrt() + p.eps_t[t_step]))
+    p.w.copy_(w)
+
+    # The next step's forward norm.
+    m.x0_vocab_inv_rms.copy_((w.square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt())
+    m.x0_vocab.copy_(bf16(w * m.x0_vocab_inv_rms))
+
+    return loss
+# § Optimizer Math
+# ==============================================================================
+
+# Helpers for Master vs. Live via Mantissa
+def rebuild_master(live: Tensor, mantissa: Tensor) -> Tensor:
+    """Reconstruct the fp32 master from bf16 live bits + stashed mantissa."""
+    bits = ((live.view(torch.int16).to(torch.int32) << 16)
+            | (mantissa.view(torch.int16).to(torch.int32) & 0xFFFF))
+    return bits.view(torch.float32)
+
+def writeback_master(master: Tensor, live: Tensor, mantissa: Tensor) -> None:
+    """Truncation split of the updated master back into live + mantissa."""
+    bits = master.view(torch.int32)
+    live.view(torch.int16).copy_((bits >> 16).to(torch.int16))
+    mantissa.view(torch.int16).copy_(bits.to(torch.int16))
+
+# ------------------------------------------------------------------------------
+# §§ AdamW
+# ------------------------------------------------------------------------------
+
+@torch.compile(dynamic=False, fullgraph=True)
+def adamw_step_fused(
+    p: Param,
+    grad: Tensor,
+    t: Tensor,      # (1,) Current step for schedules
+) -> None:
+    """AdamW update of `p`."""
+
+    # ==== Buffer Update ====
+    grad = grad.float() # Some grads are bf16, EMAs are fp32.
+
+    # Update EMAs. Mix a large portion of the tracked value with a small portion
+    # of the current gradient.
+    p.first_mntm.mul_(p.mntm_b1_t[t]).add_(grad * p.grad_b1_t[t])         # m = beta1*m + (1 - beta1)*g
+    p.scnd_mntm.mul_(p.mntm_b2_t[t]).add_(grad.square() * p.grad_b2_t[t]) # v = beta2*v + (1 - beta2)*g^2
+
+    # ==== Parameter Update ====
+    if p.mantissa is not None:
+        master = rebuild_master(p.w, p.mantissa)
+    else:
+        master = p.w.float()
+
+    # Apply weight decay inplace
+    master.mul_(p.wd_t[t])
+
+    # Apply AdamW's update inplace, w = w + lr * (m / (sqrt(v) + eps))
+    master.add_(p.lr_bc_t[t] * (p.first_mntm / (p.scnd_mntm.sqrt() + p.eps_t[t])))
+
+    # Re-split the weight.
+    if p.mantissa is not None:
+        writeback_master(master, p.w, p.mantissa)
+    else:
+        p.w.copy_(master)
+
+
+# ------------------------------------------------------------------------------
+# §§ Muon
+# ------------------------------------------------------------------------------
+
+# Polar Express orthogonalization coefficients, 5 iterations.
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+# Not autotuned: autotuning a square 768x768 bank's bmm at a batch size the shipped
+# cache lacks raises inductor's "launcher() got multiple values for argument 'stream'"
+# (torch 2.10 / triton 3.6). Costs ~0.3% of the step.
+@torch.compile(dynamic=False, fullgraph=True, options={"max_autotune_gemm": False})
+def muon_step_fused(
+    p: Param,       # the (K, out, in) weight-bank bundle: live tensor, state, schedule tables
+    grad: Tensor,   # (K, out, in) fp32 gradient -- MUTATED (nesterov lerp)
+    t: Tensor,      # (1,) int64 device tensor - the schedule row to read
+) -> None:
+    """Fused Muon step on `p`: momentum -> polar_express -> variance_reduction
+    -> cautious update on the reconstructed master."""
+
+    # Nesterov momentum
+    p.first_mntm.mul_(p.mntm_b1_t[t]).add_(grad * p.grad_b1_t[t])
+    g = grad.lerp_(p.first_mntm, p.mntm_b1_t[t])
+
+    # Polar express (orthogonalization), in bf16
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if g.size(-2) > g.size(-1): # Tall matrix
+        for a, b, c in polar_express_coeffs:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else: # Wide matrix (original math)
+        for a, b, c in polar_express_coeffs:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X
+
+    # Variance reduction (NorMuon), in fp32.
+    v_mean = g.float().square().mean(dim=p.residual_dim, keepdim=True)
+    residual_dim_size = g.size(p.residual_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * residual_dim_size
+    v_norm = v_norm_sq.sqrt()
+    p.scnd_mntm.mul_(p.mntm_b2_t[t]).add_(v_mean * p.grad_b2_t[t])
+    step_size = p.scnd_mntm.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * residual_dim_size) * step_size.square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale
+
+    # Cautious weight decay + master update + truncation split back to live
+    live = p.w
+    master = rebuild_master(live, p.mantissa)
+    # Decay still has to shrink the weight, so it stays negative under the
+    # flipped update; the gate is on `g` pointing at zero, which is now `<= 0`.
+    mask = (g * master) <= 0
+    master.add_(p.lr_bc_t[t] * g - p.wd_t[t] * master * mask)
+    writeback_master(master, live, p.mantissa)
+
+
+# ==============================================================================
+# § Weight Init & Schedule
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# §§ LR Schedule
+# ------------------------------------------------------------------------------
+
+# Learning rate schedules as per-step multipliers.
+# No warmup: peak from step 0 (the x0 scalars add a 20-step one, §§ Scalars).
+steps_0idx = np.arange(cfg.num_steps, dtype=np.float64)  # 0-based, the way the loop counts
+steps_1idx = steps_0idx + 1.0                            # 1-based, the way bias corrections count
+run_frac   = steps_0idx / cfg.num_steps
+
+# Warmdown to 0.025: Muon over the last 95% of the run, AdamW over the last 60%.
+muon_frac = np.maximum(0.0, (run_frac - 0.05) / 0.95)
+adam_frac = np.maximum(0.0, (run_frac - 0.40) / 0.60)
+
+muon_lr_mult_t = (1.0 - (1.0 - 0.025) * muon_frac) * LR_SCALE
+lr_mult_t      = (1.0 - (1.0 - 0.025) * adam_frac) * LR_SCALE   # AdamW's
+
+
+# ------------------------------------------------------------------------------
+# §§ Common
+# ------------------------------------------------------------------------------
+
+m = Model()
+
+torch.manual_seed(cfg.seed)
+torch.cuda.manual_seed(cfg.seed)
+
+fp32_empty   = lambda *shape: torch.empty(*shape, dtype=torch.float32, device=device)
+bf16_empty   = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=device)
+fp32_zeros   = lambda *shape: torch.zeros(*shape, dtype=torch.float32, device=device)
+bf16_zeros   = lambda *shape: torch.zeros(*shape, dtype=torch.bfloat16, device=device)
+
+# Uniform init bound. Var(Uniform(-a, a)) = a^2/3, so std = a/sqrt(3): to hit
+# a target std of 1/sqrt(d_model), the bound must be sqrt(3) times it.
+matrix_init_s = (3 ** 0.5) * (cfg.d_model ** -0.5)
+
+upper_bf16   = lambda w: (w.contiguous().view(torch.int32) >> 16).to(torch.int16).view(torch.bfloat16)
+lower_uint16 = lambda w: (w.contiguous().view(torch.int32)      ).to(torch.int16).view(torch.uint16)
+
+# Create an fp32 tensor on the device.
+dev = lambda a: torch.tensor(a, dtype=torch.float32, device=device)
+
+
+# ------------------------------------------------------------------------------
+# §§ Scalars
+# ------------------------------------------------------------------------------
+
+resid_lambdas  = fp32_empty(cfg.n_layers).fill_(1.0)
+x0_lambdas     = fp32_empty(cfg.n_layers).fill_(0.1)
+x0_gates       = fp32_zeros(cfg.n_layers)
+pool_lambda    = fp32_zeros(1)
+
+# Grad mix-in coefficient (1-beta), currently fixed, can be scheduled here.
+scalar_grad_mult_t = np.ones(cfg.num_steps)
+
+# x0 scalars' lr: a 20-step warmup, then Muon's schedule.
+x0_lr_mult_t = muon_lr_mult_t * np.minimum(1.0, steps_1idx / 20)
+
+scalar_configs = [
+#   name,               weights,        lr schedule,     peak lr,  b1_grad,   b2_grad,    wd,
+    ("resid_lambdas",   resid_lambdas,  lr_mult_t,       0.008,    0.2,        0.05,   0.0),
+    ("x0_lambdas",      x0_lambdas,     x0_lr_mult_t,    1.2,      0.04,       0.05,   0.002),
+    ("x0_gates",        x0_gates,       x0_lr_mult_t,    1.2,      0.04,       0.05,   0.002),
+    ("pool_lambda",     pool_lambda,    lr_mult_t,       0.06,     0.04,       0.05,   0.0),
+]
+
+# For each of the scalar parameters...
+for (name, w, sched_t, peak_lr, b1_grad, b2_grad, wd) in scalar_configs:
+
+    # Derive the momentum buffers' decays.
+    b1_mntm = 1 - b1_grad # i.e., Beta1 = 1 - (1-Beta1)
+    b2_mntm = 1 - b2_grad # i.e., Beta2 = 1 - (1-Beta2)
+
+    # Build the Param for the scalar.
+    p = Param(
+        # Weight
+        name         = name,
+        w            = w,          # Live weights
+        mantissa     = None,       # Scalars are fp32 live
+
+        # Gradients
+        grad         = fp32_zeros(w.shape),
+        gbank        = None,       # Scalars don't need banks
+
+        # Momentum buffers
+        first_mntm   = fp32_zeros(w.shape),
+        scnd_mntm    = fp32_zeros(w.shape),
+
+        residual_dim = None, # Muon only
+
+        # Schedules
+        # Fold bias correction into the learning rate.
+        lr_bc_t      = dev(sched_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5 / (1.0 - b1_mntm ** steps_1idx)),
+
+        # Weight decay schedule
+        wd_t         = dev(1.0 - sched_t * peak_lr * wd),
+
+        # Beta schedule, constant (the mix-in multiplier is all ones)
+        mntm_b1_t    = dev(np.full(cfg.num_steps, b1_mntm)),   # first_mntm decay (Beta1)
+        grad_b1_t    = dev(scalar_grad_mult_t * b1_grad),      # first_mntm grad mix-in (1-Beta1)
+
+        mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+        grad_b2_t    = dev(scalar_grad_mult_t * b2_grad),      # scnd_mntm grad mix-in (1-Beta2)
+
+        eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5), # May not be necessary
+    )
+
+    # Add the parameter to the "model" container.
+    setattr(m, name, p)
+
+# ------------------------------------------------------------------------------
+# §§ Embeddings
+# ------------------------------------------------------------------------------
+
+input_embeds =     fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=1.0)
+value_embeds =     bf16_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
+value_embeds.copy_(fp32_empty(cfg.num_ves * cfg.d_vocab, cfg.n_kv_heads * cfg.d_vo)
+                   .uniform_(-matrix_init_s, matrix_init_s))
+
+# Beta1 anneals 0.8 -> 0.4 across AdamW's warmdown.
+embed_b1_mntm_t = 0.8 + (0.4 - 0.8) * adam_frac
+
+embed_configs = [
+#   name,             weights,       peak lr,  b2_grad,  wd,     slots
+    ("input_embeds",  input_embeds,  0.6,      0.05,     0.0,    1),
+    ("value_embeds",  value_embeds,  0.6,      0.05,     0.0,    cfg.num_ves)
+]
+
+# For each of the embedding tables...
+for (name, w, peak_lr, b2_grad, wd, slots) in embed_configs:
+
+    # Derive the momentum buffer's decay.
+    b2_mntm = 1 - b2_grad
+
+    # Embeddings can handle bf16 accumulation fine. input_embeds steps inline in forward_backward.
+    grad = None if name == "input_embeds" else bf16_zeros(w.shape)
+
+    p = Param(
+        # Weight
+        name         = name,
+        w            = w,          # bf16 live (input_embeds fp32), no master
+        mantissa     = None,
+
+        # Gradients
+        grad         = grad, 
+        gbank        = list(grad.view(slots, cfg.d_vocab, -1).unbind(0)) if slots > 1 else None,
+
+        # Momentum buffers
+        first_mntm   = fp32_zeros(w.shape),
+        scnd_mntm    = fp32_zeros(w.shape),
+
+        residual_dim = None, # Muon only
+
+        # Schedules
+        # Fold bias correction into the learning rate.
+        lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5 / (1.0 - embed_b1_mntm_t ** steps_1idx)),
+
+        # Weight decay schedule
+        wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+        # Beta1 annealed, Beta2 constant
+        mntm_b1_t    = dev(embed_b1_mntm_t),                   # first_mntm decay (Beta1)
+        grad_b1_t    = dev(1.0 - embed_b1_mntm_t),             # first_mntm grad mix-in (1-Beta1)
+
+        mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),   # scnd_mntm decay (Beta2)
+        grad_b2_t    = dev(np.full(cfg.num_steps, b2_grad)),   # scnd_mntm grad mix-in (1-Beta2)
+
+        eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+    )
+
+    # Add the parameter to the "model" container.
+    setattr(m, name, p)
+
+# The normed table the forward gathers from, kept current from here on by input_embeds' update.
+m.x0_vocab_inv_rms = (m.input_embeds.w.square().mean(dim=-1, keepdim=True) + 2.0 ** -23).rsqrt()
+m.x0_vocab         = bf16(m.input_embeds.w * m.x0_vocab_inv_rms)
+
+# ------------------------------------------------------------------------------
+# §§ N-gram Value Memories
+# ------------------------------------------------------------------------------
+
+ngram_values = bf16_zeros(cfg.num_ngrams * 2 * (cfg.d_ngram + 1), cfg.n_kv_heads * cfg.d_vo // 2)  # + a scratch row per slot
+
+# Beta2 anneals 0.999 -> 0.99995 across Muon's warmdown.
+peak_lr = 0.6
+ngram_b2_mntm_t = 0.999 + (0.99995 - 0.999) * muon_frac
+ngram_bc2_t     = 1.0 - ngram_b2_mntm_t ** steps_1idx
+
+m.ngram_values = Param(
+    # Weight
+    name         = "ngram_values",
+    w            = ngram_values,      # bf16 live, no fp32 master
+    mantissa     = None,
+
+    # Gradients -- none: the update is fused into forward_backward
+    grad         = None,
+    gbank        = None,
+
+    # Momentum buffers
+    first_mntm   = None,
+    scnd_mntm    = fp32_zeros(cfg.num_ngrams * 2 * (cfg.d_ngram + 1), 1),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(np.full(cfg.num_steps, peak_lr * LR_SCALE) * ngram_bc2_t ** 0.5),
+
+    wd_t         = None,
+
+    mntm_b1_t    = None,
+    grad_b1_t    = None,
+
+    mntm_b2_t    = dev(ngram_b2_mntm_t),                   # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(1.0 - ngram_b2_mntm_t),             # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * ngram_bc2_t ** 0.5),
+)
+
+# The slots as standalone tensors, so each update writes a whole one.
+ngram_wbank = list(ngram_values.view(cfg.num_ngrams * 2, cfg.d_ngram + 1, -1).unbind(0))
+ngram_vbank = list(m.ngram_values.scnd_mntm.view(cfg.num_ngrams * 2, cfg.d_ngram + 1, 1).unbind(0))
+
+# Each slot's odd multipliers, one per offset of its key.
+hash_rng = torch.Generator(device="cpu").manual_seed(0)
+m.ngram_mults = [[[2 * int(torch.randint(16384 * 64 // 2, (), generator=hash_rng)) + 1 for _ in offsets]
+                  for offsets in (s0, s1)] for _, s0, s1 in cfg.ngram_specs]
+
+
+# ------------------------------------------------------------------------------
+# §§ LM Head
+# ------------------------------------------------------------------------------
+
+lm_head = fp32_empty(cfg.d_vocab, cfg.d_model).normal_(mean=0.0, std=0.001)
+
+# Per-step multiplier on the head's grad mix-ins (1-beta). Constant: no warmup ramp.
+lm_grad_mult_t = np.ones(cfg.num_steps)
+
+peak_lr = 0.004
+b2_grad = 0.05   # (1-Beta2)
+wd      = 0.0
+
+# Derive the momentum buffer's decay.
+b2_mntm = 1 - b2_grad
+
+# Split the fp32 draw into bf16 live + stashed low bits.
+live = upper_bf16(lm_head)
+
+m.lm_head = Param(
+    # Weight
+    name         = "lm_head",
+    w            = live,
+    mantissa     = lower_uint16(lm_head),
+
+    # Gradients
+    grad         = fp32_zeros(live.shape),
+    gbank        = None,
+
+    # Momentum buffers
+    first_mntm   = fp32_zeros(live.shape),
+    scnd_mntm    = fp32_zeros(live.shape),
+
+    residual_dim = None, # Muon only
+
+    # Schedules
+    # Fold bias correction into the learning rate.
+    lr_bc_t      = dev(lr_mult_t * peak_lr * (1.0 - b2_mntm ** steps_1idx) ** 0.5 / (1.0 - embed_b1_mntm_t ** steps_1idx)),
+
+    # Weight decay schedule
+    wd_t         = dev(1.0 - lr_mult_t * peak_lr * wd),
+
+    # Beta1 annealed (the mix-in multiplier is all ones), Beta2 constant
+    mntm_b1_t    = dev(embed_b1_mntm_t),                           # first_mntm decay (Beta1)
+    grad_b1_t    = dev(lm_grad_mult_t * (1.0 - embed_b1_mntm_t)),  # first_mntm grad mix-in (1-Beta1)
+
+    mntm_b2_t    = dev(np.full(cfg.num_steps, b2_mntm)),           # scnd_mntm decay (Beta2)
+    grad_b2_t    = dev(lm_grad_mult_t * b2_grad),                  # scnd_mntm grad mix-in (1-Beta2)
+
+    eps_t        = dev(1e-10 * (1.0 - b2_mntm ** steps_1idx) ** 0.5),
+)
+
+
+# ------------------------------------------------------------------------------
+# §§ Attention & MLPs
+# ------------------------------------------------------------------------------
+
+W_Q =   fp32_empty(cfg.n_layers, cfg.n_qo_heads * cfg.d_qk, cfg.d_model).uniform_(-matrix_init_s, matrix_init_s)
+W_K =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_qk, cfg.d_model).uniform_(-matrix_init_s, matrix_init_s)
+W_V =   fp32_empty(cfg.n_layers, cfg.n_kv_heads * cfg.d_vo, cfg.d_model).uniform_(-matrix_init_s, matrix_init_s)
+W_O =   fp32_zeros(cfg.n_layers,               cfg.d_model, cfg.n_qo_heads * cfg.d_vo)  # projections start at zero
+
+# Gates start at zero.
+head_gate  = fp32_zeros(cfg.n_layers,   cfg.n_qo_heads, cfg.d_gate)
+ve_gate    = fp32_zeros(cfg.num_ves,    cfg.n_kv_heads, cfg.d_gate)
+ngram_gate = fp32_zeros(cfg.num_ngrams, cfg.n_kv_heads, cfg.d_gate)
+
+# One bank per distinct MLP width, holding that width's layers in order.
+mlp_widths = sorted(set(cfg.d_mlp))
+W_in  = {d: fp32_empty(cfg.d_mlp.count(d), d, cfg.d_model).uniform_(-matrix_init_s, matrix_init_s) for d in mlp_widths}
+W_out = {d: fp32_zeros(cfg.d_mlp.count(d), cfg.d_model, d) for d in mlp_widths}   # projections start at zero
+
+# Muon momentum: warmup from 0.85, then warmdown 0.95 -> 0.85 from 5% of the run.
+momentum = 0.85 + (0.95 - 0.85) * np.minimum(steps_0idx / 300, 1.0)
+momentum[muon_frac > 0] = 0.95 + (0.85 - 0.95) * muon_frac[muon_frac > 0] ** 2
+
+# NorMuon's second-moment decay anneals 0.95 -> 0.98 across the warmdown.
+muon_b2 = 0.95 + (0.98 - 0.95) * muon_frac
+
+# Muon weight decay: linear to zero, with three pulses.
+muon_wd = 0.1 * (1.0 - run_frac)
+pulse = np.abs(run_frac - 0.015) < 0.005
+muon_wd[pulse] *= 3.0
+pulse = np.abs(run_frac - 0.03) < 0.01
+muon_wd[pulse] *= 5.0
+pulse = np.abs(run_frac - 0.8) < 0.025
+muon_wd[pulse] *= 1.0 + (6.0 - 1.0) * (1.0 - np.abs(run_frac[pulse] - 0.8) / 0.025)
+
+# Muon peak lr is 0.04; 0.1 on W_in and 0.05 on W_out at every width.
+# rdim is the smaller dim of each matrix (-1 on the square ones).
+muon_configs = [
+#    name,           weights,       peak lr,  rdim
+    ("W_Q",          W_Q,           0.04,      -1),
+    ("W_K",          W_K,           0.04,      -1),
+    ("W_V",          W_V,           0.04,      -1),
+    ("W_O",          W_O,           0.04,      -1),
+    *[(f"W_in_{d}",  W_in[d],       0.1,       -1) for d in mlp_widths],
+    *[(f"W_out_{d}", W_out[d],      0.05,      -2) for d in mlp_widths],
+    ("head_gate",    head_gate,     0.04,      -2),
+    ("ve_gate",      ve_gate,       0.04,      -2),
+    ("ngram_gate",   ngram_gate,    0.04,      -2)
+]
+
+# For each of the Muon-trained weight banks...
+for (name, w, peak_lr, rdim) in muon_configs:
+
+    # Split the fp32 draw into bf16 live + stashed low bits.
+    live = upper_bf16(w)
+
+    grad = fp32_zeros(live.shape)
+
+    # The NorMuon second moment holds each neuron's mean-square update -- the
+    # weight's shape with its smaller dim `rdim` collapsed to 1 (after
+    # orthogonalization only the smaller dim can carry variance).
+    scnd_shape = list(live.shape)
+    scnd_shape[rdim] = 1
+
+    p = Param(
+        # Weight
+        name         = name,
+        w            = live,
+        mantissa     = lower_uint16(w),
+
+        # Gradients
+        grad         = grad,
+        gbank        = list(grad.unbind(0)),
+
+        # Momentum buffers
+        first_mntm   = fp32_zeros(live.shape),
+        scnd_mntm    = fp32_zeros(scnd_shape),
+
+        residual_dim = rdim,
+
+        # Schedules
+        # The second moment is self-normalizing (the v_norm/v_norm_new
+        # rescale), so lr_bc_t has no bias correction and there is no eps.
+        lr_bc_t      = dev(muon_lr_mult_t * peak_lr),
+        wd_t         = dev(muon_lr_mult_t * peak_lr * muon_wd),
+
+        # b1 is the nesterov momentum; b2 is the variance-reduction EMA (both scheduled above).
+        mntm_b1_t    = dev(momentum),
+        grad_b1_t    = dev(1.0 - momentum),
+        mntm_b2_t    = dev(muon_b2),
+        grad_b2_t    = dev(1.0 - muon_b2),
+
+        eps_t        = None,
+    )
+
+    # Add the parameter to the "model" container.
+    setattr(m, name, p)
+
+# The Params own everything now: free the fp32 draws, drop the adopted names.
+del lm_head, input_embeds, value_embeds, ngram_values, resid_lambdas, x0_lambdas, x0_gates, pool_lambda, W_Q, W_K, W_V, W_O, head_gate, ve_gate, ngram_gate, W_in, W_out
+
+# Each layer's MLP banks and its slot in them.
+mlp_banks = [(getattr(m, f"W_in_{d}"), getattr(m, f"W_out_{d}"), cfg.d_mlp[:i].count(d)) for i, d in enumerate(cfg.d_mlp)]
+mlp_params = [getattr(m, f"W_{io}_{d}") for io in ("in", "out") for d in mlp_widths]
+
+
+# ------------------------------------------------------------------------------
+# §§ Rotary Cache
+# ------------------------------------------------------------------------------
+
+rotary_seq_len = cfg.train_batch_tokens
+channel_range = torch.arange(0, cfg.d_qk, 2, dtype=torch.float32, device=device)  # stride the channels
+inv_freq = 1.0 / (3_000_000 ** (channel_range / cfg.d_qk))
+t_pos = torch.arange(rotary_seq_len, dtype=torch.float32, device=device)          # stride the time steps
+freqs = torch.outer(t_pos, inv_freq)   # rotation frequency at each (time, channel) pair
+
+m.cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).to(torch.bfloat16)[None, :, None, :]   # add batch and head dims
+m.sin = torch.cat([freqs.sin(), -freqs.sin()], dim=-1).to(torch.bfloat16)[None, :, None, :]  # for later broadcasting
+
+del channel_range, inv_freq, t_pos, freqs
+
+cfg.num_params = sum(p.w.numel() for p in m)
+
+
+# ==============================================================================
+# § Training Harness
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# §§ Stats
+# ------------------------------------------------------------------------------
+# One row per step. The CSV header is the field list, the wandb row is the same
+# fields under their panel prefixes. A field nobody wrote stays None, and both
+# sinks skip it.
+
+@dataclass
+class StepStats:
+
+    step:         int          = 0
+
+    # Training
+    loss:         float | None = None   # nats per corrupted position
+    lr_mult_t:    float | None = None
+    dt:           float | None = None   # seconds; unset for steps 0-10
+    tok_per_sec:  int   | None = None   # "
+    mfu:          float | None = None   # "
+
+    # Validation, on val steps only
+    mlm:          float | None = None   # nats per corrupted position
+    mbpb:         float | None = None   # bits per byte of the corrupted positions' tokens
+    eval_seconds: float | None = None
+
+    # Run clocks, in minutes; stamped by log_step
+    train_total:  float | None = None
+    wall_total:   float | None = None
+    eta:          float | None = None
+
+
+# Field -> wandb panel. A field not named here lands under `train/`.
+WANDB_GROUPS = {
+    "val":  ("mlm", "mbpb", "eval_seconds"),
+    "time": ("train_total", "wall_total", "eta"),
+}
+_WANDB_PREFIX = {f: g for g, fs in WANDB_GROUPS.items() for f in fs}
+assert set(_WANDB_PREFIX) <= {f.name for f in fields(StepStats)}, \
+    "WANDB_GROUPS names a field StepStats does not have"
+
+
+@dataclass
+class RunResult:
+    """The run in one row: the results panel, the result JSON, the runs table."""
+
+    # Identity, for the JSON; wandb has these from the run name and config
+    run_name:           str          = ""
+    num_steps:          int          = 0
+    train_batch_tokens: int          = 0
+
+    # The result
+    val_mlm:            float | None = None
+    min_val_mlm:        float | None = None
+    val_mbpb:           float | None = None
+
+    # The cost, in minutes
+    train_time:         float        = 0.0
+    val_time:           float        = 0.0
+    compile_time:       float        = 0.0
+    wall_time:          float        = 0.0
+
+    # The rate
+    avg_step_time:      float        = 0.0    # seconds
+    avg_mfu:            float        = 0.0    # percent of BF16 peak
+    peak_mem_gb:        float        = 0.0
+
+
+FINAL_IDENTITY = ("run_name", "num_steps", "train_batch_tokens")
+
+
+# ------------------------------------------------------------------------------
+# §§ Logging
+# ------------------------------------------------------------------------------
+
+def write_checkpoint(step):
+    state = {}
+    for p in m:
+        for attr in ("mantissa", "first_mntm", "scnd_mntm"):
+            buf = getattr(p, attr)
+            if buf is not None:
+                state[f"{p.name}.{attr}"] = buf.cpu()
+
+    ckpt_dir = os.path.expanduser(f"~/.cache/encoder-rtx/runs/{cfg.run_name}")   # outside both repos; nothing outside the cache survives the box
+    os.makedirs(ckpt_dir, exist_ok=True)
+    torch.save(dict(step=step, code=code, ngram_specs=cfg.ngram_specs, ngram_mults=m.ngram_mults,
+                    weights={p.name: p.w.cpu() for p in m}),
+               f"{ckpt_dir}/model_step{step:06d}.pt")
+    torch.save(dict(step=step, t_step=int(t_step.item()), state=state),
+               f"{ckpt_dir}/optim_step{step:06d}.pt")
+
+logfile = None
+os.makedirs("logs", exist_ok=True)
+logfile = f"logs/{cfg.run_name}.txt"
+print(logfile)
+
+def print0(s="", console=False):
+    with open(logfile, "a") as f:
+        if console:
+            print(s)
+        print(s, file=f)
+
+print0(code)
+print0("="*100)
+print0(f"Running Python {sys.version}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+
+print0(f"Model parameters: {cfg.num_params:,} | FLOPs/token: {cfg.num_flops_per_token:e}", console=True)
+print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}", console=True)
+print0(f"Batch size: {cfg.train_batch_tokens:,} tokens per step, {cfg.train_targets:,} corrupted "
+       f"(mask_rate {cfg.mask_rate}); validation {cfg.val_steps} x {EVAL_BUFFER_TOKENS:,} tokens, {cfg.val_targets:,} corrupted each", console=True)
+print0(f"N-gram memories: {cfg.ngram_specs} | {cfg.d_ngram:,} rows x 2 slots each | touched_rows {cfg.touched_rows:,}", console=True)
+
+# A flat row per step and the result, for analysis without wandb.
+metrics_path = f"logs/{cfg.run_name}_metrics.csv"
+result_path  = f"logs/{cfg.run_name}_result.json"
+metrics_file = open(metrics_path, "w", newline="")
+metrics_csv = csv.DictWriter(metrics_file, fieldnames=[f.name for f in fields(StepStats)])
+metrics_csv.writeheader()
+
+
+def log_step(stats):
+    """One step's row to the CSV and to wandb, stamped with the run clocks."""
+    stats.train_total = np.sum(timed) / 60
+    stats.wall_total = (time.perf_counter() - run_wall_t0) / 60
+    row = asdict(stats)
+    metrics_csv.writerow(row)
+    metrics_file.flush()
+    wandb_run.log({"step": stats.step,
+                   **{f"{_WANDB_PREFIX.get(k, 'train')}/{k}": v
+                      for k, v in row.items() if k != "step" and v is not None}})
+
+gc_t0 = 0.0
+def gc_logging_hook(phase, info):
+    """Registered at step 10: after setup, any collector run is a surprise
+    worth flagging (cycle scans cost ~500ms at random steps)."""
+    global gc_t0
+    if phase == "start":
+        gc_t0 = time.perf_counter()
+    else:
+        print(f"gc gen{info['generation']}: collected {info['collected']} "
+              f"({(time.perf_counter() - gc_t0) * 1000:.0f}ms)", flush=True)
+
+if not cfg.use_wandb:
+    class DummyWandb:
+        """No-op wandb replacement when logging is disabled."""
+        def log(self, *args, **kwargs): pass
+        def save(self, *args, **kwargs): pass
+        def finish(self): pass
+
+    wandb_run = DummyWandb()
+else:
+    wandb_run = wandb.init(
+        project=cfg.wandb_project,
+        name=cfg.run_name,
+        # The config, verbatim: every StackConfig field, defaults and derived.
+        config={name: getattr(cfg, name) for name in StackConfig.__annotations__},
+    )
+    wandb.define_metric("step", hidden=True)   # the x-axis, not a series
+    wandb.define_metric("*", step_metric="step")
+
+profiler = None
+if PROFILE:
+    ABORT_STEP = 14   # wait out compile and the step-10 hooks, trace 12-13, stop
+    from torch.profiler import ProfilerActivity, profile as torch_profile
+    profiler = torch_profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True,
+        schedule=torch.profiler.schedule(wait=11, warmup=1, active=2, repeat=1))
+    profiler.__enter__()
+
+
+# ==============================================================================
+# § Training Loop
+# ==============================================================================
+
+# Schedule position: one (1,) int64 device tensor, advanced on-device
+t_step = torch.zeros(1, dtype=torch.int64, device=device)
+
+val_mlm = None
+val_mbpb = None
+min_val_mlm = float("inf")
+smooth_train_loss = 0.0
+total_val_time = 0.0
+timed = []   # Length of each step in seconds, steps 0-10 excluded.
+             # Total training time = np.sum(timed).
+warmup = []  # Those first 11 steps, where the compile lives.
+
+train_loader = data_generator("train", cfg.seq_len, cfg.train_batch_tokens, cfg.num_steps)
+
+# The corruption draws: the training stream from the seed, the validation re-seeded
+# per micro-batch so every validation (and every run) corrupts the same positions.
+train_gen = torch.Generator(device=device).manual_seed(cfg.seed)
+val_gen = torch.Generator(device=device)
+
+tokens, cu_seqlens = next(train_loader)   # kick off the first batch
+idx, pos, labels = corrupt(tokens, cfg.train_targets, train_gen)
+
+# The distinct rows one hash touches must fit the sparse update's scratch (rows past
+# the bound get no update, silently). Checked on the first batch, with its corruption.
+curr = idx.long()
+at = lambda off: (curr if off == 0 else
+                  torch.cat([curr[:1].expand(-off), curr[:off]]) if off < 0 else
+                  torch.cat([curr[off:], curr[-1:].expand(off)]))
+ngram_rows_touched = max(
+    int(torch.unique(functools.reduce(torch.bitwise_xor, [at(off) * mult for off, mult in zip(offsets, mults)]) % cfg.d_ngram).numel())
+    for n, (_, s0, s1) in enumerate(cfg.ngram_specs) for offsets, mults in zip((s0, s1), m.ngram_mults[n]))
+del curr, at
+print0(f"n-gram rows touched by the first batch, max over slots: {ngram_rows_touched:,} (bound {cfg.touched_rows:,})", console=True)
+assert ngram_rows_touched <= cfg.touched_rows, "raise cfg.touched_rows"
+
+# Training loop
+for step in range(cfg.num_steps + 1):
+    # An abort cuts the loop but not the schedules.
+    # Set ABORT_STEP=0 to run validation only.
+    last_step = step == (cfg.num_steps if ABORT_STEP is None else ABORT_STEP)
+
+    stats = StepStats(step=step)
+
+    # --------------- Validation Loop -----------------
+    if last_step or (cfg.val_loss_every > 0 and step % cfg.val_loss_every == 0):
+        torch.cuda.synchronize()
+        val_t0 = time.perf_counter()
+        val_loader = data_generator("val", cfg.seq_len, cfg.train_batch_tokens)
+        total_nats = torch.tensor(0.0, dtype=torch.float32, device=device)
+        total_bytes = torch.tensor(0, dtype=torch.int64, device=device)
+        for i in range(cfg.val_steps):
+            v_tokens, v_cu_seqlens = next(val_loader)
+            v_idx, v_pos, v_labels = corrupt(v_tokens, cfg.val_targets, val_gen.manual_seed(1000 + i))
+            total_nats += forward_backward(v_idx, v_pos, v_labels, v_cu_seqlens, backward=False).sum()
+            total_bytes += token_bytes[v_labels].sum()
+        del val_loader
+        val_mlm = total_nats.item() / (cfg.val_steps * cfg.val_targets)
+        val_mbpb = total_nats.item() / (math.log(2) * total_bytes.item())
+        min_val_mlm = min(min_val_mlm, val_mlm)
+        val_elapsed = time.perf_counter() - val_t0
+        total_val_time += val_elapsed
+        print0(f"step:{step}/{cfg.num_steps} val_mlm:{val_mlm:.4f} val_mbpb:{val_mbpb:.4f} val_time:{val_elapsed:.2f}s", console=True)
+        stats.mlm, stats.mbpb, stats.eval_seconds = val_mlm, val_mbpb, val_elapsed
+
+    # --------------- Checkpoint -----------------
+    if cfg.save_checkpoint and (last_step or step in cfg.save_steps):
+        ckpt_t0 = time.perf_counter()
+        write_checkpoint(step)
+        print0(f"checkpoint captured at step {step} ({time.perf_counter() - ckpt_t0:.1f}s)", console=True)
+
+    # Exit final step after validation and checkpoint
+    if last_step:
+        log_step(stats)
+        break
+
+    # --------------- Training Step -----------------
+    torch.cuda.synchronize()
+    step_t0 = time.perf_counter()
+
+    # Forward and Backward pass
+    loss = forward_backward(idx, pos, labels, cu_seqlens,
+                            loss_scale=1.0 / pos.size(0))
+
+    # Next training batch
+    tokens, cu_seqlens = next(train_loader)
+    idx, pos, labels = corrupt(tokens, cfg.train_targets, train_gen)
+
+    # Smooth gradients, update weights
+
+    # Muon
+    for p in (m.W_Q, m.W_K, m.W_V, m.W_O, *mlp_params, m.head_gate, m.ve_gate, m.ngram_gate):
+        muon_step_fused(p, p.grad, t_step)
+
+    # AdamW
+    for p in (m.lm_head, m.value_embeds, m.resid_lambdas, m.x0_lambdas, \
+              m.x0_gates, m.pool_lambda):
+        # Run AdamW
+        adamw_step_fused(p, p.grad, t_step)
+
+    t_step.add_(1)  # advance the schedule on-device
+
+    train_loss = loss.item()
+    torch.cuda.synchronize()
+    dt = time.perf_counter() - step_t0
+
+    # --------------- Timing and Logging -----------------
+    pct_done = 100 * step / cfg.num_steps
+
+    # EMA the loss for readability.
+    smooth_train_loss = 0.9*smooth_train_loss + 0.1*train_loss
+    debiased_smooth_loss = smooth_train_loss / (1 - 0.9**(step + 1))
+
+    # Track time and ETA after first 10 steps to exclude compile time.
+    if step > 10:
+        timed.append(dt)
+        remaining_time = (cfg.num_steps - step - 1) * np.mean(timed) / 60
+        eta_str = f" | eta: {remaining_time:.1f}m"
+    else:
+        warmup.append(dt)
+        eta_str = ""
+
+    tok_per_sec = int(cfg.train_batch_tokens / dt)
+    mfu = 100 * cfg.num_flops_per_token * cfg.train_batch_tokens / dt / gpu_peak_flops
+
+    print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lr_mult_t: {lr_mult_t[step]:.2f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
+
+    stats.loss = train_loss
+    stats.lr_mult_t = float(lr_mult_t[step])
+    if step > 10:   # the compile and warm-up rates are not the run's rates
+        stats.dt, stats.tok_per_sec, stats.mfu = dt, tok_per_sec, mfu
+        stats.eta = remaining_time
+    log_step(stats)
+
+    if profiler is not None:
+        profiler.step()
+
+    # Keep garbage collection out of timed portion.
+    if step == 0:
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+    # Garbage collection and compile are done by step 10, flag anything after.
+    elif step == 10:
+        torch._logging.set_logs(recompiles=True)
+        gc.callbacks.append(gc_logging_hook)
+    elif step % 5000 == 0:
+        gc.collect()
+
+
+# ------------------------------------------------------------------------------
+# §§ Results
+# ------------------------------------------------------------------------------
+
+if profiler is not None:
+    profiler.__exit__(None, None, None)
+    trace_path = f"logs/{cfg.run_name}_trace.json.gz"
+    profiler.export_chrome_trace(trace_path)
+    print0(f"chrome trace -> {trace_path} (ui.perfetto.dev)", console=True)
+
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+metrics_file.close()
+
+# The warm-up steps cost the compile plus whatever they were going to cost anyway.
+avg_step_time = float(np.mean(timed)) if timed else 0.0
+compile_time = max(0.0, np.sum(warmup) - len(warmup) * avg_step_time)
+
+result = RunResult(
+    run_name           = cfg.run_name,
+    num_steps          = cfg.num_steps,
+    train_batch_tokens = cfg.train_batch_tokens,
+
+    train_time         = float(np.sum(timed)) / 60,
+    val_time           = total_val_time / 60,
+    compile_time       = compile_time / 60,
+    wall_time          = (time.perf_counter() - run_wall_t0) / 60,
+
+    avg_step_time      = avg_step_time,
+    avg_mfu            = (100 * cfg.num_flops_per_token * cfg.train_batch_tokens
+                          / avg_step_time / gpu_peak_flops) if avg_step_time else 0.0,
+    peak_mem_gb        = torch.cuda.max_memory_reserved() / 2**30,
+)
+if val_mlm is not None:
+    result.val_mlm, result.min_val_mlm, result.val_mbpb = val_mlm, min_val_mlm, val_mbpb
+
+row = asdict(result)
+with open(result_path, "w") as f:
+    json.dump(row, f, indent=1)
+wandb_run.log({"step": cfg.num_steps,
+               **{f"final/{k}": v for k, v in row.items()
+                  if k not in FINAL_IDENTITY and v is not None}})
+
+print0(f"== {result.run_name} ==", console=True)
+if result.val_mlm is not None:
+    print0(f"  val_mlm {result.val_mlm:.4f} nats per corrupted position | min {result.min_val_mlm:.4f} | val_mbpb {result.val_mbpb:.4f}", console=True)
+print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
+if timed:
+    print0(f"  {cfg.train_batch_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | median {np.median(timed):.3f}s | {int(cfg.train_batch_tokens / result.avg_step_time):,} tok/s | mfu {result.avg_mfu:.2f}%", console=True)
+print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
+
+for _f in (logfile, metrics_path, result_path):
+    wandb_run.save(_f, policy="now")
+wandb_run.finish()
