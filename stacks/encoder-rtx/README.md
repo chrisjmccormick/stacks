@@ -13,8 +13,8 @@ training (val MLM 1.779 nats per corrupted position). Its checkpoint is `runs/ml
 the private model repo `ChrisMcCormick/encoder-rtx`. `train_decision.py` starts from it and
 trains on decision records: two passes over Kev's records and Recast NLP's (d3-flash's
 labels, yes/no questions balanced per source) at a 0.5 decision share (616 steps, 3.4 min of
-training at 0.328 s/step) reach decision-dev accuracy 0.70-0.73, transfer-dev 0.50-0.51 and
-JevBench 0.45-0.49, against 0.33 / 0.39 / 0.32 for uniform guessing (Kev's records alone,
+training at 0.328 s/step) reach decision-dev accuracy 0.70-0.73, transfer-dev 0.48-0.51 and
+JevBench 0.45-0.50, against 0.33 / 0.39 / 0.32 for uniform guessing (Kev's records alone,
 one pass: 0.64 / 0.50 / 0.38-0.44). `train_encoder.py`,
 at the bottom, is Phase 0's
 single-stage fork (joint MLM + decision from scratch on the 32K BPE), superseded by the two
@@ -135,11 +135,11 @@ families at `bd5ae231`; agent-ops-stacks `encoder-rtx/2026-11-01_1203am_decision
 |---|---|---|---|---|---|---|---|---|
 | Kev's, one pass (the previous default, `TRAIN_SPLITS=train EPOCHS=1`) | 3 seeds | 1.835 | 0.638 / 0.635 / 0.646 | 0.508 / 0.497 / 0.494 | 0.443 / 0.445 / 0.449 | 0.437 / 0.381 / 0.398 | 145 | 0.318 |
 | **Kev's + Recast NLP's (d3 labels, nouls balanced), two passes** | 3 seeds (session) | 1.822 | 0.718 / 0.726 / 0.718 | 0.512 / 0.502 / 0.497 | 0.531 / 0.538 / 0.547 | 0.485 / 0.446 / 0.472 | 616 | 0.330 |
-| the same, the committed defaults | 1 | 1.820 | 0.704 | 0.508 | 0.527 | 0.468 | 616 | 0.328 |
+| the same, the committed data prep (seed 42: the defaults with no knobs; 43 / 44: the session's variant with a seed knob) | 3 seeds | 1.820 | 0.704 / 0.714 / 0.710 | 0.508 / 0.488 / 0.482 | 0.527 / 0.532 / 0.546 | 0.468 / 0.472 / 0.498 | 616 | 0.328 |
 
 The new mix lifts every in-distribution and Jev-shaped number at every seed and holds
-transfer-dev (seed means +0.08 decision-dev, +0.09 Phase 1 holdout, +0.06 JevBench, +0.004
-transfer-dev); on Cookbook-dev (TypeSafe's cookbooks as decision records, eval only) its
+transfer-dev (the committed data path against Kev-only, seed means: +0.07 decision-dev, +0.09
+Phase 1 holdout, +0.07 JevBench, -0.007 transfer-dev); on Cookbook-dev (TypeSafe's cookbooks as decision records, eval only) its
 many-option choices beat every Kev-only run. Transfer-dev doesn't move with any mix tried:
 on most of its families the stage answers one constant per family, so its accuracy reads
 priors, and the same config moves ~0.015 between seeds.
