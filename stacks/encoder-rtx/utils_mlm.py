@@ -27,13 +27,13 @@ _k = get_kernel("kernels-community/flash-attn2", version=1)
 fa2 = getattr(_k, "flash_attn_interface", _k)
 
 
-def flash_attn_varlen_fwd_lse(q, k, v, cu_seqlens, max_seqlen, window_size):
-    """Bidirectional attention forward that also returns the softmax LSE (H, T) fp32.
-    window_size is (left, right): local attention each way within a document;
-    (-1, -1) is the whole document."""
+def flash_attn_varlen_fwd_lse(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, window_size):
+    """Bidirectional attention forward that also returns the softmax LSE (H, Tq) fp32.
+    Query segment b attends to key segment b. window_size is (left, right): local
+    attention each way within a document; (-1, -1) is the whole document."""
     # FA2 takes dropout_p and softmax_scale positionally, before causal.
     out, softmax_lse, *_ = fa2._flash_attn_varlen_forward(
-        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         0.0,                        # dropout_p
         q.shape[-1] ** -0.5,        # softmax_scale
         False,                      # causal
@@ -41,7 +41,8 @@ def flash_attn_varlen_fwd_lse(q, k, v, cu_seqlens, max_seqlen, window_size):
     return out, softmax_lse
 
 
-def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqlen, window_size):
+def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k,
+                          max_seqlen_q, max_seqlen_k, window_size):
     """Attention backward for flash_attn_varlen_fwd_lse: returns (dq, dk, dv).
     FA2's varlen backward writes the grads into pre-allocated dq/dk/dv (they
     sit right after the saved tensors) and returns softmax_d."""
@@ -49,8 +50,8 @@ def flash_attn_varlen_bwd(dout, q, k, v, out, softmax_lse, cu_seqlens, max_seqle
     fa2._flash_attn_varlen_backward(
         dout, q, k, v, out, softmax_lse,
         dq, dk, dv,
-        cu_seqlens, cu_seqlens,     # cu_seqlens_q, cu_seqlens_k
-        max_seqlen, max_seqlen,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
         0.0,                        # dropout_p
         q.shape[-1] ** -0.5,        # softmax_scale
         False,                      # is_causal

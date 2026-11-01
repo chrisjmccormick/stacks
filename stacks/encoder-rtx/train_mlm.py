@@ -524,7 +524,7 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
         k_hat = bf16(k * cos + torch.roll(k, half, dims=-1) * sin)
 
         # Read V from the residual streams both ways by matching their K.
-        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cfg.seq_len, cfg.window_sizes[i])
+        y, lse = flash_attn_varlen_fwd_lse(q_hat, k_hat, v, cu_seqlens, cu_seqlens, cfg.seq_len, cfg.seq_len, cfg.window_sizes[i])
         y = y.contiguous()
 
         # Per-head output norm and gate
@@ -708,7 +708,7 @@ def forward_backward(idx, pos, labels, cu_seqlens, loss_scale=1.0, backward=True
         xb_gates[:, :cfg.d_gate] += head_gateb_z @ m.head_gate.w[i]
 
         qb_hat, kb_hat, vb = flash_attn_varlen_bwd(
-            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_seqlens, cfg.seq_len,
+            yb, st.q_hat, st.k_hat, st.v, st.y, st.lse, cu_seqlens, cu_seqlens, cfg.seq_len, cfg.seq_len,
             cfg.window_sizes[i])
 
         # per-(token, head) norm backward
