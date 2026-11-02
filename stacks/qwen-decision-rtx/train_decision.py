@@ -829,7 +829,7 @@ def stage_packs(packs, train):
                 n_options=pinned(N, R, dtype=torch.int32), target=pinned(N, R, cfg.n_codes, dtype=torch.float32),
                 n_rows=pinned(N, dtype=torch.int32), rows=[])
     tokens, pos, cu, last_pos, n_options, target = (x.numpy() for x in st[:6])
-    tokens.fill(0); pos.fill(0); cu.fill(P); last_pos.fill(P - 1); n_options.fill(1); target.fill(0.0); target[:, :, 0] = 1.0
+    tokens.fill(0); pos.fill(0); cu.fill(P); cu[:, 0] = 0; last_pos.fill(P - 1); n_options.fill(1); target.fill(0.0); target[:, :, 0] = 1.0
     for n, pack_rows in enumerate(packs):
         end = 0
         for j, row in enumerate(pack_rows):
