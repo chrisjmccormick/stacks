@@ -753,7 +753,8 @@ def main():
     if USE_WANDB:
         import wandb
         wandb.init(project="qwen_decision_rtx_dev", name=RUN_NAME,
-                   config={k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float, str, list))})
+                   config={k: v for k, v in globals().items() if k.isupper() and (isinstance(v, (int, float, str))
+                           or isinstance(v, list) and all(isinstance(s, str) for s in v))})   # the knobs, not the weight lists
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     step_time, seen = 0.0, 0
     for step in range(num_steps):
