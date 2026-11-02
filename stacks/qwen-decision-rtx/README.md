@@ -103,12 +103,23 @@ each split's clean rows:
 | | decision-dev | transfer-dev | Phase 1 holdout | JevBench | Cookbook-dev |
 |---|---|---|---|---|---|
 | Qwen3.5-9B in d3's format, no training (step 0) | 0.798 | 0.781 | 0.729 | 0.823 | 0.884 |
-| **after Kev's records** | **0.866** | **0.838** | **0.754** | **0.766** | **0.910** |
+| **after Kev's records (LoRA rank 16)** | **0.866** | **0.838** | **0.754** | **0.766** | **0.910** |
+| Kev's + Recast NLP's Phase 1 records, LoRA (R2, 93 min) | 0.865 | 0.826 | 0.746 | 0.797 | 0.900 |
+| Kev's records, every matrix trained at lr 2e-6 (R4, 57 min, 8k packs) | 0.873 | 0.834 | 0.732 | 0.762 | 0.912 |
 | the eager predecessor, same data (our special-token format) | 0.870 | 0.825 | 0.739 | 0.749 | 0.916 |
 | d3-flash | 0.845 | 0.840 | 0.775 | 0.823 | 0.900 |
 
 Above d3-flash on decision-dev and Cookbook-dev, level on transfer-dev, below on Phase 1 holdout and JevBench, where
-Kev's records alone move the base model little or backwards.
+Kev's records alone move the base model little or backwards. Adding Phase 1's records moved JevBench +0.03 and the
+rest -0.01 to 0; training every weight landed level with LoRA (the same session's R2 and R4).
+
+**The full fine-tune** is a variant of this script, `train_decision-04-full.py` in that session folder, not yet
+promoted here: every matrix trained in place (the embedding, norms and DeltaNet vectors frozen), each GEMM's weight
+gradient stepped by AdamW right where the backward computes it, the fp32 master as the live bf16 weight's bits
+over a 16-bit mantissa (decoder-rtx's trick, with the live half rounded to nearest: truncation moves half of a
+pretrained model by one bf16 ulp on its first step), bf16 moments, 8,192-token packs. 53.5 GiB of weights and
+optimizer state, 79.7 GiB peak. At lr 1e-5 it degraded the base model from step ~150 (the pack is a ~14-row batch);
+at 2e-6 it learned.
 
 ## Speed and memory
 
@@ -116,8 +127,11 @@ Kev's records alone move the base model little or backwards.
 
 | | step | tokens/s | peak memory | compile |
 |---|---|---|---|---|
-| this trainer, compiled | 1.94 s | 8.5k | 68.0 GiB | 11 s, 7 graphs |
+| this trainer, compiled (LoRA, 16,384-token packs) | 1.94 s | 8.5k | 68.0 GiB | 11 s, 7 graphs |
+| the full fine-tune variant (8,192-token packs) | 1.21 s | 6.8k | 79.7 GiB | 20 s, 6 graphs |
 | the eager predecessor (`2026-11-01_0507pm_lora-fwd-bwd`, T1) | 3.4-4.2 s | 4.0k | 85.9 GiB | |
 
 Every graph compiles in step 0 (one per layer kind and direction, the embedding, the readout, AdamW), and nothing
-recompiles after: the packs' shapes never change.
+recompiles after: the packs' shapes never change. Inductor fuses each residual add into the GEMM before it (one
+bf16 rounding where eager has two), so the compiled forward differs from eager by ~4e-3 a layer on the stream; the
+panel at step 0 is the same to a few questions a split.
