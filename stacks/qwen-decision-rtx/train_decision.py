@@ -81,8 +81,15 @@ from kernels import get_kernel
 _k = get_kernel("kernels-community/flash-attn2", version=1)
 fa2 = getattr(_k, "flash_attn_interface", _k)
 
-# FLA's chunked gated delta rule, for the DeltaNet layers.
+# FLA's chunked gated delta rule, for the DeltaNet layers: the public op for the forward,
+# and for the backward its own pieces below the autograd function.
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd as fla_gated_delta_rule_bwd
+from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from fla.modules.norm.l2norm import l2norm_bwd, l2norm_fwd
+from fla.ops.utils import chunk_local_cumsum
+from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.index import prepare_chunk_indices
 
 # ==============================================================================
 # § Configuration
@@ -434,13 +441,22 @@ def _(q, k, v, g, beta, cu, cu_cpu):
 
 @torch.library.custom_op("decision::gated_delta_rule_bwd", mutates_args=())
 def gated_delta_rule_bwd(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor, outb: Tensor, cu: Tensor, cu_cpu: Tensor) -> list[Tensor]:
-    """-> [qb, kb, vb, gb, betab], through FLA's own backward: the forward is rerun under a
-    local autograd graph (its kernels are a few percent of a step) and differentiated."""
-    leaves = [x.detach().requires_grad_(True) for x in (q, k, v, g, beta)]
-    with torch.enable_grad():
-        out, _ = chunk_gated_delta_rule(*(x[None] for x in leaves), cu_seqlens=cu.long(),
-                                        cu_seqlens_cpu=cu_cpu, use_qk_l2norm_in_kernel=True)
-        return list(torch.autograd.grad(out[0], leaves, outb))
+    """-> [qb, kb, vb, gb, betab]: FLA's backward, called below its autograd function (a custom
+    op's body runs with autograd excluded). The cheap forward pieces it reads, the L2 norms of
+    q and k, the chunked cumsum of g and the intra-chunk solve A, are recomputed here, not kept."""
+    cu = cu.long()
+    chunk_indices = prepare_chunk_indices(cu, 64, cu_seqlens_cpu=cu_cpu)
+    q_n, q_rstd = l2norm_fwd(q[None])
+    k_n, k_rstd = l2norm_fwd(k[None])
+    g_cum = chunk_local_cumsum(g[None], chunk_size=64, scale=RCP_LN2, cu_seqlens=cu, chunk_indices=chunk_indices)
+    _, _, A = chunk_gated_delta_rule_fwd_intra(k=k_n, v=v[None], g=g_cum, beta=beta[None], cu_seqlens=cu,
+                                               chunk_indices=chunk_indices, chunk_size=64)
+    qb, kb, vb, betab, gb, *_ = fla_gated_delta_rule_bwd(
+        q=q_n, k=k_n, v=v[None], g=g_cum, beta=beta[None], A=A, scale=cfg.d_qk ** -0.5, initial_state=None,
+        do=outb[None], dht=None, cu_seqlens=cu, chunk_indices=chunk_indices, chunk_size=64)
+    qb = l2norm_bwd(q_n, q_rstd, qb)
+    kb = l2norm_bwd(k_n, k_rstd, kb)
+    return [qb[0].to(q.dtype), kb[0].to(k.dtype), vb[0].to(v.dtype), gb[0].to(g.dtype), betab[0].to(beta.dtype)]
 
 @gated_delta_rule_bwd.register_fake
 def _(q, k, v, g, beta, outb, cu, cu_cpu):
@@ -450,8 +466,15 @@ def _gdn_setup(ctx, inputs, output):
     ctx.save_for_backward(*inputs)
 
 def _gdn_autograd(ctx, outb):
+    # Through FLA's own autograd function, so CHECK_GRADS's reference is independent of
+    # gated_delta_rule_bwd's wiring.
     q, k, v, g, beta, cu, cu_cpu = ctx.saved_tensors
-    return *gated_delta_rule_bwd(q, k, v, g, beta, outb.contiguous(), cu, cu_cpu), None, None
+    leaves = [x.detach().requires_grad_(True) for x in (q, k, v, g, beta)]
+    with torch.enable_grad():
+        out, _ = chunk_gated_delta_rule(*(x[None] for x in leaves), cu_seqlens=cu.long(),
+                                        cu_seqlens_cpu=cu_cpu, use_qk_l2norm_in_kernel=True)
+        grads = torch.autograd.grad(out[0], leaves, outb.contiguous())
+    return *grads, None, None
 
 gated_delta_rule.register_autograd(_gdn_autograd, setup_context=_gdn_setup)
 
