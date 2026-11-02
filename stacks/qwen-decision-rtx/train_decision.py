@@ -172,7 +172,7 @@ ABORT_STEP = None
 # the first pack, then exit. Same kernels either way, so the gap is bf16 rounding order.
 CHECK_GRADS = False
 if CHECK_GRADS:   # a small pack of short rows, so autograd's eager pass fits in memory
-    cfg.train_splits, cfg.pack_tokens, cfg.max_rows, cfg.use_wandb = ("decision_dev",), 1024, 32, False
+    cfg.train_splits, cfg.val_splits, cfg.pack_tokens, cfg.max_rows, cfg.use_wandb = ("decision_dev",), (), 1024, 32, False
 
 if cfg.use_wandb:
     assert "WANDB_API_KEY" in os.environ, "cfg.use_wandb=True but WANDB_API_KEY not set"
