@@ -181,7 +181,7 @@ if cfg.use_wandb:
 # The fused projections' widths, in bank order.
 cfg.d_qk_all = cfg.n_qk_heads * cfg.d_qk                      # 2048, q or k of a DeltaNet layer
 cfg.d_v_all = cfg.n_v_heads * cfg.d_v                         # 4096, v or z
-cfg.d_conv = 2 * cfg.d_qk_all + cfg.d_v_all                   # 8192, the convolution's channels: [q | k | v]
+cfg.d_conv_channels = 2 * cfg.d_qk_all + cfg.d_v_all          # 8192, the convolution's channels: [q | k | v]
 cfg.d_qo_all = cfg.n_qo_heads * cfg.d_head                    # 4096, q or its gate of an attention layer
 cfg.d_kv_all = cfg.n_kv_heads * cfg.d_head                    # 1024, k or v
 
@@ -522,7 +522,7 @@ def layer_forward(x, L, cos, sin, tap_keep, cu, cu_cpu, backward):
     proj, u_in = lora(x_in_hat, L.in_proj, L.lora_in)
 
     if deltanet:
-        qkv, z, b, a = proj.split([cfg.d_conv, cfg.d_v_all, cfg.n_v_heads, cfg.n_v_heads], dim=-1)
+        qkv, z, b, a = proj.split([cfg.d_conv_channels, cfg.d_v_all, cfg.n_v_heads, cfg.n_v_heads], dim=-1)
 
         # Causal depthwise convolution over the segment: tap j reads x[t - 3 + j], zero before the segment.
         qkv_pad = F.pad(qkv, (0, 0, 3, 0))
@@ -672,10 +672,10 @@ def layer_backward(xb, L, st, cos, sin, tap_keep, cu, cu_cpu):
         # qkvb[t] = sum_j (convb keep w[j])[t + 3 - j].
         conv_f = st.conv.float()
         sig_c = torch.sigmoid(conv_f)
-        convb = torch.cat((qb.view(T, cfg.d_qk_all), kb.view(T, cfg.d_qk_all), vb.view(T, cfg.d_v_all)), dim=-1).float() \
+        convb = torch.cat((qb.reshape(T, cfg.d_qk_all), kb.reshape(T, cfg.d_qk_all), vb.reshape(T, cfg.d_v_all)), dim=-1).float() \
                 * (sig_c * (1 + conv_f * (1 - sig_c)))                                   # (T, 8192) fp32
         qkvb = sum(F.pad(convb * tap_keep[:, j:j + 1] * L.conv[j], (0, 0, 0, 3 - j))[3 - j:] for j in range(4))
-        projb = bf16(torch.cat((qkvb, zb.view(T, cfg.d_v_all), bb, ab), dim=-1))         # (T, 12352)
+        projb = bf16(torch.cat((qkvb, zb.reshape(T, cfg.d_v_all), bb, ab), dim=-1))      # (T, 12352)
     else:
         # The output gate, recomputed
         sig = torch.sigmoid(st.gate.float())
@@ -697,8 +697,8 @@ def layer_backward(xb, L, st, cos, sin, tap_keep, cu, cu_cpu):
         gh = rope(kb_hat.float(), cos, -sin) * L.k_norm
         xhat = st.k_raw.float() * st.k_inv_rms
         k_rawb = st.k_inv_rms * (gh - xhat * (gh * xhat).mean(dim=-1, keepdim=True))
-        projb = bf16(torch.cat((q_rawb.view(T, cfg.d_qo_all), gateb, k_rawb.view(T, cfg.d_kv_all),
-                                vb.view(T, cfg.d_kv_all).float()), dim=-1))              # (T, 10240)
+        projb = bf16(torch.cat((q_rawb.reshape(T, cfg.d_qo_all), gateb, k_rawb.reshape(T, cfg.d_kv_all),
+                                vb.reshape(T, cfg.d_kv_all).float()), dim=-1))           # (T, 10240)
 
     # The fused input projection's backward, then the mixer input norm's; the residual passes xb_mid through.
     x_in_hat = bf16(st.x_in.float() * st.x_in_inv_rms * L.in_norm)
@@ -1291,8 +1291,11 @@ for step in range(cfg.num_steps + 1):
         stats.eta = remaining_time
     log_step(stats)
 
-    # Garbage collection and compile are done by step 10, flag anything after.
-    if step == 10:
+    # Every graph compiles in step 0 (and the first panel): one per kind and direction. Flag
+    # any recompile after step 10.
+    if step == 0:
+        print0(f"compiled graphs after step 0: {dynamo.utils.counters['stats']['unique_graphs']}", console=True)
+    elif step == 10:
         torch._logging.set_logs(recompiles=True)
 
 
