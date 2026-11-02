@@ -246,7 +246,10 @@ def gdn_fn(pk):
         return fla
 
     def reference(q, k, v, g, beta):
-        from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+        import inspect
+        from transformers.models.qwen3_5 import modeling_qwen3_5
+        # transformers dispatches its torch rule to FLA when FLA is installed; the plain torch rule is underneath
+        torch_chunk_gated_delta_rule = inspect.unwrap(modeling_qwen3_5.torch_chunk_gated_delta_rule)
         rep = v.shape[1] // q.shape[1]
         outs = []
         for s, e in zip(pk.cu_cpu[:-1].tolist(), pk.cu_cpu[1:].tolist()):
@@ -624,8 +627,13 @@ def evaluate(splits, rows_by_split, final):
 
 def run_checks():
     global DT, ACC, SPECIAL_BASE
+    import inspect
     from transformers import Qwen3_5TextConfig
+    from transformers.models.qwen3_5 import modeling_qwen3_5
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+    # transformers' reference runs its plain torch Gated DeltaNet and convolution, not FLA's fp32-only kernels
+    for name in ("torch_chunk_gated_delta_rule", "causal_conv1d_fn"):
+        setattr(modeling_qwen3_5, name, inspect.unwrap(getattr(modeling_qwen3_5, name)))
     DT, ACC = torch.float64, torch.float64
     tc = Qwen3_5TextConfig(   # agent-ops-stacks encoder-rtx/2026-11-01_1135am_d3-varlen-engine/check_tiny.py's
         hidden_size=64, intermediate_size=96, num_hidden_layers=4,
