@@ -771,7 +771,8 @@ def forward_backward(pack, backward=True):
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step(params, t):
     """One AdamW step on every Param: betas 0.9 / 0.999, no weight decay, the bias
-    corrections folded into lr_bc_t and eps_t. t is the (,) int64 device step."""
+    corrections folded into lr_bc_t and eps_t. t is the (1,) int64 device step: indexed with
+    it, the tables give (1,) tensors that broadcast, where a 0-dim index would be read as an int."""
     for p in params:
         p.first_mntm.lerp_(p.grad, 0.1)                                  # m = 0.9 m + 0.1 g
         p.scnd_mntm.mul_(0.999).addcmul_(p.grad, p.grad, value=0.001)   # v = 0.999 v + 0.001 g^2
@@ -1231,8 +1232,8 @@ else:
 # § Training Loop
 # ==============================================================================
 
-# Schedule position: one () int64 device tensor, advanced on-device
-t_step = torch.zeros((), dtype=torch.int64, device=device)
+# Schedule position: one (1,) int64 device tensor, advanced on-device
+t_step = torch.zeros(1, dtype=torch.int64, device=device)
 
 panel = None
 panel_questions = None
