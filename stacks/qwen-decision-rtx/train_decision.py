@@ -1,802 +1,1349 @@
-"""Qwen3.5-9B fine-tuned into a decision model with LoRA, its forward and backward written by hand, on one RTX PRO 6000.
+# train_decision.py
+#
+# Qwen3.5-9B fine-tuned into a decision model with LoRA on one RTX PRO 6000, with the
+# model code implemented as hand-written forward and backward functions, no nn.Module or
+# autograd. The weights are Qwen's, banked by data/prepare_model.py; the data is
+# data/prepare_decision_data.py's: d3-flash's prompt format in Qwen's tokens, every
+# question one row, its options listed under letter codes and all of them read at the
+# row's last token against a trained readout that starts from the LM head's code rows.
+#
+# Style:
+# - Minimal helpers and classes to consolidate math and reduce redirects.
+# - Config `cfg` and model tensor container `m` are globals.
+# - Optimizer state is attached to its parameters; the LR schedule is a table.
+# - Everything on the GPU runs under torch.compile(dynamic=False, fullgraph=True): every
+#   pack has the same shape (pack_tokens tokens, max_rows segments, padded), and the two
+#   library kernels (FlashAttention-2 and FLA's gated delta rule) are custom ops the
+#   graph sees as opaque. Compiled code does not reproduce eager or transformers logits
+#   bit for bit; what is validated is behavior, on the evaluation panel.
+#
+# Config:
+# - "WANDB_API_KEY" is the one environment variable you need to set.
+#   The script is self-contained: no environment variable passing or command line
+#   arguments in the committed baseline.
+# - Recommend setting cfg.run_name (for both wandb and log files) on every run.
+# - For shorter tests, see these flags:
+#     ABORT_STEP
+#     cfg.use_wandb
+#     cfg.val_splits
+#
+# Grep for "§" to retrieve the document outline
+# ("§ " marks a chapter, "§§ " a subsection).
 
-Each question is one row: the state, then the question in encoder-rtx's special-token format, read out at the
-readout token that ends each option (README). Rows are packed end to end into a token budget per step; the
-optimizer steps each layer's LoRA weights inside the backward, as soon as their gradients exist, so a step is one
-pack and there is no gradient accumulation. The activations the backward needs are kept from the forward rather
-than recomputed.
+# ==============================================================================
+# § Setup
+# ==============================================================================
 
-    python train_decision.py            train, then evaluate on the panel (knobs below, each printed)
-    CHECK=1 python train_decision.py    the forward against transformers' Qwen3.5 and the hand-written gradients
-                                        against autograd, on a tiny random model in fp64 (GPU, no download)
-"""
-from __future__ import annotations
+import os
+import sys
+import time as _time
+run_wall_t0 = _time.perf_counter()
+del _time
 
+with open(sys.argv[0], 'r') as f:
+    code = f.read()   # the run section logs the script source to wandb
+
+import csv
 import json
 import math
-import os
 import random
-import sys
 import time
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import pyarrow.parquet as pq
+import wandb
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import torch
+import torch._dynamo as dynamo
 import torch.nn.functional as F
+from torch import Tensor
+from safetensors.torch import load_file
 
-# ==============================================================================
-# § Knobs
-# ==============================================================================
-# Read from the environment and printed, so a log carries the whole configuration.
+dynamo.config.recompile_limit = 64
 
-def knob(name, default, cast=str):
-    value = cast(os.environ.get(name, default))
-    print(f"knob {name}={value}")
-    return value
+assert torch.cuda.is_available(), "no GPU"
 
-CHECK = knob("CHECK", "0") == "1"
-RUN_NAME = knob("RUN_NAME", time.strftime("run-%m%d-%H%M"))
-TRAIN_SPLITS = knob("TRAIN_SPLITS", "train,phase1_train").split(",")
-VAL_SPLITS = [s for s in knob("VAL_SPLITS", "decision_dev,transfer_dev,phase1_holdout,phase1_jevbench,cookbook_dev").split(",") if s]   # empty: no evaluation
-EPOCHS = knob("EPOCHS", "1", float)
-TOKENS = knob("TOKENS", "16384", int)            # tokens per training pack (= per step)
-EVAL_TOKENS = knob("EVAL_TOKENS", "32768", int)  # tokens per evaluation pack
-LR = knob("LR", "2e-4", float)
-RANK = knob("RANK", "16", int)
-ALPHA = knob("ALPHA", "32", float)               # LoRA's update is (ALPHA / RANK) B A
-SOFT_WEIGHT = knob("SOFT_WEIGHT", "1.0", float)  # target = SOFT_WEIGHT x a soft target (where one exists) + the rest on the label
-STATE_CAP = knob("STATE_CAP", "8192", int)
-VAL_EVERY = knob("VAL_EVERY", "0", int)          # 0: evaluate at the end only
-ABORT_STEP = knob("ABORT_STEP", "0", int)        # stop after this many steps (timing runs)
-SEED = knob("SEED", "42", int)
-USE_WANDB = knob("USE_WANDB", "1") == "1"
-SAVE_CHECKPOINT = knob("SAVE_CHECKPOINT", "1") == "1"
+props = torch.cuda.get_device_properties(0)
+print(f"{props.name} | {props.total_memory / 2**30:.1f} GiB | sm{props.major}{props.minor}")
+assert props.major >= 8, f"needs Ampere or newer (got sm{props.major}{props.minor})"
 
-MODEL_REPO, MODEL_REV = "Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a"   # the post-trained 9B; d3-flash's base too
-CACHE = Path.home() / ".cache" / "qwen-decision-rtx"
-DATA_DIR = CACHE / "decision"
-RUN_DIR = CACHE / "runs" / RUN_NAME
-
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 device = torch.device("cuda", 0)
+torch.cuda.set_device(device)
+
+# FlashAttention-2 from the HF kernels hub (FA3 is not for Blackwell); the raw varlen ops
+# live in flash_attn_interface.
+from kernels import get_kernel
+_k = get_kernel("kernels-community/flash-attn2", version=1)
+fa2 = getattr(_k, "flash_attn_interface", _k)
+
+# FLA's chunked gated delta rule, for the DeltaNet layers.
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 # ==============================================================================
-# § Model
+# § Configuration
 # ==============================================================================
-# Qwen3.5-9B's text stack: 32 layers, every fourth softmax attention (causal, with a sigmoid output gate and
-# per-head q / k norms), the rest Gated DeltaNet; one RMSNorm before each mixer and each MLP. The frozen weights
-# live in flat per-layer lists (agent-ops-stacks encoder-rtx/2026-11-01_1135am_d3-varlen-engine/d3_varlen.py,
-# checked there against transformers), with the projections that read one input fused into one matrix. The LM
-# head is dropped: a single learned readout vector scores each option's readout token.
 
-cfg = SimpleNamespace()
-KIND = []                        # "linear" | "full" per layer
-W_IN, W_POST = [], []            # (D,) fp32: 1 + the zero-centred RMSNorm weight
-W_MIX_IN, W_MIX_OUT = [], []     # the mixer's fused input projection (qkv|z|b|a, or q+gate|k|v) and its output projection
-CONV_W, A_NEG, DT_BIAS, W_GNORM = [], [], [], []   # Gated DeltaNet: (4, C) taps, -exp(A_log), dt_bias, the gated norm's weight
-W_QN, W_KN = [], []              # attention: 1 + the per-head q / k RMSNorm weights (Dh,)
-W_MLP_IN, W_MLP_OUT = [], []     # gate|up (2F, D) and down (D, F)
-EMBED = W_FINAL = INV_FREQ = None
-DT = torch.bfloat16              # the model's dtype (fp64 in the checks)
-ACC = torch.float32              # the norms', decay's and convolution's dtype
+class DecisionConfig:
+    """Model architecture constants and training configuration. The LR schedule and
+    optimizer parameters are defined directly in their code instead. This codebase only
+    includes the codepath executed during the run, without togglable features; the
+    "config" is for referencing constants and documenting key settings."""
 
-# The trained parameters, fp32: LoRA's (A, B) per layer per projection, the readout vector, the special tokens'
-# embedding rows. Each has AdamW moments beside it.
-LORA_NAMES = ("mix_in", "mix_out", "mlp_in", "mlp_out")
-LORA = []                        # per layer: {name: [A (r, in), B (out, r)]}
-READOUT = None                   # (D,)
-SPECIAL_ROWS = None              # (n_special, D)
-SPECIAL_BASE = None              # the first special token's id
-ADAM = {}                        # id(param) -> (m, v)
-FA2 = None
+    # ---- Architecture: Qwen3.5-9B's text stack, as data/prepare_model.py banked it ----
+
+    n_layers:   int = 32
+    d_model:    int = 4096
+    d_mlp:      int = 12288
+    d_embed:    int = 248320   # embedding rows (more than the tokenizer's ids)
+    rms_eps:    float = 1e-6
+
+    # Gated DeltaNet layers: every layer but each fourth
+    n_deltanet: int = 24
+    n_qk_heads: int = 16
+    d_qk:       int = 128
+    n_v_heads:  int = 32    # each q / k head serves n_v_heads / n_qk_heads value heads
+    d_v:        int = 128
+
+    # Softmax attention layers: each fourth
+    n_attention: int = 8
+    n_qo_heads:  int = 16
+    n_kv_heads:  int = 4
+    d_head:      int = 256
+    d_rotary:    int = 64   # RoPE on the first quarter of each head
+    rope_theta:  float = 1e7
+
+    # Readout: one row per answer code, scoring a question's options at its last token
+    n_codes:    int = 255
+
+    # ---- LoRA, on every projection (the fused mixer input, the mixer output, gate|up, down) ----
+    rank:       int = 16
+    alpha:      float = 32.0   # the update is (alpha / rank) B A
+
+    # Model stats, for logging
+    num_params:       int   # Derived: every trained value
+    num_frozen_params: int  # Derived: the text stack
+
+    # ---- Data ----
+
+    train_splits: tuple = ("train",)   # Kev's 30,540 records; ("train", "phase1_train") adds Recast NLP's
+    val_splits:   tuple = ("decision_dev", "transfer_dev", "phase1_holdout", "phase1_jevbench", "cookbook_dev")
+    epochs:       float = 1.0
+    soft_weight:  float = 1.0   # target = soft_weight x a teacher's soft target (where one exists) + the rest on the label
+
+    # Packs: rows end to end, every pack the same shape
+    pack_tokens:    int = 16384   # tokens per pack; a step is one pack (the optimizer runs per pack)
+    max_row_tokens: int = 8192    # a row (one question) must fit this; also every segment's length cap
+    max_rows:       int = 256     # segments per pack: the rows, then the padding in max_row_tokens pieces
+
+    # ---- Training ----
+
+    lr:        float = 2e-4   # peak; warmup 5%, cosine to 10% (§ Weight Init & Schedule)
+    num_steps: int            # Derived: the packs one pass of the train splits makes, x epochs
+
+    # Evaluation and logging
+    val_every:  int = 400      # steps between panels; 0 = the end only (step 0 always)
+
+    # Logging
+    wandb_project:   str = "qwen_decision_rtx_dev"   # qwen_decision_rtx is for baselines
+    run_name:        str = "rewrite-kev-1pass"      # both wandb and log files
+    use_wandb:       bool = True
+
+    save_checkpoint: bool = True   # the trained tensors, to ~/.cache/qwen-decision-rtx/runs/<run_name>/
+
+    seed:            int  = 42     # LoRA's A, the packs' order and the options' shuffles
+
+cfg = DecisionConfig() # Make config a global, don't pass it around.
+
+# ==============================================================================
+# § Derived Configs
+# ==============================================================================
+
+# Set this to run training under the normal schedule and have it abort
+# part way. Great way to test things out without changing the data.
+# None = run every step; 0 = evaluate the base model and exit.
+ABORT_STEP = None
+
+# The hand-written backward against autograd through the same forward (run eagerly), on
+# the first pack, then exit. Same kernels either way, so the gap is bf16 rounding order.
+CHECK_GRADS = False
+if CHECK_GRADS:   # a small pack of short rows, so autograd's eager pass fits in memory
+    cfg.train_splits, cfg.pack_tokens, cfg.max_rows, cfg.use_wandb = ("decision_dev",), 1024, 32, False
+
+if cfg.use_wandb:
+    assert "WANDB_API_KEY" in os.environ, "cfg.use_wandb=True but WANDB_API_KEY not set"
+    wandb.login(key=os.environ["WANDB_API_KEY"])
+
+# The fused projections' widths, in bank order.
+cfg.d_qk_all = cfg.n_qk_heads * cfg.d_qk                      # 2048, q or k of a DeltaNet layer
+cfg.d_v_all = cfg.n_v_heads * cfg.d_v                         # 4096, v or z
+cfg.d_conv = 2 * cfg.d_qk_all + cfg.d_v_all                   # 8192, the convolution's channels: [q | k | v]
+cfg.d_qo_all = cfg.n_qo_heads * cfg.d_head                    # 4096, q or its gate of an attention layer
+cfg.d_kv_all = cfg.n_kv_heads * cfg.d_head                    # 1024, k or v
+
+# Every segment is at most max_row_tokens long, so a pack's padding takes this many segments at most.
+cfg.max_pad_segments = math.ceil(cfg.pack_tokens / cfg.max_row_tokens)
+
+CACHE = Path.home() / ".cache" / "qwen-decision-rtx"
+DATA_DIR = CACHE / "decision"                                 # data/prepare_decision_data.py's output
+MODEL_PATH = CACHE / "model" / "qwen3.5-9b-decision.safetensors"   # data/prepare_model.py's
+RUN_DIR = CACHE / "runs" / cfg.run_name
+assert MODEL_PATH.is_file(), f"{MODEL_PATH} missing: run data/prepare_model.py"
+assert (DATA_DIR / "meta.json").is_file(), f"{DATA_DIR} missing: run data/prepare_decision_data.py"
+
+# The data prep's answer codes and the prompt's tail after the last option; the banks were
+# cut for the same codes.
+data_meta = json.loads((DATA_DIR / "meta.json").read_text())
+model_meta = json.loads(MODEL_PATH.with_suffix(".json").read_text())
+CODE_IDS, TAIL_IDS = data_meta["code_ids"], data_meta["tail_ids"]
+assert len(CODE_IDS) == cfg.n_codes and model_meta["code_ids"] == CODE_IDS, "the banks' answer codes differ from the data's"
+for name in ("n_layers", "d_model", "d_mlp", "d_embed", "n_qk_heads", "d_qk", "n_v_heads", "d_v",
+             "n_qo_heads", "n_kv_heads", "d_head", "d_rotary", "rope_theta"):
+    assert model_meta["arch"][name] == getattr(cfg, name), f"banks' {name} = {model_meta['arch'][name]}"
+
+random.seed(cfg.seed)
+np.random.seed(cfg.seed)
+torch.manual_seed(cfg.seed)
+torch.cuda.manual_seed(cfg.seed)
+
+# ==============================================================================
+# § Data Structures
+# ==============================================================================
+
+# NamedTuples can be passed to compiled functions.
+class Param(NamedTuple):
+    """A trained tensor bundled with everything needed for training it."""
+
+    name:        str
+    w:           Tensor    # fp32
+
+    # Optimizer State
+    grad:        Tensor    # Matches full weight size
+    first_mntm:  Tensor
+    scnd_mntm:   Tensor
+
+class Lora(NamedTuple):
+    """One projection's LoRA in one layer: its rows of the A and B banks, and their gradient slots."""
+    A:  Tensor    # (rank, in)  fp32
+    B:  Tensor    # (out, rank) fp32
+    Ab: Tensor
+    Bb: Tensor
+
+class DeltaNetLayer(NamedTuple):
+    """One Gated DeltaNet layer: its slice of every frozen bank, and its LoRAs."""
+    in_norm:     Tensor    # (d_model,)            fp32, 1 + the zero-centred weight
+    in_proj:     Tensor    # (12352, d_model)      bf16, rows [q | k | v | z | b | a]
+    conv:        Tensor    # (4, 8192)             fp32, tap j reads x[t - 3 + j]
+    decay:       Tensor    # (n_v_heads,)          fp32, -exp(A_log)
+    dt_bias:     Tensor    # (n_v_heads,)          fp32
+    gate_norm:   Tensor    # (d_v,)                fp32
+    out_proj:    Tensor    # (d_model, d_model)    bf16
+    post_norm:   Tensor    # (d_model,)            fp32
+    mlp_in:      Tensor    # (2 d_mlp, d_model)    bf16, rows [gate | up]
+    mlp_out:     Tensor    # (d_model, d_mlp)      bf16
+    lora_in:     Lora
+    lora_out:    Lora
+    lora_mlp_in: Lora
+    lora_mlp_out: Lora
+
+class AttentionLayer(NamedTuple):
+    """One softmax attention layer: its slice of every frozen bank, and its LoRAs."""
+    in_norm:     Tensor    # (d_model,)            fp32
+    in_proj:     Tensor    # (10240, d_model)      bf16, rows [q | gate | k | v]
+    q_norm:      Tensor    # (d_head,)             fp32
+    k_norm:      Tensor    # (d_head,)             fp32
+    out_proj:    Tensor    # (d_model, d_model)    bf16
+    post_norm:   Tensor    # (d_model,)            fp32
+    mlp_in:      Tensor    # (2 d_mlp, d_model)    bf16
+    mlp_out:     Tensor    # (d_model, d_mlp)      bf16
+    lora_in:     Lora
+    lora_out:    Lora
+    lora_mlp_in: Lora
+    lora_mlp_out: Lora
+
+class Model:
+    """Container for the model's weights: the frozen banks, the trained Params, and the
+    32 layer records that slice both."""
+
+    # Frozen banks (data/prepare_model.py)
+    embed:         Tensor   # (d_embed, d_model) bf16
+    final_norm:    Tensor   # (d_model,) fp32
+    inv_freq:      Tensor   # (d_rotary / 2,) fp32, the rotary frequencies
+
+    # Trained: LoRA's A and B per projection, banked over each kind's layers
+    deltanet_A_in: Param;    deltanet_B_in: Param       # (24, rank, d_model), (24, 12352, rank)
+    deltanet_A_out: Param;   deltanet_B_out: Param
+    deltanet_A_mlp_in: Param;  deltanet_B_mlp_in: Param
+    deltanet_A_mlp_out: Param; deltanet_B_mlp_out: Param
+    attention_A_in: Param;   attention_B_in: Param      # (8, rank, d_model), (8, 10240, rank)
+    attention_A_out: Param;  attention_B_out: Param
+    attention_A_mlp_in: Param;  attention_B_mlp_in: Param
+    attention_A_mlp_out: Param; attention_B_mlp_out: Param
+
+    # Trained: the readout, one row per answer code
+    readout:       Param    # (n_codes, d_model)
+
+    # The layers in checkpoint order, each a DeltaNetLayer or an AttentionLayer
+    layers:        list
+
+    # `for p in m` yields every trained Param, in the order above.
+    def __iter__(self):
+        return (v for v in vars(self).values() if isinstance(v, Param))
+
+# One layer's forward activations, held for the backward pass. Everything element-wise
+# between them is recomputed there (the norms' outputs, silu, the kernels' inputs).
+class DeltaNetStash(NamedTuple):
+    x_in:          Tensor    # (T, d_model)          bf16
+    x_in_inv_rms:  Tensor    # (T, 1)                fp32
+    u_in:          Tensor    # (T, rank)             bf16   x_in_hat A^T
+    conv:          Tensor    # (T, 8192)             bf16   the convolution's output, before silu
+    z:             Tensor    # (T, d_v_all)          bf16   the gate branch
+    a:             Tensor    # (T, n_v_heads)        bf16   the decay branch, before softplus
+    beta:          Tensor    # (T, n_v_heads)        bf16   sigmoid(b)
+    core:          Tensor    # (T, n_v_heads, d_v)   bf16   the delta rule's output
+    core_inv_rms:  Tensor    # (T, n_v_heads, 1)     fp32
+    u_out:         Tensor    # (T, rank)             bf16
+    x_mid:         Tensor    # (T, d_model)          bf16   the stream after the mixer
+    x_mid_inv_rms: Tensor    # (T, 1)                fp32
+    gu:            Tensor    # (T, 2 d_mlp)          bf16   the MLP's [gate | up]
+    u_mlp_in:      Tensor    # (T, rank)             bf16
+    u_mlp_out:     Tensor    # (T, rank)             bf16
+
+class AttentionStash(NamedTuple):
+    x_in:          Tensor    # (T, d_model)             bf16
+    x_in_inv_rms:  Tensor    # (T, 1)                   fp32
+    u_in:          Tensor    # (T, rank)                bf16
+    q_raw:         Tensor    # (T, n_qo_heads, d_head)  bf16   before the q norm
+    k_raw:         Tensor    # (T, n_kv_heads, d_head)  bf16
+    v:             Tensor    # (T, n_kv_heads, d_head)  bf16
+    q_inv_rms:     Tensor    # (T, n_qo_heads, 1)       fp32
+    k_inv_rms:     Tensor    # (T, n_kv_heads, 1)       fp32
+    gate:          Tensor    # (T, d_qo_all)            bf16   the output gate, before sigmoid
+    y:             Tensor    # (T, n_qo_heads, d_head)  bf16   attention's output
+    lse:           Tensor    # (n_qo_heads, T)          fp32   its softmax log-sum-exp
+    u_out:         Tensor    # (T, rank)                bf16
+    x_mid:         Tensor    # (T, d_model)             bf16
+    x_mid_inv_rms: Tensor    # (T, 1)                   fp32
+    gu:            Tensor    # (T, 2 d_mlp)             bf16
+    u_mlp_in:      Tensor    # (T, rank)                bf16
+    u_mlp_out:     Tensor    # (T, rank)                bf16
+
+class Pack(NamedTuple):
+    """One pack on the device: pack_tokens tokens in max_rows segments (the rows, then the
+    padding, then empty segments), and per row its last token, option count and target."""
+    tokens:    Tensor    # (pack_tokens,)             int32
+    pos:       Tensor    # (pack_tokens,)             int32   position within the segment
+    cu:        Tensor    # (max_rows + 1,)            int32   segment boundaries, cu_seqlens
+    cu_cpu:    Tensor    # (max_rows + 1,)            int64, on the host: FLA's chunk indices without a sync
+    last_pos:  Tensor    # (max_rows,)                int64   each row's readout token (a padding row: the pack's last)
+    n_options: Tensor    # (max_rows,)                int32   options per row (a padding row: 1)
+    target:    Tensor    # (max_rows, n_codes)        fp32    the target over the options (a padding row: option 0)
+    n_rows:    Tensor    # ()                         int32
+    rows:      list      # the Row records, for the evaluation's scoring
+
+class Row(NamedTuple):
+    """One question of one record, from the data prep's parquet."""
+    split:   str
+    record:  int
+    source:  str
+    clean:   bool
+    kind:    str       # "choice" | "noul" | "score"
+    prefix:  list      # token ids up to and including "Options:\n" (the state is inside)
+    options: list      # each option's ": <text>\n" ids, in record order
+    label:   int
+    target:  list      # a teacher's probability per option, or None
+    length:  int       # the row's tokens: prefix, a code per option, the options, the tail
+
+bf16 = lambda x: x.to(torch.bfloat16)
 
 
-def set_cfg(text):
-    get = text.get if isinstance(text, dict) else lambda k, d=None: getattr(text, k, d)
-    cfg.d = get("hidden_size"); cfg.f = get("intermediate_size"); cfg.layers = get("num_hidden_layers")
-    cfg.hq = get("num_attention_heads"); cfg.hkv = get("num_key_value_heads"); cfg.dh = get("head_dim")
-    cfg.hk = get("linear_num_key_heads"); cfg.hv = get("linear_num_value_heads")
-    cfg.dk = get("linear_key_head_dim"); cfg.dv = get("linear_value_head_dim")
-    cfg.conv = get("linear_conv_kernel_dim"); cfg.eps = get("rms_norm_eps")
-    rope = get("rope_parameters") or {}
-    cfg.rot = int(cfg.dh * rope.get("partial_rotary_factor", get("partial_rotary_factor", 1.0)))
-    cfg.theta = rope.get("rope_theta", 1e7)
-    KIND[:] = ["full" if t == "full_attention" else "linear" for t in get("layer_types")[:cfg.layers]]
-    assert cfg.conv == 4 and cfg.hv % cfg.hk == 0 and cfg.hq % cfg.hkv == 0
+# ==============================================================================
+# § Kernels
+# ==============================================================================
+# The two segment-aware ops, as custom ops: the graph sees each as one opaque call with
+# fixed output shapes, whatever happens inside (FLA builds data-dependent chunk indices;
+# FA2's backward writes into preallocated buffers). Their autograd registrations serve
+# CHECK_GRADS only; training calls the *_bwd ops by hand.
+
+@torch.library.custom_op("decision::attention", mutates_args=())
+def attention(q: Tensor, k: Tensor, v: Tensor, cu: Tensor) -> tuple[Tensor, Tensor]:
+    """Causal softmax attention within each segment: q (T, n_qo_heads, d_head), k and v
+    (T, n_kv_heads, d_head), grouped. -> (y, the softmax LSE (n_qo_heads, T) fp32)."""
+    y, lse, *_ = fa2._flash_attn_varlen_forward(
+        q, k, v, cu, cu, cfg.max_row_tokens, cfg.max_row_tokens,
+        0.0,                        # dropout_p
+        cfg.d_head ** -0.5,         # softmax_scale
+        True,                       # causal
+        window_size_left=cfg.max_row_tokens, window_size_right=0)
+    return y, lse
+
+@attention.register_fake
+def _(q, k, v, cu):
+    return torch.empty_like(q), q.new_empty((q.shape[1], q.shape[0]), dtype=torch.float32)
+
+@torch.library.custom_op("decision::attention_bwd", mutates_args=())
+def attention_bwd(yb: Tensor, q: Tensor, k: Tensor, v: Tensor, y: Tensor, lse: Tensor, cu: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """-> (qb, kb, vb). FA2's varlen backward writes the grads into preallocated buffers."""
+    qb, kb, vb = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    fa2._flash_attn_varlen_backward(
+        yb, q, k, v, y, lse,
+        qb, kb, vb,
+        cu, cu,                     # cu_seqlens_q, cu_seqlens_k
+        cfg.max_row_tokens, cfg.max_row_tokens,
+        0.0,                        # dropout_p
+        cfg.d_head ** -0.5,         # softmax_scale
+        True,                       # is_causal
+        cfg.max_row_tokens, 0,      # window_size_left, window_size_right
+        0.0,                        # softcap
+        None,                       # alibi_slopes
+        False,                      # deterministic
+        None,                       # rng_state
+    )
+    return qb, kb, vb
+
+@attention_bwd.register_fake
+def _(yb, q, k, v, y, lse, cu):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+def _attention_setup(ctx, inputs, output):
+    ctx.save_for_backward(*inputs[:3], *output, inputs[3])
+
+def _attention_autograd(ctx, yb, lse_b):
+    q, k, v, y, lse, cu = ctx.saved_tensors
+    return *attention_bwd(yb.contiguous(), q, k, v, y, lse, cu), None
+
+attention.register_autograd(_attention_autograd, setup_context=_attention_setup)
 
 
-def load_weights(get):
-    """Fill the weight lists from `get(name) -> tensor` (checkpoint names after `language_model.`)."""
-    global EMBED, W_FINAL, INV_FREQ
-    f32 = lambda name: get(name).to(device, ACC)
-    mat = lambda *names: torch.cat([get(n).to(device, DT) for n in names], 0)
-    for i in range(cfg.layers):
-        p = f"layers.{i}."
-        W_IN.append(1 + f32(p + "input_layernorm.weight"))
-        W_POST.append(1 + f32(p + "post_attention_layernorm.weight"))
-        if KIND[i] == "linear":
-            m = p + "linear_attn."
-            W_MIX_IN.append(mat(m + "in_proj_qkv.weight", m + "in_proj_z.weight", m + "in_proj_b.weight", m + "in_proj_a.weight"))
-            W_MIX_OUT.append(mat(m + "out_proj.weight"))
-            CONV_W.append(f32(m + "conv1d.weight").reshape(-1, cfg.conv).T.contiguous())   # (4, C): tap j reads x[t - 3 + j]
-            A_NEG.append(-f32(m + "A_log").exp())
-            DT_BIAS.append(f32(m + "dt_bias"))
-            W_GNORM.append(f32(m + "norm.weight"))
-            W_QN.append(None); W_KN.append(None)
-        else:
-            m = p + "self_attn."
-            W_MIX_IN.append(mat(m + "q_proj.weight", m + "k_proj.weight", m + "v_proj.weight"))
-            W_MIX_OUT.append(mat(m + "o_proj.weight"))
-            W_QN.append(1 + f32(m + "q_norm.weight")); W_KN.append(1 + f32(m + "k_norm.weight"))
-            CONV_W.append(None); A_NEG.append(None); DT_BIAS.append(None); W_GNORM.append(None)
-        W_MLP_IN.append(mat(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"))
-        W_MLP_OUT.append(mat(p + "mlp.down_proj.weight"))
-    EMBED = get("embed_tokens.weight").to(device, DT)
-    W_FINAL = 1 + f32("norm.weight")
-    INV_FREQ = 1.0 / cfg.theta ** (torch.arange(0, cfg.rot, 2, device=device).to(ACC) / cfg.rot)
+@torch.library.custom_op("decision::gated_delta_rule", mutates_args=())
+def gated_delta_rule(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor, cu: Tensor, cu_cpu: Tensor) -> Tensor:
+    """Gated DeltaNet within each segment, the state reset at each boundary: q, k
+    (T, n_qk_heads, d_qk), v (T, n_v_heads, d_v), the log decay g fp32 and beta (T, n_v_heads).
+    q and k are L2-normalized inside; each q / k head serves n_v_heads / n_qk_heads value heads."""
+    out, _ = chunk_gated_delta_rule(q[None], k[None], v[None], g[None], beta[None], cu_seqlens=cu.long(),
+                                    cu_seqlens_cpu=cu_cpu, use_qk_l2norm_in_kernel=True)
+    return out[0]
 
+@gated_delta_rule.register_fake
+def _(q, k, v, g, beta, cu, cu_cpu):
+    return torch.empty_like(v)
 
-def init_trained(special_base, special_init):
-    """LoRA at rank RANK on every projection (A Kaiming-uniform, B zero, so training starts from the base
-    model), the readout vector at zero (every option starts equal), and the special tokens' rows from
-    `special_init` (n_special, D)."""
-    global READOUT, SPECIAL_ROWS, SPECIAL_BASE
-    LORA.clear(); ADAM.clear()
-    pdt = torch.float64 if DT == torch.float64 else torch.float32
-    for i in range(cfg.layers):
-        shapes = {"mix_in": W_MIX_IN[i].shape, "mix_out": W_MIX_OUT[i].shape,
-                  "mlp_in": W_MLP_IN[i].shape, "mlp_out": W_MLP_OUT[i].shape}
-        layer = {}
-        for name, (out_dim, in_dim) in shapes.items():
-            A = torch.empty(RANK, in_dim, device=device, dtype=pdt)
-            torch.nn.init.kaiming_uniform_(A, a=math.sqrt(5))
-            layer[name] = [A, torch.zeros(out_dim, RANK, device=device, dtype=pdt)]
-        LORA.append(layer)
-    READOUT = torch.zeros(cfg.d, device=device, dtype=pdt)
-    SPECIAL_ROWS = special_init.to(device, pdt).clone()
-    SPECIAL_BASE = special_base
-    for p in all_params():
-        ADAM[id(p)] = (torch.zeros_like(p), torch.zeros_like(p))
-
-
-def all_params():
-    return [p for layer in LORA for name in LORA_NAMES for p in layer[name]] + [READOUT, SPECIAL_ROWS]
-
-
-def load_qwen():
-    """Qwen3.5-9B's text weights onto the GPU (the vision tower, the MTP layer and the LM head stay on disk),
-    and the FlashAttention-2 kernels."""
-    global FA2
-    from huggingface_hub import snapshot_download
-    from safetensors import safe_open
-    root = Path(snapshot_download(MODEL_REPO, revision=MODEL_REV, allow_patterns=["*.safetensors", "*.json", "*.txt", "*.jinja"]))
-    config = json.loads((root / "config.json").read_text())
-    set_cfg(config.get("text_config", config))
-    tensors = {}
-    for file in sorted(root.glob("*.safetensors")):
-        with safe_open(file, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if "language_model." in name and ".mtp" not in name:
-                    tensors[name.split("language_model.", 1)[1]] = f.get_tensor(name)
-    load_weights(tensors.pop)
-    assert not tensors, f"unused weights: {sorted(tensors)[:5]}"
-    torch.cuda.empty_cache()
-    from kernels import get_kernel
-    k = get_kernel("kernels-community/flash-attn2", version=1)
-    FA2 = k if hasattr(k, "flash_attn_varlen_func") else k.flash_attn_interface
-    return root
-
-
-# ------------------------------------------------------------------------------
-# §§ Kernels
-# ------------------------------------------------------------------------------
-# The two segment-aware ops: causal softmax attention within each row (FlashAttention-2 varlen) and the Gated
-# DeltaNet recurrence within each row (FLA's chunk kernel). The backward uses each library's own backward:
-# `kernel` runs the op on detached inputs under a local autograd graph and keeps that graph, which saves
-# exactly what the op's backward reads (q, k, v, out and the LSE; FLA's chunk inputs); `kernel_bwd` runs it.
-# Everything around them is differentiated by hand. On the checks' CPU-free fp64 path they are per-row
-# references in plain torch.
-
-def kernel(fn, inputs, keep):
-    if not keep:
-        return fn(*inputs), None
-    leaves = [x.detach().requires_grad_(True) for x in inputs]
+@torch.library.custom_op("decision::gated_delta_rule_bwd", mutates_args=())
+def gated_delta_rule_bwd(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor, outb: Tensor, cu: Tensor, cu_cpu: Tensor) -> list[Tensor]:
+    """-> [qb, kb, vb, gb, betab], through FLA's own backward: the forward is rerun under a
+    local autograd graph (its kernels are a few percent of a step) and differentiated."""
+    leaves = [x.detach().requires_grad_(True) for x in (q, k, v, g, beta)]
     with torch.enable_grad():
-        out = fn(*leaves)
-    return out.detach(), (out, leaves)
+        out, _ = chunk_gated_delta_rule(*(x[None] for x in leaves), cu_seqlens=cu.long(),
+                                        cu_seqlens_cpu=cu_cpu, use_qk_l2norm_in_kernel=True)
+        return list(torch.autograd.grad(out[0], leaves, outb))
+
+@gated_delta_rule_bwd.register_fake
+def _(q, k, v, g, beta, outb, cu, cu_cpu):
+    return [torch.empty_like(x) for x in (q, k, v, g, beta)]
+
+def _gdn_setup(ctx, inputs, output):
+    ctx.save_for_backward(*inputs)
+
+def _gdn_autograd(ctx, outb):
+    q, k, v, g, beta, cu, cu_cpu = ctx.saved_tensors
+    return *gated_delta_rule_bwd(q, k, v, g, beta, outb.contiguous(), cu, cu_cpu), None, None
+
+gated_delta_rule.register_autograd(_gdn_autograd, setup_context=_gdn_setup)
 
 
-def kernel_bwd(saved, dout):
-    out, leaves = saved
-    return torch.autograd.grad(out, leaves, dout)
+# ==============================================================================
+# § Train Forward + Backward
+# ==============================================================================
+# forward_backward (at the end of the chapter) drives the compiled pieces: the embedding,
+# one layer_forward per layer (stashing), the readout's loss and its gradient into the
+# stream, then one layer_backward per layer in reverse. The LoRA gradients land in their
+# Param.grad banks; § Optimizer Math steps them after the pack.
+#
+# Direction naming (decoder-rtx's):
+# A bare name is the forward pass; a 'b' on its leading symbol is the backward pass, the
+# gradient w.r.t. that exact tensor: x -> xb, q_hat -> qb_hat, mixed -> mixedb.
+#
+# Stream stages:
+# x_in    - the layer's input
+# x_mid   - after the mixer's residual add, the MLP's input
+# x       - after the MLP's residual add, the next layer's input
+# *_hat   - RMS-normed and weighted, bf16, what the GEMMs read
+# *_inv_rms - 1/rms, fp32, kept for the norm's backward
 
+def lora(x, W, l):
+    """x (T, in) -> x W^T + (alpha / rank) (x A^T) B^T, and u = x A^T for the backward."""
+    u = x @ bf16(l.A).mT                                                           # (T, rank)
+    return torch.addmm(x @ W.mT, u, bf16(l.B).mT, alpha=cfg.alpha / cfg.rank), u
 
-def attn_fn(pk):
-    """Causal softmax attention within each row: q (T, Hq, Dh), k and v (T, Hkv, Dh), grouped by Hq / Hkv."""
-    scale = cfg.dh ** -0.5
-    if DT != torch.float64:
-        def fa(q, k, v):
-            out = FA2.flash_attn_varlen_func(q, k, v, pk.cu, pk.cu, pk.longest, pk.longest, softmax_scale=scale, causal=True)
-            return out[0] if isinstance(out, (tuple, list)) else out
-        return fa
-
-    def reference(q, k, v):
-        rep = q.shape[1] // k.shape[1]
-        outs = []
-        for s, e in zip(pk.cu_cpu[:-1].tolist(), pk.cu_cpu[1:].tolist()):
-            qq = q[s:e].transpose(0, 1)[None]
-            kk, vv = (x[s:e].transpose(0, 1).repeat_interleave(rep, 0)[None] for x in (k, v))
-            outs.append(F.scaled_dot_product_attention(qq, kk, vv, scale=scale, is_causal=True)[0].transpose(0, 1))
-        return torch.cat(outs, 0)
-    return reference
-
-
-def gdn_fn(pk):
-    """Gated DeltaNet within each row, the state reset at each boundary: q, k (T, Hk, Dk), v (T, Hv, Dv),
-    g fp32 and beta (T, Hv); q and k are L2-normalized inside, and each Hv / Hk value heads share a q / k head."""
-    if DT != torch.float64:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
-        def fla(q, k, v, g, beta):
-            out, _ = chunk_gated_delta_rule(q[None], k[None], v[None], g[None], beta[None], cu_seqlens=pk.cu_long,
-                                            cu_seqlens_cpu=pk.cu_cpu_long, use_qk_l2norm_in_kernel=True)
-            return out[0]
-        return fla
-
-    def reference(q, k, v, g, beta):
-        import inspect
-        from transformers.models.qwen3_5 import modeling_qwen3_5
-        # transformers dispatches its torch rule to FLA when FLA is installed; the plain torch rule is underneath
-        torch_chunk_gated_delta_rule = inspect.unwrap(modeling_qwen3_5.torch_chunk_gated_delta_rule)
-        rep = v.shape[1] // q.shape[1]
-        outs = []
-        for s, e in zip(pk.cu_cpu[:-1].tolist(), pk.cu_cpu[1:].tolist()):
-            outs.append(torch_chunk_gated_delta_rule(q[None, s:e].repeat_interleave(rep, 2), k[None, s:e].repeat_interleave(rep, 2),
-                                                     v[None, s:e], g[None, s:e], beta[None, s:e], use_qk_l2norm_in_kernel=True)[0][0])
-        return torch.cat(outs, 0)
-    return reference
-
-
-# ------------------------------------------------------------------------------
-# §§ Pieces and their backwards
-# ------------------------------------------------------------------------------
-
-def rmsnorm(x, w1):
-    """RMSNorm in fp32 with the (1 + w) weight, back to x's dtype -> (y, rstd (.., 1) fp32)."""
-    xf = x.to(ACC)
-    rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + cfg.eps)
-    return (xf * rstd * w1).to(x.dtype), rstd
-
-
-def rmsnorm_bwd(dy, x, rstd, w1):
-    """dx (fp32) for y = x * rstd * w1, w1 frozen (None for no weight)."""
-    xhat = x.to(ACC) * rstd
-    g = dy.to(ACC) * (w1 if w1 is not None else 1.0)
-    return rstd * (g - xhat * (g * xhat).mean(-1, keepdim=True))
-
-
-def silu_grad(x):
-    s = torch.sigmoid(x.to(ACC))
-    return s * (1 + x.to(ACC) * (1 - s))
-
+def lora_bwd(yb, x, u, W, l):
+    """-> xb (T, in); A's and B's gradients land in their slots."""
+    yB = yb @ bf16(l.B)                                                            # (T, rank)
+    l.Ab.copy_((yB.mT @ x).float() * (cfg.alpha / cfg.rank))                       # (rank, in)
+    l.Bb.copy_((yb.mT @ u).float() * (cfg.alpha / cfg.rank))                       # (out, rank)
+    return torch.addmm(yb @ W, yB, bf16(l.A), alpha=cfg.alpha / cfg.rank)
 
 def rope(x, cos, sin):
-    """Rotary position embedding on the first cfg.rot dims of each head (the rotate-half form)."""
-    r, rest = x[..., :cfg.rot], x[..., cfg.rot:]
-    half = cfg.rot // 2
-    return torch.cat((r * cos + torch.cat((-r[..., half:], r[..., :half]), -1) * sin, rest), -1)
+    """x (T, H, d_head) fp32: the first d_rotary dims rotated, the rotate-half form. The
+    transpose of the rotation is the same call with -sin."""
+    r, rest = x[..., :cfg.d_rotary], x[..., cfg.d_rotary:]
+    half = cfg.d_rotary // 2
+    return torch.cat((r * cos + torch.cat((-r[..., half:], r[..., :half]), dim=-1) * sin, rest), dim=-1)
 
 
-def rope_bwd(dy, cos, sin):
-    """The transpose of the rotation: the same rotation with -sin."""
-    return rope(dy, cos, -sin)
+@torch.compile(dynamic=False, fullgraph=True)
+def embed_forward(tokens, pos):
+    """The token embeddings, the rotary tables and the convolution's row-start mask, for one pack."""
+    x = F.embedding(tokens, m.embed)                                               # (T, d_model) bf16
+    freqs = pos.float()[:, None] * m.inv_freq[None]                                # (T, d_rotary / 2)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos, sin = emb.cos()[:, None], emb.sin()[:, None]                              # (T, 1, d_rotary) fp32
+    # Tap j reads x[t - 3 + j], inside the segment iff pos >= 3 - j.
+    tap_keep = (pos[:, None] >= torch.arange(3, -1, -1, device=pos.device)).float()   # (T, 4)
+    return x, cos, sin, tap_keep
 
 
-def lora_mm(x, i, name, W):
-    """x (T, in) -> x W^T + (ALPHA/RANK) (x A^T) B^T, and u = x A^T for the backward."""
-    A, B = LORA[i][name]
-    u = x @ A.to(x.dtype).T
-    return torch.addmm(x @ W.T, u, B.to(x.dtype).T, alpha=ALPHA / RANK), u
+@torch.compile(dynamic=False, fullgraph=True)
+def layer_forward(x, L, cos, sin, tap_keep, cu, cu_cpu, backward):
+    """One layer: x -> x, and its stash when backward=True (None otherwise)."""
+    T = x.shape[0]
+    deltanet = isinstance(L, DeltaNetLayer)
+    x_in = x
+
+    # Mixer input norm
+    x_in_inv_rms = (x_in.float().square().mean(dim=-1, keepdim=True) + cfg.rms_eps).rsqrt()
+    x_in_hat = bf16(x_in.float() * x_in_inv_rms * L.in_norm)
+
+    # The fused input projection
+    proj, u_in = lora(x_in_hat, L.in_proj, L.lora_in)
+
+    if deltanet:
+        qkv, z, b, a = proj.split([cfg.d_conv, cfg.d_v_all, cfg.n_v_heads, cfg.n_v_heads], dim=-1)
+
+        # Causal depthwise convolution over the segment: tap j reads x[t - 3 + j], zero before the segment.
+        qkv_pad = F.pad(qkv, (0, 0, 3, 0))
+        conv = bf16(sum(qkv_pad[j:j + T].float() * tap_keep[:, j:j + 1] * L.conv[j] for j in range(4)))   # (T, 8192)
+        q, k, v = F.silu(conv).split([cfg.d_qk_all, cfg.d_qk_all, cfg.d_v_all], dim=-1)
+
+        # The delta rule's gates: beta in (0, 1), the log decay g <= 0
+        beta = torch.sigmoid(b)                                                    # (T, n_v_heads) bf16
+        g = L.decay * F.softplus(a.float() + L.dt_bias)                            # (T, n_v_heads) fp32
+
+        core = gated_delta_rule(q.reshape(T, cfg.n_qk_heads, cfg.d_qk), k.reshape(T, cfg.n_qk_heads, cfg.d_qk),
+                                v.reshape(T, cfg.n_v_heads, cfg.d_v), g, beta, cu, cu_cpu)   # (T, n_v_heads, d_v)
+
+        # Gated RMSNorm: the normed core, weighted per value dim, gated by silu(z)
+        core_inv_rms = (core.float().square().mean(dim=-1, keepdim=True) + cfg.rms_eps).rsqrt()
+        mixed = bf16(core.float() * core_inv_rms * L.gate_norm
+                     * F.silu(z.float().view(T, cfg.n_v_heads, cfg.d_v))).view(T, cfg.d_model)
+    else:
+        q_raw, gate, k_raw, v = proj.split([cfg.d_qo_all, cfg.d_qo_all, cfg.d_kv_all, cfg.d_kv_all], dim=-1)
+        q_raw = q_raw.reshape(T, cfg.n_qo_heads, cfg.d_head)
+        k_raw = k_raw.reshape(T, cfg.n_kv_heads, cfg.d_head)
+        v = v.reshape(T, cfg.n_kv_heads, cfg.d_head)
+
+        # QK-norm, then RoPE
+        q_inv_rms = (q_raw.float().square().mean(dim=-1, keepdim=True) + cfg.rms_eps).rsqrt()
+        k_inv_rms = (k_raw.float().square().mean(dim=-1, keepdim=True) + cfg.rms_eps).rsqrt()
+        q_hat = bf16(rope(q_raw.float() * q_inv_rms * L.q_norm, cos, sin))
+        k_hat = bf16(rope(k_raw.float() * k_inv_rms * L.k_norm, cos, sin))
+
+        # Read V from the segment's past by matching its K.
+        y, lse = attention(q_hat, k_hat, v, cu)                                    # (T, n_qo_heads, d_head)
+
+        # The sigmoid output gate
+        mixed = bf16(y.view(T, cfg.d_model).float() * torch.sigmoid(gate.float()))
+
+    # Project back onto the stream.
+    attn_out, u_out = lora(mixed, L.out_proj, L.lora_out)
+    x_mid = x_in + attn_out
+
+    # MLP input norm
+    x_mid_inv_rms = (x_mid.float().square().mean(dim=-1, keepdim=True) + cfg.rms_eps).rsqrt()
+    x_mid_hat = bf16(x_mid.float() * x_mid_inv_rms * L.post_norm)
+
+    # SwiGLU
+    gu, u_mlp_in = lora(x_mid_hat, L.mlp_in, L.lora_mlp_in)                        # (T, 2 d_mlp)
+    act = bf16(F.silu(gu[:, :cfg.d_mlp].float()) * gu[:, cfg.d_mlp:].float())
+    mlp_out, u_mlp_out = lora(act, L.mlp_out, L.lora_mlp_out)
+
+    # Write back to the stream.
+    x = x_mid + mlp_out
+
+    if not backward:
+        return x, None
+    if deltanet:
+        return x, DeltaNetStash(x_in=x_in, x_in_inv_rms=x_in_inv_rms, u_in=u_in, conv=conv, z=z.contiguous(),
+                                a=a.contiguous(), beta=beta, core=core, core_inv_rms=core_inv_rms, u_out=u_out,
+                                x_mid=x_mid, x_mid_inv_rms=x_mid_inv_rms, gu=gu, u_mlp_in=u_mlp_in, u_mlp_out=u_mlp_out)
+    return x, AttentionStash(x_in=x_in, x_in_inv_rms=x_in_inv_rms, u_in=u_in, q_raw=q_raw, k_raw=k_raw, v=v,
+                             q_inv_rms=q_inv_rms, k_inv_rms=k_inv_rms, gate=gate.contiguous(), y=y, lse=lse, u_out=u_out,
+                             x_mid=x_mid, x_mid_inv_rms=x_mid_inv_rms, gu=gu, u_mlp_in=u_mlp_in, u_mlp_out=u_mlp_out)
 
 
-def lora_mm_bwd(dy, x, u, i, name, W):
-    """-> dx, and the fp32 gradients of A and B."""
-    A, B = LORA[i][name]
-    dyB = dy @ B.to(dy.dtype)                                                       # (T, r)
-    dx = torch.addmm(dy @ W, dyB, A.to(dy.dtype), alpha=ALPHA / RANK)
-    return dx, (dyB.T @ x).to(A.dtype) * (ALPHA / RANK), (dy.T @ u).to(A.dtype) * (ALPHA / RANK)
+@torch.compile(dynamic=False, fullgraph=True)
+def readout_forward_backward(x, last_pos, n_options, target, n_rows, backward):
+    """The final norm at each row's last token, the logits over the answer codes (masked to
+    the row's options) and the cross-entropy against the target, averaged over the pack's
+    rows. With backward=True also the readout's gradient and the loss's gradient w.r.t.
+    the stream, xb (T, d_model) fp32, zero everywhere but the readout tokens."""
+    rows = x[last_pos]                                                             # (R, d_model) bf16
+    inv_rms = (rows.float().square().mean(dim=-1, keepdim=True) + cfg.rms_eps).rsqrt()
+    rows_hat = bf16(rows.float() * inv_rms * m.final_norm)
+
+    # ==== Forward ====
+    valid = torch.arange(cfg.n_codes, device=x.device)[None] < n_options[:, None]  # (R, n_codes)
+    logits = (rows_hat @ bf16(m.readout.w).mT).float().masked_fill(~valid, float("-inf"))
+    logp = torch.log_softmax(logits, dim=-1)
+    probs = logp.exp()
+    if not backward:
+        return probs
+    loss = -(target * logp.masked_fill(~valid, 0.0)).sum() / n_rows
+
+    # ==== Backward ====
+    # A padding row's target is option 0 of 1, so its gradient is exactly zero; the mask
+    # keeps it so whatever the target holds.
+    real = (n_options > 1).float()[:, None]
+    logitsb = (probs - target) * real / n_rows                                      # (R, n_codes) fp32
+    m.readout.grad.copy_(logitsb.mT @ rows_hat.float())                             # (n_codes, d_model)
+    rows_hatb = logitsb @ m.readout.w                                               # (R, d_model) fp32
+
+    # Final norm backward
+    gh = rows_hatb * m.final_norm
+    xhat = rows.float() * inv_rms
+    rowsb = inv_rms * (gh - xhat * (gh * xhat).mean(dim=-1, keepdim=True))
+    xb = torch.zeros(x.shape, dtype=torch.float32, device=x.device).index_add_(0, last_pos, rowsb)
+    return loss, probs, xb
 
 
-# ------------------------------------------------------------------------------
-# §§ Forward
-# ------------------------------------------------------------------------------
-# One pack -> the final-norm hidden states at the readout rows. With keep=True each layer leaves what its
-# backward reads in `ctx`; otherwise nothing is kept (evaluation, and the checks' autograd reference).
+@torch.compile(dynamic=False, fullgraph=True)
+def layer_backward(xb, L, st, cos, sin, tap_keep, cu, cu_cpu):
+    """One layer's backward: xb (T, d_model) fp32, the gradient w.r.t. the layer's output,
+    -> the gradient w.r.t. its input. The LoRA gradients land in L's slots."""
+    T = xb.shape[0]
+    deltanet = isinstance(L, DeltaNetLayer)
 
-def forward(pk, keep):
-    T = pk.tokens.shape[0]
-    special = pk.tokens >= SPECIAL_BASE
-    x = torch.where(special[:, None], SPECIAL_ROWS.to(DT)[(pk.tokens - SPECIAL_BASE).clamp(min=0)], EMBED[pk.tokens.clamp(max=SPECIAL_BASE - 1)])
-    freqs = pk.pos.to(ACC)[:, None] * INV_FREQ[None]
-    emb = torch.cat((freqs, freqs), -1)
-    cos, sin = emb.cos().to(DT)[:, None], emb.sin().to(DT)[:, None]                # (T, 1, rot)
-    # Convolution tap j reads x[t - 3 + j]; it stays inside the row iff pos >= 3 - j (zero padding before it).
-    tap_keep = (pk.pos[:, None] >= torch.arange(3, -1, -1, device=pk.pos.device)).to(DT)   # (T, 4)
-    attn, gdn = attn_fn(pk), gdn_fn(pk)
-    ctx = []
-    for i in range(cfg.layers):
-        c = dict(x=x) if keep else None
-        h, rstd = rmsnorm(x, W_IN[i])
-        proj, u_in = lora_mm(h, i, "mix_in", W_MIX_IN[i])
-        if KIND[i] == "linear":
-            kd, vd = cfg.hk * cfg.dk, cfg.hv * cfg.dv
-            qkv, z, b, a = proj.split([2 * kd + vd, vd, cfg.hv, cfg.hv], -1)
-            conv = torch.zeros(qkv.shape, dtype=ACC, device=x.device)
-            xp = F.pad(qkv, (0, 0, 3, 0))
-            for j in range(4):
-                conv = conv + (xp[j:j + T] * tap_keep[:, j:j + 1]).to(ACC) * CONV_W[i][j]
-            conv = conv.to(DT)
-            q, k, v = F.silu(conv).split([kd, kd, vd], -1)
-            q, k = q.unflatten(-1, (cfg.hk, cfg.dk)).contiguous(), k.unflatten(-1, (cfg.hk, cfg.dk)).contiguous()
-            v = v.unflatten(-1, (cfg.hv, cfg.dv)).contiguous()
-            beta = torch.sigmoid(b)
-            g = A_NEG[i] * F.softplus(a.to(ACC) + DT_BIAS[i])
-            core, k_saved = kernel(gdn, (q, k, v, g, beta), keep)                     # (T, Hv, Dv)
-            cf = core.to(ACC)
-            core_rstd = torch.rsqrt(cf.pow(2).mean(-1, keepdim=True) + cfg.eps)
-            zf = z.to(ACC).unflatten(-1, (cfg.hv, cfg.dv))
-            mixed = (cf * core_rstd * W_GNORM[i] * F.silu(zf)).to(DT).flatten(1)
-            if keep:
-                # z and a copied out of the fused projection, so the projection itself can be freed
-                c.update(conv=conv, z=z.contiguous(), a=a.contiguous(), beta=beta, core=core, core_rstd=core_rstd, kernel=k_saved)
-        else:
-            qg, k, v = proj.split([2 * cfg.hq * cfg.dh, cfg.hkv * cfg.dh, cfg.hkv * cfg.dh], -1)
-            qg = qg.unflatten(-1, (cfg.hq, 2 * cfg.dh))
-            q_raw, gate = qg[..., :cfg.dh], qg[..., cfg.dh:]
-            k_raw = k.unflatten(-1, (cfg.hkv, cfg.dh))
-            qn, q_rstd = rmsnorm(q_raw, W_QN[i])
-            kn, k_rstd = rmsnorm(k_raw, W_KN[i])
-            q, k = rope(qn, cos, sin), rope(kn, cos, sin)
-            att, k_saved = kernel(attn, (q.contiguous(), k.contiguous(), v.unflatten(-1, (cfg.hkv, cfg.dh)).contiguous()), keep)
-            mixed = att.flatten(1) * torch.sigmoid(gate.flatten(1))
-            if keep:
-                c.update(q_raw=q_raw, k_raw=k_raw, q_rstd=q_rstd, k_rstd=k_rstd, gate=gate, att=att, kernel=k_saved)
-        out, u_out = lora_mm(mixed, i, "mix_out", W_MIX_OUT[i])
-        x = x + out
-        h2, rstd2 = rmsnorm(x, W_POST[i])
-        gu, u_mlp_in = lora_mm(h2, i, "mlp_in", W_MLP_IN[i])
-        act = F.silu(gu[:, :cfg.f]) * gu[:, cfg.f:]
-        down, u_mlp_out = lora_mm(act, i, "mlp_out", W_MLP_OUT[i])
-        if keep:
-            c.update(rstd=rstd, u_in=u_in, mixed=mixed, u_out=u_out, x_mid=x, rstd2=rstd2, gu=gu,
-                     u_mlp_in=u_mlp_in, u_mlp_out=u_mlp_out)
-            ctx.append(c)
-        x = x + down
-    hf, rstd_f = rmsnorm(x[pk.readout], W_FINAL)
-    if keep:
-        ctx.append(dict(x_rows=x[pk.readout], rstd_f=rstd_f, hf=hf, special=special))
-    return hf, ctx
+    # --- MLP backward: x = x_mid + mlp_out, mlp_out = lora(silu(gate) * up) ---
+    x_mid_hat = bf16(st.x_mid.float() * st.x_mid_inv_rms * L.post_norm)
+    gate_f, up = st.gu[:, :cfg.d_mlp].float(), st.gu[:, cfg.d_mlp:].float()
+    sig = torch.sigmoid(gate_f)
+    silu_gate = gate_f * sig
+    act = bf16(silu_gate * up)
+    actb = lora_bwd(bf16(xb), act, st.u_mlp_out, L.mlp_out, L.lora_mlp_out)              # (T, d_mlp) bf16
+    gub = torch.cat((bf16(actb.float() * up * (sig * (1 + gate_f * (1 - sig)))),         # d silu(gate) / d gate
+                     bf16(actb.float() * silu_gate)), dim=-1)                            # (T, 2 d_mlp)
+    x_mid_hatb = lora_bwd(gub, x_mid_hat, st.u_mlp_in, L.mlp_in, L.lora_mlp_in)
+
+    # MLP input norm backward; the residual passes xb through.
+    gh = x_mid_hatb.float() * L.post_norm
+    xhat = st.x_mid.float() * st.x_mid_inv_rms
+    xb_mid = xb + st.x_mid_inv_rms * (gh - xhat * (gh * xhat).mean(dim=-1, keepdim=True))
+
+    # --- Mixer backward: x_mid = x_in + attn_out, attn_out = lora(mixed) ---
+    if deltanet:
+        # The gated norm, recomputed: mixed = n * gate_norm * silu(z), n the normed core
+        z_f = st.z.float().view(T, cfg.n_v_heads, cfg.d_v)
+        sig_z = torch.sigmoid(z_f)
+        silu_z = z_f * sig_z
+        n = st.core.float() * st.core_inv_rms
+        mixed = bf16(n * L.gate_norm * silu_z).view(T, cfg.d_model)
+        mixedb = lora_bwd(bf16(xb_mid), mixed, st.u_out, L.out_proj, L.lora_out)
+        mb = mixedb.float().view(T, cfg.n_v_heads, cfg.d_v)
+        zb = mb * n * L.gate_norm * (sig_z * (1 + z_f * (1 - sig_z)))
+        nb = mb * L.gate_norm * silu_z
+        coreb = bf16(st.core_inv_rms * (nb - n * (nb * n).mean(dim=-1, keepdim=True)))
+
+        # The kernel's inputs, recomputed from the convolution's output, then FLA's backward
+        q, k, v = F.silu(st.conv).split([cfg.d_qk_all, cfg.d_qk_all, cfg.d_v_all], dim=-1)
+        g = L.decay * F.softplus(st.a.float() + L.dt_bias)
+        qb, kb, vb, gb, betab = gated_delta_rule_bwd(q.reshape(T, cfg.n_qk_heads, cfg.d_qk), k.reshape(T, cfg.n_qk_heads, cfg.d_qk),
+                                                     v.reshape(T, cfg.n_v_heads, cfg.d_v), g, st.beta, coreb, cu, cu_cpu)
+
+        # The gates' backward: beta = sigmoid(b), g = decay * softplus(a + dt_bias)
+        beta_f = st.beta.float()
+        bb = betab.float() * beta_f * (1 - beta_f)
+        ab = gb * L.decay * torch.sigmoid(st.a.float() + L.dt_bias)
+
+        # silu, then the convolution: conv[t] = sum_j qkv[t - 3 + j] keep[t, j] w[j], so
+        # qkvb[t] = sum_j (convb keep w[j])[t + 3 - j].
+        conv_f = st.conv.float()
+        sig_c = torch.sigmoid(conv_f)
+        convb = torch.cat((qb.view(T, cfg.d_qk_all), kb.view(T, cfg.d_qk_all), vb.view(T, cfg.d_v_all)), dim=-1).float() \
+                * (sig_c * (1 + conv_f * (1 - sig_c)))                                   # (T, 8192) fp32
+        qkvb = sum(F.pad(convb * tap_keep[:, j:j + 1] * L.conv[j], (0, 0, 0, 3 - j))[3 - j:] for j in range(4))
+        projb = bf16(torch.cat((qkvb, zb.view(T, cfg.d_v_all), bb, ab), dim=-1))         # (T, 12352)
+    else:
+        # The output gate, recomputed
+        sig = torch.sigmoid(st.gate.float())
+        mixed = bf16(st.y.view(T, cfg.d_model).float() * sig)
+        mixedb = lora_bwd(bf16(xb_mid), mixed, st.u_out, L.out_proj, L.lora_out)
+        mb = mixedb.float()
+        yb = bf16(mb * sig).view(T, cfg.n_qo_heads, cfg.d_head)
+        gateb = mb * st.y.view(T, cfg.d_model).float() * sig * (1 - sig)                 # (T, d_qo_all)
+
+        # q_hat and k_hat recomputed, then FlashAttention's backward
+        q_hat = bf16(rope(st.q_raw.float() * st.q_inv_rms * L.q_norm, cos, sin))
+        k_hat = bf16(rope(st.k_raw.float() * st.k_inv_rms * L.k_norm, cos, sin))
+        qb_hat, kb_hat, vb = attention_bwd(yb, q_hat, k_hat, st.v, st.y, st.lse, cu)
+
+        # RoPE's transpose is the rotation by -theta; then the per-(token, head) norms' backward
+        gh = rope(qb_hat.float(), cos, -sin) * L.q_norm
+        xhat = st.q_raw.float() * st.q_inv_rms
+        q_rawb = st.q_inv_rms * (gh - xhat * (gh * xhat).mean(dim=-1, keepdim=True))
+        gh = rope(kb_hat.float(), cos, -sin) * L.k_norm
+        xhat = st.k_raw.float() * st.k_inv_rms
+        k_rawb = st.k_inv_rms * (gh - xhat * (gh * xhat).mean(dim=-1, keepdim=True))
+        projb = bf16(torch.cat((q_rawb.view(T, cfg.d_qo_all), gateb, k_rawb.view(T, cfg.d_kv_all),
+                                vb.view(T, cfg.d_kv_all).float()), dim=-1))              # (T, 10240)
+
+    # The fused input projection's backward, then the mixer input norm's; the residual passes xb_mid through.
+    x_in_hat = bf16(st.x_in.float() * st.x_in_inv_rms * L.in_norm)
+    x_in_hatb = lora_bwd(projb, x_in_hat, st.u_in, L.in_proj, L.lora_in)
+    gh = x_in_hatb.float() * L.in_norm
+    xhat = st.x_in.float() * st.x_in_inv_rms
+    return xb_mid + st.x_in_inv_rms * (gh - xhat * (gh * xhat).mean(dim=-1, keepdim=True))
 
 
-def readout_loss(hf, pk):
-    """Cross-entropy of each question's options against its target, averaged over the pack's questions."""
-    logits = hf.to(READOUT.dtype) @ READOUT                                         # (R,)
-    padded = logits[pk.opt_idx.clamp(min=0)].masked_fill(pk.opt_idx < 0, float("-inf"))   # (Q, K)
-    logp = torch.log_softmax(padded, -1)
-    loss = -(pk.target * logp.masked_fill(pk.opt_idx < 0, 0)).sum(-1).mean()
-    return loss, logp.exp()
+@torch.no_grad()
+def forward_backward(pack, backward=True):
+    """One pack through the model. Returns the loss; with backward=False (evaluation) the
+    rows' probabilities over the answer codes instead, and nothing is kept."""
+    x, cos, sin, tap_keep = embed_forward(pack.tokens, pack.pos)
 
+    # -----------------------------
+    #           Forward
+    # -----------------------------
+    stash = []
+    for L in m.layers:
+        x, st = layer_forward(x, L, cos, sin, tap_keep, pack.cu, pack.cu_cpu, backward)
+        stash.append(st)
+    if not backward:
+        return readout_forward_backward(x, pack.last_pos, pack.n_options, pack.target, pack.n_rows, False)
+    loss, probs, xb = readout_forward_backward(x, pack.last_pos, pack.n_options, pack.target, pack.n_rows, True)
 
-# ------------------------------------------------------------------------------
-# §§ Backward
-# ------------------------------------------------------------------------------
-# The forward in reverse, a layer at a time. Each layer's LoRA gradients go straight into AdamW (`step_in`),
-# and the layer's saved activations are freed as soon as its backward has read them.
-
-def backward(pk, ctx, probs, step_in):
-    last = ctx.pop()
-    Q = probs.shape[0]
-    dpad = (probs - pk.target).masked_fill(pk.opt_idx < 0, 0) / Q                   # dloss / dlogits, (Q, K)
-    valid = pk.opt_idx >= 0
-    dlogits = torch.zeros(pk.readout.shape[0], device=probs.device, dtype=READOUT.dtype)
-    dlogits.index_add_(0, pk.opt_idx[valid], dpad[valid].to(READOUT.dtype))
-    d_readout = dlogits @ last["hf"].to(READOUT.dtype)
-    dhf = dlogits[:, None] * READOUT[None]
-    step_in([READOUT], [d_readout])
-    dx = torch.zeros(pk.tokens.shape[0], cfg.d, device=probs.device, dtype=ACC)
-    dx[pk.readout] = rmsnorm_bwd(dhf, last["x_rows"], last["rstd_f"], W_FINAL)
-    for i in reversed(range(cfg.layers)):
-        c = ctx.pop()
-        grads = {}
-        # MLP: x_out = x_mid + down(silu(gate) * up)
-        h2 = rmsnorm(c["x_mid"], W_POST[i])[0]
-        g_, up = c["gu"][:, :cfg.f], c["gu"][:, cfg.f:]
-        act = F.silu(g_) * up
-        dact, *grads["mlp_out"] = lora_mm_bwd(dx.to(DT), act, c["u_mlp_out"], i, "mlp_out", W_MLP_OUT[i])
-        dgu = torch.cat(((dact.to(ACC) * up.to(ACC) * silu_grad(g_)).to(DT), (dact.to(ACC) * F.silu(g_.to(ACC))).to(DT)), -1)
-        dh2, *grads["mlp_in"] = lora_mm_bwd(dgu, h2, c["u_mlp_in"], i, "mlp_in", W_MLP_IN[i])
-        dx = dx + rmsnorm_bwd(dh2, c["x_mid"], c["rstd2"], W_POST[i])
-        # Mixer: x_mid = x + out(mixed)
-        dmixed, *grads["mix_out"] = lora_mm_bwd(dx.to(DT), c["mixed"], c["u_out"], i, "mix_out", W_MIX_OUT[i])
-        if KIND[i] == "linear":
-            zf = c["z"].to(ACC).unflatten(-1, (cfg.hv, cfg.dv))
-            cf = c["core"].to(ACC)
-            n = cf * c["core_rstd"]
-            dm = dmixed.to(ACC).unflatten(-1, (cfg.hv, cfg.dv))
-            dz = dm * n * W_GNORM[i] * silu_grad(zf)
-            dcore = rmsnorm_bwd(dm * W_GNORM[i] * F.silu(zf), cf, c["core_rstd"], None)
-            dq, dk, dv, dg, dbeta = kernel_bwd(c["kernel"], dcore.to(DT))
-            beta = c["beta"].to(ACC)
-            db = dbeta.to(ACC) * beta * (1 - beta)
-            da = dg.to(ACC) * A_NEG[i] * torch.sigmoid(c["a"].to(ACC) + DT_BIAS[i])
-            dconv = torch.cat((dq.flatten(1), dk.flatten(1), dv.flatten(1)), -1).to(ACC) * silu_grad(c["conv"])
-            # conv[t] = sum_j qkv[t - 3 + j] * keep[t, j] * w[j]  =>  dqkv[t - 3 + j] += dconv[t] * keep[t, j] * w[j]
-            T = dconv.shape[0]
-            tap_keep = (pk.pos[:, None] >= torch.arange(3, -1, -1, device=pk.pos.device)).to(ACC)
-            dxp = torch.zeros(T + 3, dconv.shape[1], device=dconv.device, dtype=ACC)
-            for j in range(4):
-                dxp[j:j + T] += dconv * tap_keep[:, j:j + 1] * CONV_W[i][j]
-            dproj = torch.cat((dxp[3:], dz.flatten(1), db, da), -1).to(DT)
-        else:
-            sig = torch.sigmoid(c["gate"].flatten(1).to(ACC))
-            datt = (dmixed.to(ACC) * sig).to(DT).unflatten(-1, (cfg.hq, cfg.dh))
-            dgate = (dmixed.to(ACC) * c["att"].flatten(1).to(ACC) * sig * (1 - sig)).unflatten(-1, (cfg.hq, cfg.dh))
-            dq, dk, dv = kernel_bwd(c["kernel"], datt)
-            cos, sin = pk.cos, pk.sin
-            dq_raw = rmsnorm_bwd(rope_bwd(dq, cos, sin), c["q_raw"], c["q_rstd"], W_QN[i])
-            dk_raw = rmsnorm_bwd(rope_bwd(dk, cos, sin), c["k_raw"], c["k_rstd"], W_KN[i])
-            dqg = torch.cat((dq_raw, dgate), -1).flatten(1)
-            dproj = torch.cat((dqg, dk_raw.flatten(1), dv.flatten(1).to(ACC)), -1).to(DT)
-        h = rmsnorm(c["x"], W_IN[i])[0]
-        dh, *grads["mix_in"] = lora_mm_bwd(dproj, h, c["u_in"], i, "mix_in", W_MIX_IN[i])
-        dx = dx + rmsnorm_bwd(dh, c["x"], c["rstd"], W_IN[i])
-        del c
-        step_in([p for name in LORA_NAMES for p in LORA[i][name]], [gr for name in LORA_NAMES for gr in grads[name]])
-    special = last["special"]
-    d_special = torch.zeros_like(SPECIAL_ROWS)
-    d_special.index_add_(0, pk.tokens[special] - SPECIAL_BASE, dx[special])
-    step_in([SPECIAL_ROWS], [d_special])
+    # -----------------------------
+    #           Backward
+    # -----------------------------
+    for i in reversed(range(cfg.n_layers)):
+        # ← each layer's backward, its LoRA gradients into their banks
+        xb = layer_backward(xb, m.layers[i], stash[i], cos, sin, tap_keep, pack.cu, pack.cu_cpu)
+        stash[i] = None                          # free this layer's stash as we go
+    return loss
 
 
 # ==============================================================================
-# § Optimizer
+# § Optimizer Math
 # ==============================================================================
-# AdamW on the fp32 trained parameters, stepped in place from inside the backward. Warmup over the first 5% of
-# steps, then cosine to 10% of LR. No weight decay (LoRA's B starts at zero and its A carries no scale).
 
-def adamw_step(params, grads, step, num_steps):
-    warm = max(1, int(0.05 * num_steps))
-    progress = (step - warm) / max(1, num_steps - warm)
-    lr = LR * (step + 1) / warm if step < warm else LR * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, progress))))
-    b1, b2, eps = 0.9, 0.999, 1e-8
-    t = step + 1
-    for p, g in zip(params, grads):
-        m, v = ADAM[id(p)]
-        m.lerp_(g, 1 - b1)
-        v.mul_(b2).addcmul_(g, g, value=1 - b2)
-        p.addcdiv_(m, (v / (1 - b2 ** t)).sqrt_().add_(eps), value=-lr / (1 - b1 ** t))
-    return lr
+# ------------------------------------------------------------------------------
+# §§ AdamW
+# ------------------------------------------------------------------------------
+
+@torch.compile(dynamic=False, fullgraph=True)
+def adamw_step(params, t):
+    """One AdamW step on every Param: betas 0.9 / 0.999, no weight decay, the bias
+    corrections folded into lr_bc_t and eps_t. t is the (,) int64 device step."""
+    for p in params:
+        p.first_mntm.lerp_(p.grad, 0.1)                                  # m = 0.9 m + 0.1 g
+        p.scnd_mntm.mul_(0.999).addcmul_(p.grad, p.grad, value=0.001)   # v = 0.999 v + 0.001 g^2
+        p.w.sub_(lr_bc_t[t] * p.first_mntm / (p.scnd_mntm.sqrt() + eps_t[t]))
 
 
 # ==============================================================================
 # § Data
 # ==============================================================================
-# Rows from the data prep's records: one per question, the state (its first STATE_CAP ids) then the question's
-# prefix and options. Training shuffles a choice question's options every time its row is built.
+# The data prep's parquets -> Row records -> packs of at most pack_tokens tokens and
+# max_rows - max_pad_segments rows -> every pack's tensors staged in pinned memory, in
+# one fixed shape. Training packs are planned for the whole run up front (shuffled, filled
+# greedily, a choice question's options shuffled each time its row is built); evaluation
+# packs are planned per split (first-fit decreasing).
 
-def load_split(split):
+def load_rows(split):
     t = pq.read_table(DATA_DIR / f"{split}.parquet").to_pydict()
     rows = []
     for r in range(len(t["id"])):
-        state = t["state_ids"][r][:STATE_CAP]
         for j in range(len(t["q_name"][r])):
-            rows.append(SimpleNamespace(split=split, record=r, source=t["source"][r], clean=t["variant"][r] == "clean",
-                                        state=state, kind=t["q_type"][r][j], prefix=t["q_prefix"][r][j],
-                                        options=t["q_options"][r][j], label=t["q_label"][r][j],
-                                        target=t["q_target"][r][j] or None,
-                                        length=len(state) + len(t["q_prefix"][r][j]) + sum(len(o) for o in t["q_options"][r][j])))
+            prefix, options = t["q_prefix"][r][j], t["q_options"][r][j]
+            rows.append(Row(split=split, record=r, source=t["source"][r], clean=t["variant"][r] == "clean",
+                            kind=t["q_type"][r][j], prefix=prefix, options=options, label=t["q_label"][r][j],
+                            target=t["q_target"][r][j] or None,
+                            length=len(prefix) + sum(len(o) + 1 for o in options) + len(TAIL_IDS)))
+    longest = max(r.length for r in rows)
+    assert longest <= min(cfg.max_row_tokens, cfg.pack_tokens), f"{split}: a {longest}-token row is over max_row_tokens"
+    assert max(len(r.options) for r in rows) <= cfg.n_codes
     return rows
 
 
-def row_target(row, order):
-    """The training target in option order `order`: SOFT_WEIGHT x the soft target + the rest on the label."""
-    hard = np.zeros(len(order), np.float32)
-    hard[order.index(row.label)] = 1
-    if row.target is None:
-        return hard
-    soft = np.asarray([row.target[o] for o in order], np.float32)
-    return SOFT_WEIGHT * soft + (1 - SOFT_WEIGHT) * hard
-
-
-def make_pack(rows, train):
-    """Rows end to end -> the forward's inputs: tokens, positions within each row, cu_seqlens, the readout rows,
-    and per question its option rows (padded with -1) and target."""
-    tokens, pos, readout, opt_rows, targets, labels, orders = [], [], [], [], [], [], []
-    n = 0
-    for row in rows:
-        order = list(range(len(row.options)))
-        if train and row.kind == "choice":
-            random.shuffle(order)
-        ids = row.state + row.prefix
-        mine = []
-        for o in order:
-            ids = ids + row.options[o]
-            mine.append(n + len(ids) - 1)
-        tokens.append(ids); pos.append(np.arange(len(ids)))
-        q_rows = list(range(len(readout), len(readout) + len(mine)))
-        readout += mine; opt_rows.append(q_rows); orders.append(order)
-        targets.append(row_target(row, order) if train else None)
-        n += len(ids)
-    K = max(len(o) for o in opt_rows)
-    opt_idx = np.full((len(rows), K), -1, np.int64)
-    target = np.zeros((len(rows), K), np.float32)
-    for q, rr in enumerate(opt_rows):
-        opt_idx[q, :len(rr)] = rr
-        if targets[q] is not None:
-            target[q, :len(rr)] = targets[q]
-    lengths = [len(t) for t in tokens]
-    cu_cpu = torch.tensor([0] + list(np.cumsum(lengths)), dtype=torch.int32)
-    pk = SimpleNamespace(tokens=torch.from_numpy(np.concatenate(tokens)).to(device),
-                         pos=torch.from_numpy(np.concatenate(pos).astype(np.int32)).to(device),
-                         cu=cu_cpu.to(device), cu_cpu=cu_cpu, cu_long=cu_cpu.long().to(device), cu_cpu_long=cu_cpu.long(),
-                         longest=max(lengths),
-                         readout=torch.tensor(readout, device=device), opt_idx=torch.from_numpy(opt_idx).to(device),
-                         target=torch.from_numpy(target).to(device), rows=rows, orders=orders, n_tokens=n)
-    freqs = pk.pos.to(ACC)[:, None] * INV_FREQ[None]
-    emb = torch.cat((freqs, freqs), -1)
-    pk.cos, pk.sin = emb.cos().to(DT)[:, None], emb.sin().to(DT)[:, None]
-    return pk
-
-
-def plan_packs(rows, budget, shuffle):
-    """Rows into packs of at most `budget` tokens: in random order, filled greedily (training), or first-fit
-    decreasing (evaluation)."""
-    assert max(r.length for r in rows) <= budget, f"a {max(r.length for r in rows)}-token row is over the {budget}-token budget"
+def plan_packs(rows, shuffle):
+    """Rows into packs: in random order, filled greedily (training), or first-fit decreasing (evaluation)."""
+    max_rows = cfg.max_rows - cfg.max_pad_segments
     if shuffle:
-        order = list(range(len(rows))); random.shuffle(order)
+        order = list(range(len(rows)))
+        random.shuffle(order)
         packs, cur, used = [], [], 0
         for i in order:
-            if used + rows[i].length > budget:
-                packs.append(cur); cur, used = [], 0
-            cur.append(rows[i]); used += rows[i].length
+            if used + rows[i].length > cfg.pack_tokens or len(cur) == max_rows:
+                packs.append(cur)
+                cur, used = [], 0
+            cur.append(rows[i])
+            used += rows[i].length
         return packs + [cur]
     packs, room = [], []
     for i in sorted(range(len(rows)), key=lambda i: -rows[i].length):
         for p in range(len(packs)):
-            if rows[i].length <= room[p]:
-                packs[p].append(rows[i]); room[p] -= rows[i].length
+            if rows[i].length <= room[p] and len(packs[p]) < max_rows:
+                packs[p].append(rows[i])
+                room[p] -= rows[i].length
                 break
         else:
-            packs.append([rows[i]]); room.append(budget - rows[i].length)
+            packs.append([rows[i]])
+            room.append(cfg.pack_tokens - rows[i].length)
     return packs
+
+
+class Staged(NamedTuple):
+    """Every pack of a plan, in pinned memory, one fixed shape."""
+    tokens:    Tensor    # (N, pack_tokens)         int32
+    pos:       Tensor    # (N, pack_tokens)         int32
+    cu:        Tensor    # (N, max_rows + 1)        int32
+    last_pos:  Tensor    # (N, max_rows)            int64
+    n_options: Tensor    # (N, max_rows)            int32
+    target:    Tensor    # (N, max_rows, n_codes)   fp32
+    n_rows:    Tensor    # (N,)                     int32
+    rows:      list      # per pack, its Row records (in pack order)
+
+
+def stage_packs(packs, train):
+    """-> Staged. A row is its prefix, then a code and the option for each option (in the
+    row's order), then the tail; every option is read at the row's last token. The padding
+    after the rows is cut into segments of at most max_row_tokens (position 0 at each cut),
+    and the remaining segments are empty."""
+    N, P, R = len(packs), cfg.pack_tokens, cfg.max_rows
+    pinned = lambda *shape, dtype: torch.empty(*shape, dtype=dtype, pin_memory=True)
+    st = Staged(tokens=pinned(N, P, dtype=torch.int32), pos=pinned(N, P, dtype=torch.int32),
+                cu=pinned(N, R + 1, dtype=torch.int32), last_pos=pinned(N, R, dtype=torch.int64),
+                n_options=pinned(N, R, dtype=torch.int32), target=pinned(N, R, cfg.n_codes, dtype=torch.float32),
+                n_rows=pinned(N, dtype=torch.int32), rows=[])
+    tokens, pos, cu, last_pos, n_options, target = (x.numpy() for x in st[:6])
+    tokens.fill(0); pos.fill(0); cu.fill(P); last_pos.fill(P - 1); n_options.fill(1); target.fill(0.0); target[:, :, 0] = 1.0
+    for n, pack_rows in enumerate(packs):
+        end = 0
+        for j, row in enumerate(pack_rows):
+            order = list(range(len(row.options)))
+            if train and row.kind == "choice":
+                random.shuffle(order)
+            ids = list(row.prefix)
+            for k, o in enumerate(order):
+                ids.append(CODE_IDS[k])
+                ids += row.options[o]
+            ids += TAIL_IDS
+            assert len(ids) == row.length
+            start, end = end, end + row.length
+            tokens[n, start:end] = ids
+            pos[n, start:end] = np.arange(row.length)
+            cu[n, j + 1] = end
+            last_pos[n, j] = end - 1
+            n_options[n, j] = len(order)
+            hard = np.zeros(len(order), np.float32)
+            hard[order.index(row.label)] = 1.0
+            if train and row.target is not None:
+                soft = np.asarray([row.target[o] for o in order], np.float32)
+                target[n, j, :len(order)] = cfg.soft_weight * soft + (1 - cfg.soft_weight) * hard
+            else:
+                target[n, j, :len(order)] = hard
+        j = len(pack_rows)
+        while end < P:                                   # the padding, in segments of at most max_row_tokens
+            start, end = end, min(end + cfg.max_row_tokens, P)
+            pos[n, start:end] = np.arange(end - start)
+            cu[n, j + 1] = end
+            j += 1
+        st.n_rows[n] = len(pack_rows)
+        st.rows.append(pack_rows)
+    return st
+
+
+def pack_on_device(st, n):
+    """Pack n of a Staged, moved to the device."""
+    to = lambda x: x[n].to(device, non_blocking=True)
+    return Pack(tokens=to(st.tokens), pos=to(st.pos), cu=to(st.cu), cu_cpu=st.cu[n].long(),
+                last_pos=to(st.last_pos), n_options=to(st.n_options), target=to(st.target),
+                n_rows=to(st.n_rows), rows=st.rows[n])
+
+
+t0 = time.perf_counter()
+train_rows = [r for split in cfg.train_splits for r in load_rows(split)]
+train_tokens = sum(r.length for r in train_rows)
+epochs = [plan_packs(train_rows, shuffle=True) for _ in range(math.ceil(cfg.epochs))]
+train_packs = [p for ep in epochs for p in ep][:round(cfg.epochs * len(epochs[0]))]
+train_staged = stage_packs(train_packs, train=True)
+cfg.num_steps = len(train_packs)
+val_rows = {split: load_rows(split) for split in cfg.val_splits}
+print(f"train: {len(train_rows):,} questions, {train_tokens / 1e6:.1f}M tokens a pass, {len(epochs[0])} packs a pass; "
+      f"{cfg.num_steps} steps; staged in {time.perf_counter() - t0:.1f}s "
+      f"({sum(x.numel() * x.element_size() for x in train_staged[:7]) / 2**30:.2f} GiB pinned)")
+rows_per_pack = train_staged.n_rows.numpy()
+print(f"  rows per pack: mean {rows_per_pack.mean():.1f}, max {rows_per_pack.max()} (of {cfg.max_rows - cfg.max_pad_segments}); "
+      f"fill {100 * train_tokens * cfg.epochs / (cfg.num_steps * cfg.pack_tokens):.1f}%")
+
+
+# ==============================================================================
+# § Weight Init & Schedule
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# §§ LR Schedule
+# ------------------------------------------------------------------------------
+
+# Learning rate as a per-step table: linear warmup over the first 5% of steps, then
+# cosine to 10% of peak. The bias corrections are folded in: lr_bc_t and eps_t are what
+# the update reads.
+steps_0idx = np.arange(cfg.num_steps, dtype=np.float64)
+steps_1idx = steps_0idx + 1.0
+warmup_steps = max(1, int(0.05 * cfg.num_steps))
+cosine_frac = np.clip((steps_0idx - warmup_steps) / max(1, cfg.num_steps - warmup_steps), 0.0, 1.0)
+lr_mult_t = np.where(steps_0idx < warmup_steps, steps_1idx / warmup_steps,
+                     0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * cosine_frac)))
+
+dev = lambda a: torch.tensor(a, dtype=torch.float32, device=device)
+lr_bc_t = dev(cfg.lr * lr_mult_t * (1.0 - 0.999 ** steps_1idx) ** 0.5 / (1.0 - 0.9 ** steps_1idx))
+eps_t   = dev(1e-8 * (1.0 - 0.999 ** steps_1idx) ** 0.5)
+
+# ------------------------------------------------------------------------------
+# §§ Frozen Banks
+# ------------------------------------------------------------------------------
+
+m = Model()
+
+t0 = time.perf_counter()
+banks = load_file(str(MODEL_PATH), device="cuda")
+cfg.num_frozen_params = sum(t.numel() for name, t in banks.items() if name != "lm_head_codes")
+m.embed = banks["embed"]
+m.final_norm = banks["final_norm"]
+m.inv_freq = 1.0 / cfg.rope_theta ** (torch.arange(0, cfg.d_rotary, 2, device=device).float() / cfg.d_rotary)
+print(f"banks: {cfg.num_frozen_params / 1e9:.2f}B parameters in {time.perf_counter() - t0:.0f}s; "
+      f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB")
+
+# ------------------------------------------------------------------------------
+# §§ LoRA
+# ------------------------------------------------------------------------------
+
+fp32_zeros = lambda *shape: torch.zeros(*shape, dtype=torch.float32, device=device)
+
+def param(name, w):
+    """A Param around w, with zero gradient and optimizer state."""
+    return Param(name=name, w=w, grad=fp32_zeros(w.shape), first_mntm=fp32_zeros(w.shape), scnd_mntm=fp32_zeros(w.shape))
+
+# Per kind and projection: A (L, rank, in) Kaiming-uniform as nn.Linear's, B (L, out, rank)
+# zero, so training starts from the base model.
+for kind, n_kind in (("deltanet", cfg.n_deltanet), ("attention", cfg.n_attention)):
+    for proj in ("in", "out", "mlp_in", "mlp_out"):
+        out_dim, in_dim = banks[f"{kind}_{proj}_proj" if proj in ("in", "out") else f"{kind}_{proj}"].shape[1:]
+        A = torch.empty(n_kind, cfg.rank, in_dim, dtype=torch.float32, device=device)
+        torch.nn.init.kaiming_uniform_(A.view(-1, in_dim), a=math.sqrt(5))
+        setattr(m, f"{kind}_A_{proj}", param(f"{kind}_A_{proj}", A))
+        setattr(m, f"{kind}_B_{proj}", param(f"{kind}_B_{proj}", fp32_zeros(n_kind, out_dim, cfg.rank)))
+
+# ------------------------------------------------------------------------------
+# §§ Readout
+# ------------------------------------------------------------------------------
+
+# The LM head's rows for the answer codes: before any training the model answers as Qwen does.
+m.readout = param("readout", banks["lm_head_codes"].float())
+
+cfg.num_params = sum(p.w.numel() for p in m)
+print(f"trained: {cfg.num_params / 1e6:.1f}M parameters (LoRA rank {cfg.rank}, alpha {cfg.alpha:g}, and the readout)")
+
+# ------------------------------------------------------------------------------
+# §§ Layers
+# ------------------------------------------------------------------------------
+
+def build_layers():
+    """The 32 layer records in checkpoint order, each slicing its kind's banks and Params."""
+    layers = []
+    for i in range(cfg.n_layers):
+        kind, j = ("attention", i // 4) if i % 4 == 3 else ("deltanet", i - i // 4)
+        bank = lambda name: banks[f"{kind}_{name}"][j]
+        loras = {f"lora_{proj}": Lora(A=getattr(m, f"{kind}_A_{proj}").w[j], B=getattr(m, f"{kind}_B_{proj}").w[j],
+                                      Ab=getattr(m, f"{kind}_A_{proj}").grad[j], Bb=getattr(m, f"{kind}_B_{proj}").grad[j])
+                 for proj in ("in", "out", "mlp_in", "mlp_out")}
+        if kind == "deltanet":
+            layers.append(DeltaNetLayer(in_norm=bank("in_norm"), in_proj=bank("in_proj"), conv=bank("conv"), decay=bank("decay"),
+                                        dt_bias=bank("dt_bias"), gate_norm=bank("gate_norm"), out_proj=bank("out_proj"),
+                                        post_norm=bank("post_norm"), mlp_in=bank("mlp_in"), mlp_out=bank("mlp_out"), **loras))
+        else:
+            layers.append(AttentionLayer(in_norm=bank("in_norm"), in_proj=bank("in_proj"), q_norm=bank("q_norm"), k_norm=bank("k_norm"),
+                                         out_proj=bank("out_proj"), post_norm=bank("post_norm"), mlp_in=bank("mlp_in"),
+                                         mlp_out=bank("mlp_out"), **loras))
+    return layers
+
+m.layers = build_layers()
+trained = list(m)
+
+
+# ==============================================================================
+# § Gradient Check
+# ==============================================================================
+# CHECK_GRADS: the hand-written backward (grads in the Param banks) against autograd
+# through the same forward run eagerly, on the first training pack, with B random so A's
+# gradients are not zero. The same kernels on both sides, so the gap is rounding order.
+
+if CHECK_GRADS:
+    pack = pack_on_device(train_staged, 0)
+    for p in trained:
+        if "_B_" in p.name:
+            p.w.normal_(0, 0.05)
+    forward_backward(pack)
+    mine = {p.name: p.grad.clone() for p in trained}
+    with torch.compiler.set_stance("force_eager"), torch.enable_grad():
+        for p in trained:
+            p.w.requires_grad_(True)
+        m.layers = build_layers()                # views of the leaves, so autograd sees them
+        x, cos, sin, tap_keep = embed_forward(pack.tokens, pack.pos)
+        for L in m.layers:
+            x, _ = layer_forward(x, L, cos, sin, tap_keep, pack.cu, pack.cu_cpu, False)
+        probs = readout_forward_backward(x, pack.last_pos, pack.n_options, pack.target, pack.n_rows, False)
+        loss = -(pack.target * probs.clamp_min(1e-30).log()).sum() / pack.n_rows
+        ref = torch.autograd.grad(loss, [p.w for p in trained])
+        for p in trained:
+            p.w.requires_grad_(False)
+    worst = 0.0
+    for p, g in zip(trained, ref):
+        rel = ((mine[p.name] - g).norm() / g.norm()).item()
+        cos_sim = F.cosine_similarity(mine[p.name].flatten(), g.flatten(), dim=0).item()
+        worst = max(worst, rel)
+        print(f"  {p.name:24s} |ref| {g.norm().item():.3e}  rel err {rel:.3e}  cos {cos_sim:.6f}")
+    print(f"check: hand-written gradients vs autograd, {len(trained)} tensors, worst relative error {worst:.3e}")
+    assert worst < 0.05
+    sys.exit(0)
 
 
 # ==============================================================================
 # § Evaluation
 # ==============================================================================
-# Accuracy, Brier score and log loss against the label, and KL from d3-flash's distribution where the data prep
-# joined one, on each split's clean rows; Cookbook-dev also by source.
+# Accuracy, Brier score and log loss against the label, and KL from d3-flash's distribution
+# where the data prep joined one, on each split's clean rows; Cookbook-dev also by source.
 
-@torch.no_grad()
-def evaluate(splits, rows_by_split, final):
-    results = {}
-    for split in splits:
-        rows = rows_by_split[split]
-        stats = []
-        for pack_rows in plan_packs(rows, EVAL_TOKENS, shuffle=False):
-            pk = make_pack(pack_rows, train=False)
-            hf, _ = forward(pk, keep=False)
-            _, probs = readout_loss(hf, pk)
-            probs = probs.cpu().numpy()
-            for q, row in enumerate(pack_rows):
-                p = probs[q, :len(row.options)]
-                onehot = np.eye(len(p))[row.label]
-                kl = None
-                if row.target is not None:
-                    t = np.asarray(row.target)
-                    kl = float((t * (np.log(np.maximum(t, 1e-12)) - np.log(np.maximum(p, 1e-12)))).sum())
-                stats.append(dict(clean=row.clean, source=row.source, acc=float(p.argmax() == row.label),
-                                  brier=float(((p - onehot) ** 2).sum()), logloss=float(-np.log(max(p[row.label], 1e-12))),
-                                  kl=kl, p=p.round(4).tolist(), label=row.label, record=row.record))
-        clean = [s for s in stats if s["clean"]]
-        kls = [s["kl"] for s in clean if s["kl"] is not None]
-        res = dict(n=len(clean), acc=np.mean([s["acc"] for s in clean]), brier=np.mean([s["brier"] for s in clean]),
-                   logloss=np.mean([s["logloss"] for s in clean]), kl_d3=np.mean(kls) if kls else None)
-        if final:
-            by_source = {}
-            for s in clean:
-                by_source.setdefault(s["source"], []).append(s["acc"])
-            res["by_source"] = {k: (int(sum(v)), len(v)) for k, v in sorted(by_source.items())}
-            res["questions"] = stats
-        results[split] = res
-        kl_text = f" kl_d3 {res['kl_d3']:.3f}" if res["kl_d3"] is not None else ""
-        print(f"  val {split}: n {res['n']} acc {res['acc']:.4f} brier {res['brier']:.4f} logloss {res['logloss']:.4f}{kl_text}", flush=True)
-        if final and split == "cookbook_dev":
-            print("    by source: " + ", ".join(f"{k} {a}/{b}" for k, (a, b) in res["by_source"].items()))
-    return results
+def evaluate(split):
+    """-> (the split's summary, one dict per question)."""
+    staged = stage_packs(plan_packs(val_rows[split], shuffle=False), train=False)
+    questions = []
+    for n in range(len(staged.rows)):
+        pack = pack_on_device(staged, n)
+        probs = forward_backward(pack, backward=False).cpu().numpy()
+        for q, row in enumerate(pack.rows):
+            p = probs[q, :len(row.options)]
+            onehot = np.eye(len(p), dtype=np.float32)[row.label]
+            kl = None
+            if row.target is not None:
+                t = np.asarray(row.target)
+                kl = float((t * (np.log(np.maximum(t, 1e-12)) - np.log(np.maximum(p, 1e-12)))).sum())
+            questions.append(dict(clean=row.clean, source=row.source, record=row.record, label=row.label,
+                                  acc=float(p.argmax() == row.label), brier=float(((p - onehot) ** 2).sum()),
+                                  logloss=float(-np.log(max(p[row.label], 1e-12))), kl=kl, p=p.round(4).tolist()))
+    clean = [s for s in questions if s["clean"]]
+    kls = [s["kl"] for s in clean if s["kl"] is not None]
+    by_source = {}
+    for s in clean:
+        by_source.setdefault(s["source"], []).append(s["acc"])
+    summary = dict(n=len(clean), acc=float(np.mean([s["acc"] for s in clean])), brier=float(np.mean([s["brier"] for s in clean])),
+                   logloss=float(np.mean([s["logloss"] for s in clean])), kl_d3=float(np.mean(kls)) if kls else None,
+                   by_source={k: (int(sum(v)), len(v)) for k, v in sorted(by_source.items())})
+    return summary, questions
 
 
 # ==============================================================================
-# § Checks
-# ==============================================================================
-# CHECK=1: a tiny random Qwen3.5 in fp64 on the GPU, with the per-row reference kernels. (1) With LoRA's B at zero
-# the forward's final hidden states match transformers' Qwen3_5TextModel. (2) With B random, the hand-written
-# backward's gradients match autograd's through the same forward, for every trained parameter.
-
-def run_checks():
-    global DT, ACC, SPECIAL_BASE
-    import inspect
-    from transformers import Qwen3_5TextConfig
-    from transformers.models.qwen3_5 import modeling_qwen3_5
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
-    # transformers' reference runs its plain torch Gated DeltaNet and convolution, not FLA's fp32-only kernels
-    for name in ("torch_chunk_gated_delta_rule", "causal_conv1d_fn"):
-        setattr(modeling_qwen3_5, name, inspect.unwrap(getattr(modeling_qwen3_5, name)))
-    DT, ACC = torch.float64, torch.float64
-    tc = Qwen3_5TextConfig(   # agent-ops-stacks encoder-rtx/2026-11-01_1135am_d3-varlen-engine/check_tiny.py's
-        hidden_size=64, intermediate_size=96, num_hidden_layers=4,
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-        num_attention_heads=4, num_key_value_heads=2, head_dim=16, attn_output_gate=True,
-        linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=8, linear_value_head_dim=8,
-        linear_conv_kernel_dim=4, vocab_size=512, rms_norm_eps=1e-6, max_position_embeddings=4096,
-        rope_parameters=dict(rope_type="default", rope_theta=1e7, partial_rotary_factor=0.25,
-                             mrope_section=[11, 11, 10], mrope_interleaved=True))
-    tc._attn_implementation = "sdpa"
-    torch.manual_seed(0)
-    ref = Qwen3_5TextModel(tc).eval()
-    with torch.no_grad():
-        for p in ref.parameters():        # every weight random, the zero-centred norms included
-            p.add_(torch.randn_like(p) * 0.3)
-    ref = ref.to(device, torch.float64)
-    set_cfg(tc)
-    sd = ref.state_dict()
-    load_weights(lambda name: sd[name])
-    n_special = 18
-    init_trained(tc.vocab_size - n_special, torch.randn(n_special, cfg.d, dtype=torch.float64) * 0.1)
-    READOUT_ = torch.randn(cfg.d, device=device, dtype=torch.float64)
-
-    rng = np.random.default_rng(0)
-    rows = []
-    for length in (23, 9, 40):
-        ids = rng.integers(0, tc.vocab_size - n_special, size=length).tolist()
-        ids[3] = tc.vocab_size - n_special + 2                                    # a special token mid-row
-        rows.append(SimpleNamespace(state=ids[:length - 6], prefix=ids[length - 6:length - 4],
-                                    options=[ids[length - 4:length - 2], ids[length - 2:]], kind="choice", label=1,
-                                    target=None, length=length))
-
-    # (1) the forward against transformers, every row on its own
-    pk = make_pack(rows, train=False)
-    with torch.no_grad():
-        SPECIAL_ROWS.copy_(ref.embed_tokens.weight[SPECIAL_BASE:SPECIAL_BASE + n_special])
-        T = pk.tokens.shape[0]
-        pk.readout = torch.arange(T, device=device)
-        hf, _ = forward(pk, keep=False)
-        worst = 0.0
-        for s, e in zip(pk.cu_cpu[:-1].tolist(), pk.cu_cpu[1:].tolist()):
-            out = ref(input_ids=pk.tokens[None, s:e]).last_hidden_state[0]
-            worst = max(worst, (out - hf[s:e]).abs().max().item() / out.abs().max().item())
-    # transformers computes the delta rule, the gated norm, the log decay and every RMSNorm in fp32 whatever the
-    # model dtype, so fp32 rounding is the floor here (check_tiny.py widens those to reach fp64 agreement)
-    print(f"check forward vs transformers: max relative error {worst:.2e}")
-    assert worst < 1e-4
-
-    # (2) the hand-written gradients against autograd's
-    for layer in LORA:
-        for name in LORA_NAMES:
-            layer[name][1].normal_(0, 0.05)
-    global READOUT
-    READOUT = READOUT_
-    pk = make_pack(rows, train=True)
-    params = all_params()
-    for p in params:
-        p.requires_grad_(True)
-    with torch.enable_grad():
-        hf, _ = forward(pk, keep=False)
-        loss, _ = readout_loss(hf, pk)
-        ref_grads = torch.autograd.grad(loss, params)
-    for p in params:
-        p.requires_grad_(False)
-    mine = {}
-    hf, ctx = forward(pk, keep=True)
-    _, probs = readout_loss(hf, pk)
-    backward(pk, ctx, probs, lambda ps, gs: mine.update({id(p): g for p, g in zip(ps, gs)}))
-    worst = 0.0
-    for p, g in zip(params, ref_grads):
-        err = (mine[id(p)] - g).abs().max().item() / max(g.abs().max().item(), 1e-30)
-        worst = max(worst, err)
-    print(f"check hand-written gradients vs autograd: {len(params)} tensors, max relative error {worst:.2e}")
-    assert worst < 1e-8
-
-
-# ==============================================================================
-# § Train
+# § Training Harness
 # ==============================================================================
 
-def special_init_rows(root):
-    """Each special token's row starts as the mean of the embeddings of the word that names it."""
-    from tokenizers import Tokenizer
-    meta = json.loads((DATA_DIR / "meta.json").read_text())
-    tok = Tokenizer.from_file(str(root / "tokenizer.json"))
-    words = {"<|state|>": "state", "<|noul|>": "yes or no", "<|score|>": "score", "<|choice|>": "choice", '<|"|>': '"',
-             "<|yes|>": "yes", "<|no|>": "no", "<|option|>": "option", **{f"<|level_{i}|>": str(i) for i in range(10)}}
-    names = sorted(meta["special_tokens"], key=meta["special_tokens"].get)
-    base = meta["special_tokens"][names[0]]
-    assert [meta["special_tokens"][n] for n in names] == list(range(base, base + len(names)))
-    rows = torch.stack([EMBED[tok.encode(" " + words[n] if words[n][0].isalnum() else words[n], add_special_tokens=False).ids].float().mean(0)
-                        for n in names])
-    return base, rows
+# ------------------------------------------------------------------------------
+# §§ Stats
+# ------------------------------------------------------------------------------
+# One row per step. The CSV header is the field list, the wandb row is the same
+# fields under their panel prefixes. A field nobody wrote stays None, and both
+# sinks skip it.
+
+@dataclass
+class StepStats:
+
+    step:         int          = 0
+
+    # Training
+    loss:         float | None = None
+    lr:           float | None = None
+    dt:           float | None = None   # seconds; unset for steps 0-10
+    tok_per_sec:  int   | None = None   # "
+    peak_mem_gb:  float | None = None
+
+    # Validation, on val steps only: each split's accuracy, and the panel's time
+    decision_dev:    float | None = None
+    transfer_dev:    float | None = None
+    phase1_holdout:  float | None = None
+    phase1_jevbench: float | None = None
+    cookbook_dev:    float | None = None
+    eval_seconds:    float | None = None
+
+    # Run clocks, in minutes; stamped by log_step
+    train_total:  float | None = None
+    wall_total:   float | None = None
+    eta:          float | None = None
 
 
-def main():
-    if CHECK:
-        run_checks()
-        return
-    t0 = time.time()
-    root = load_qwen()
-    print(f"loaded {MODEL_REPO} in {time.time() - t0:.0f}s; {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
-    special_base, special_rows = special_init_rows(root)
-    init_trained(special_base, special_rows)
-    n_lora = sum(p.numel() for layer in LORA for name in LORA_NAMES for p in layer[name])
-    print(f"LoRA rank {RANK}: {n_lora / 1e6:.1f}M parameters", flush=True)
+# Field -> wandb panel. A field not named here lands under `train/`.
+WANDB_GROUPS = {
+    "val":  ("decision_dev", "transfer_dev", "phase1_holdout", "phase1_jevbench", "cookbook_dev", "eval_seconds"),
+    "time": ("train_total", "wall_total", "eta"),
+}
+_WANDB_PREFIX = {f: g for g, fs in WANDB_GROUPS.items() for f in fs}
+assert set(_WANDB_PREFIX) <= {f.name for f in fields(StepStats)}, \
+    "WANDB_GROUPS names a field StepStats does not have"
 
-    train_rows = [r for s in TRAIN_SPLITS for r in load_split(s)]
-    val_rows = {s: load_split(s) for s in VAL_SPLITS}
-    n_tokens = sum(r.length for r in train_rows)
-    epochs = [plan_packs(train_rows, TOKENS, shuffle=True) for _ in range(math.ceil(EPOCHS))]
-    packs = [p for ep in epochs for p in ep][:int(round(EPOCHS * len(epochs[0])))]
-    num_steps = min(len(packs), ABORT_STEP) if ABORT_STEP else len(packs)
-    print(f"train: {len(train_rows):,} questions, {n_tokens / 1e6:.1f}M tokens a pass, {len(epochs[0])} packs a pass; "
-          f"{num_steps} steps", flush=True)
 
-    if USE_WANDB:
-        import wandb
-        wandb.init(project="qwen_decision_rtx_dev", name=RUN_NAME,
-                   config={k: v for k, v in globals().items() if k.isupper() and (isinstance(v, (int, float, str))
-                           or isinstance(v, list) and all(isinstance(s, str) for s in v))})   # the knobs, not the weight lists
+@dataclass
+class RunResult:
+    """The run in one row: the results panel, the result JSON."""
+
+    # Identity, for the JSON; wandb has these from the run name and config
+    run_name:      str          = ""
+    num_steps:     int          = 0
+    pack_tokens:   int          = 0
+
+    # The result: the final panel, accuracy per split
+    panel:         dict | None  = None
+
+    # The cost, in minutes
+    train_time:    float        = 0.0
+    val_time:      float        = 0.0
+    compile_time:  float        = 0.0
+    wall_time:     float        = 0.0
+
+    # The rate
+    avg_step_time: float        = 0.0    # seconds
+    tok_per_sec:   int          = 0
+    peak_mem_gb:   float        = 0.0
+
+
+# ------------------------------------------------------------------------------
+# §§ Logging
+# ------------------------------------------------------------------------------
+
+def write_checkpoint(step):
+    """The trained tensors (LoRA's banks and the readout; ~150 MB) and the run's config."""
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    step_time, seen = 0.0, 0
-    for step in range(num_steps):
-        torch.cuda.synchronize(); ts = time.time()
-        pk = make_pack(packs[step], train=True)
-        lr = [None]
-        with torch.no_grad():
-            hf, ctx = forward(pk, keep=True)
-            loss, probs = readout_loss(hf, pk)
-            # ← the step: the backward, with AdamW stepping each layer's weights as their gradients arrive
-            backward(pk, ctx, probs, lambda ps, gs: lr.__setitem__(0, adamw_step(ps, gs, step, num_steps)))
+    torch.save(dict(step=step, config={name: getattr(cfg, name) for name in DecisionConfig.__annotations__},
+                    weights={p.name: p.w.cpu() for p in m}),
+               RUN_DIR / "trained.pt")
+
+os.makedirs("logs", exist_ok=True)
+logfile = f"logs/{cfg.run_name}.txt"
+print(logfile)
+
+def print0(s="", console=False):
+    with open(logfile, "a") as f:
+        if console:
+            print(s, flush=True)
+        print(s, file=f)
+
+print0(code)
+print0("="*100)
+print0(f"Running Python {sys.version}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+
+print0(f"Frozen parameters: {cfg.num_frozen_params:,} | trained: {cfg.num_params:,}", console=True)
+print0(f"GPU: {props.name}", console=True)
+print0(f"Pack: {cfg.pack_tokens:,} tokens, {cfg.max_rows} segments; {cfg.num_steps} steps", console=True)
+
+# A flat row per step and the result, for analysis without wandb.
+metrics_path = f"logs/{cfg.run_name}_metrics.csv"
+result_path  = f"logs/{cfg.run_name}_result.json"
+questions_path = f"logs/{cfg.run_name}_questions.json"
+metrics_file = open(metrics_path, "w", newline="")
+metrics_csv = csv.DictWriter(metrics_file, fieldnames=[f.name for f in fields(StepStats)])
+metrics_csv.writeheader()
+
+
+def log_step(stats):
+    """One step's row to the CSV and to wandb, stamped with the run clocks."""
+    stats.train_total = np.sum(timed) / 60
+    stats.wall_total = (time.perf_counter() - run_wall_t0) / 60
+    row = asdict(stats)
+    metrics_csv.writerow(row)
+    metrics_file.flush()
+    wandb_run.log({"step": stats.step,
+                   **{f"{_WANDB_PREFIX.get(k, 'train')}/{k}": v
+                      for k, v in row.items() if k != "step" and v is not None}})
+
+if not cfg.use_wandb:
+    class DummyWandb:
+        """No-op wandb replacement when logging is disabled."""
+        def log(self, *args, **kwargs): pass
+        def save(self, *args, **kwargs): pass
+        def finish(self): pass
+
+    wandb_run = DummyWandb()
+else:
+    wandb_run = wandb.init(
+        project=cfg.wandb_project,
+        name=cfg.run_name,
+        # The config, verbatim: every DecisionConfig field, defaults and derived.
+        config={name: getattr(cfg, name) for name in DecisionConfig.__annotations__},
+    )
+    wandb.define_metric("step", hidden=True)   # the x-axis, not a series
+    wandb.define_metric("*", step_metric="step")
+
+
+# ==============================================================================
+# § Training Loop
+# ==============================================================================
+
+# Schedule position: one () int64 device tensor, advanced on-device
+t_step = torch.zeros((), dtype=torch.int64, device=device)
+
+panel = None
+panel_questions = None
+total_val_time = 0.0
+timed = []   # Length of each step in seconds, steps 0-10 excluded.
+             # Total training time = np.sum(timed).
+warmup = []  # Those first 11 steps, where the compile lives.
+
+# Training loop
+for step in range(cfg.num_steps + 1):
+    # An abort cuts the loop but not the schedule.
+    # Set ABORT_STEP=0 to evaluate the base model only.
+    last_step = step == (cfg.num_steps if ABORT_STEP is None else ABORT_STEP)
+
+    stats = StepStats(step=step)
+
+    # --------------- Evaluation Panel -----------------
+    if cfg.val_splits and (last_step or (cfg.val_every > 0 and step % cfg.val_every == 0)):
         torch.cuda.synchronize()
-        dt = time.time() - ts
-        if step >= 3:
-            step_time += dt; seen += 1
-        msg = (f"step {step + 1}/{num_steps} loss {loss.item():.4f} rows {len(pk.rows)} tokens {pk.n_tokens} "
-               f"{dt:.2f}s ({pk.n_tokens / dt:,.0f} tok/s) lr {lr[0]:.2e} peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
-        print(msg, flush=True)
-        if USE_WANDB:
-            wandb.log(dict(loss=loss.item(), lr=lr[0], step_s=dt, tok_s=pk.n_tokens / dt), step=step + 1)
-        if VAL_EVERY and (step + 1) % VAL_EVERY == 0 and step + 1 < num_steps:
-            res = evaluate(VAL_SPLITS, val_rows, final=False)
-            if USE_WANDB:
-                wandb.log({f"{s}/{k}": v for s, r in res.items() for k, v in r.items() if isinstance(v, float)}, step=step + 1)
-    if seen:
-        print(f"mean step {step_time / seen:.2f}s over steps 4-{num_steps}; peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
-    if not VAL_SPLITS:
-        return
-    t_eval = time.time()
-    res = evaluate(VAL_SPLITS, val_rows, final=True)
-    print(f"eval {time.time() - t_eval:.0f}s", flush=True)
-    if USE_WANDB:
-        wandb.log({f"{s}/{k}": v for s, r in res.items() for k, v in r.items() if isinstance(v, float)}, step=num_steps)
-        wandb.finish()
-    summary = {s: {k: v for k, v in r.items() if k != "questions"} for s, r in res.items()}
-    (RUN_DIR / "result.json").write_text(json.dumps(dict(summary=summary, steps=num_steps, mean_step_s=step_time / max(seen, 1)), indent=1, default=float))
-    (RUN_DIR / "questions.json").write_text(json.dumps({s: r["questions"] for s, r in res.items()}, default=float))
-    if SAVE_CHECKPOINT:
-        torch.save(dict(lora=LORA, readout=READOUT, special_rows=SPECIAL_ROWS, special_base=SPECIAL_BASE, rank=RANK, alpha=ALPHA),
-                   RUN_DIR / "trained.pt")
-    print(f"-> {RUN_DIR}", flush=True)
+        val_t0 = time.perf_counter()
+        panel, panel_questions = {}, {}
+        for split in cfg.val_splits:
+            panel[split], panel_questions[split] = evaluate(split)
+            res = panel[split]
+            kl_text = f" kl_d3 {res['kl_d3']:.3f}" if res["kl_d3"] is not None else ""
+            print0(f"step:{step}/{cfg.num_steps} val {split}: n {res['n']} acc {res['acc']:.4f} brier {res['brier']:.4f} "
+                   f"logloss {res['logloss']:.4f}{kl_text}", console=True)
+            if split == "cookbook_dev":
+                print0("    by source: " + ", ".join(f"{k} {a}/{b}" for k, (a, b) in res["by_source"].items()), console=True)
+            setattr(stats, split, res["acc"])
+        val_elapsed = time.perf_counter() - val_t0
+        total_val_time += val_elapsed
+        print0(f"step:{step}/{cfg.num_steps} val_time:{val_elapsed:.1f}s", console=True)
+        stats.eval_seconds = val_elapsed
+
+    # --------------- Checkpoint -----------------
+    if cfg.save_checkpoint and last_step:
+        ckpt_t0 = time.perf_counter()
+        write_checkpoint(step)
+        print0(f"checkpoint captured at step {step} ({time.perf_counter() - ckpt_t0:.1f}s) -> {RUN_DIR}", console=True)
+
+    # Exit final step after validation and checkpoint
+    if last_step:
+        log_step(stats)
+        break
+
+    # --------------- Training Step -----------------
+    torch.cuda.synchronize()
+    step_t0 = time.perf_counter()
+
+    pack = pack_on_device(train_staged, step)
+
+    # Forward and Backward pass: the LoRA gradients land in their banks
+    loss = forward_backward(pack)
+
+    # Update weights
+    adamw_step(trained, t_step)
+    t_step.add_(1)  # advance the schedule on-device
+
+    train_loss = loss.item()
+    torch.cuda.synchronize()
+    dt = time.perf_counter() - step_t0
+
+    # --------------- Timing and Logging -----------------
+    pct_done = 100 * step / cfg.num_steps
+
+    # Track time and ETA after first 10 steps to exclude compile time.
+    if step > 10:
+        timed.append(dt)
+        remaining_time = (cfg.num_steps - step - 1) * np.mean(timed) / 60
+        eta_str = f" | eta: {remaining_time:.1f}m"
+    else:
+        warmup.append(dt)
+        eta_str = ""
+
+    tok_per_sec = int(cfg.pack_tokens / dt)
+    peak_mem_gb = torch.cuda.max_memory_allocated() / 2**30
+
+    print0(f"step {step:05d}/{cfg.num_steps:05d} ({pct_done:.2f}%) | loss: {train_loss:.4f} | rows: {int(pack.n_rows):3d} | "
+           f"lr: {cfg.lr * lr_mult_t[step]:.2e} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+           f"peak: {peak_mem_gb:.1f} GiB | total time: {np.sum(timed)/60:.2f}m{eta_str}", console=True)
+
+    stats.loss = train_loss
+    stats.lr = float(cfg.lr * lr_mult_t[step])
+    stats.peak_mem_gb = peak_mem_gb
+    if step > 10:   # the compile and warm-up rates are not the run's rates
+        stats.dt, stats.tok_per_sec = dt, tok_per_sec
+        stats.eta = remaining_time
+    log_step(stats)
+
+    # Garbage collection and compile are done by step 10, flag anything after.
+    if step == 10:
+        torch._logging.set_logs(recompiles=True)
 
 
-if __name__ == "__main__":
-    main()
+# ------------------------------------------------------------------------------
+# §§ Results
+# ------------------------------------------------------------------------------
+
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+metrics_file.close()
+
+# The warm-up steps cost the compile plus whatever they were going to cost anyway.
+avg_step_time = float(np.mean(timed)) if timed else 0.0
+compile_time = max(0.0, np.sum(warmup) - len(warmup) * avg_step_time)
+
+result = RunResult(
+    run_name      = cfg.run_name,
+    num_steps     = cfg.num_steps,
+    pack_tokens   = cfg.pack_tokens,
+
+    panel         = {split: res["acc"] for split, res in panel.items()} if panel else None,
+
+    train_time    = float(np.sum(timed)) / 60,
+    val_time      = total_val_time / 60,
+    compile_time  = compile_time / 60,
+    wall_time     = (time.perf_counter() - run_wall_t0) / 60,
+
+    avg_step_time = avg_step_time,
+    tok_per_sec   = int(cfg.pack_tokens / avg_step_time) if avg_step_time else 0,
+    peak_mem_gb   = torch.cuda.max_memory_reserved() / 2**30,
+)
+
+row = asdict(result)
+with open(result_path, "w") as f:
+    json.dump(dict(row, final_panel=panel), f, indent=1)
+if panel_questions is not None:
+    with open(questions_path, "w") as f:
+        json.dump(panel_questions, f)
+wandb_run.log({"step": cfg.num_steps,
+               **{f"final/{k}": v for k, v in row.items() if isinstance(v, (int, float)) and k != "num_steps"}})
+
+print0(f"== {result.run_name} ==", console=True)
+if result.panel:
+    print0("  panel: " + " | ".join(f"{s} {a:.4f}" for s, a in result.panel.items()), console=True)
+print0(f"  train {result.train_time:.2f}m | val {result.val_time:.2f}m | compile {result.compile_time:.2f}m | wall {result.wall_time:.2f}m", console=True)
+if timed:
+    print0(f"  {cfg.pack_tokens:,} tokens/step over {len(timed):,} timed steps: mean {result.avg_step_time:.3f}s | "
+           f"median {np.median(timed):.3f}s | {result.tok_per_sec:,} tok/s", console=True)
+print0(f"  rows -> {metrics_path} | result -> {result_path}", console=True)
+
+for _f in (logfile, metrics_path, result_path):
+    wandb_run.save(_f, policy="now")
+wandb_run.finish()

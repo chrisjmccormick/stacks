@@ -1,0 +1,18 @@
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+torch==2.10
+triton
+
+numpy
+huggingface_hub
+safetensors
+# FlashAttention-2 from the kernels hub: the build decoder-rtx validated, loaded with
+# get_kernel(..., version=1).
+kernels==0.17.0
+# FLA's chunked gated delta rule, for the DeltaNet layers.
+flash-linear-attention
+wandb
+pyarrow
+tokenizers
+# The data prep only (Qwen's chat template); the trainer never imports it.
+transformers>=5.17
