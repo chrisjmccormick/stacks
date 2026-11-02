@@ -526,7 +526,7 @@ def layer_forward(x, L, cos, sin, tap_keep, cu, cu_cpu, backward):
 
         # Causal depthwise convolution over the segment: tap j reads x[t - 3 + j], zero before the segment.
         qkv_pad = F.pad(qkv, (0, 0, 3, 0))
-        conv = bf16(sum(qkv_pad[j:j + T].float() * tap_keep[:, j:j + 1] * L.conv[j] for j in range(4)))   # (T, 8192)
+        conv = bf16(sum([qkv_pad[j:j + T].float() * tap_keep[:, j:j + 1] * L.conv[j] for j in range(4)]))   # (T, 8192)
         q, k, v = F.silu(conv).split([cfg.d_qk_all, cfg.d_qk_all, cfg.d_v_all], dim=-1)
 
         # The delta rule's gates: beta in (0, 1), the log decay g <= 0
@@ -674,7 +674,7 @@ def layer_backward(xb, L, st, cos, sin, tap_keep, cu, cu_cpu):
         sig_c = torch.sigmoid(conv_f)
         convb = torch.cat((qb.reshape(T, cfg.d_qk_all), kb.reshape(T, cfg.d_qk_all), vb.reshape(T, cfg.d_v_all)), dim=-1).float() \
                 * (sig_c * (1 + conv_f * (1 - sig_c)))                                   # (T, 8192) fp32
-        qkvb = sum(F.pad(convb * tap_keep[:, j:j + 1] * L.conv[j], (0, 0, 0, 3 - j))[3 - j:] for j in range(4))
+        qkvb = sum([F.pad(convb * tap_keep[:, j:j + 1] * L.conv[j], (0, 0, 0, 3 - j))[3 - j:] for j in range(4)])
         projb = bf16(torch.cat((qkvb, zb.reshape(T, cfg.d_v_all), bb, ab), dim=-1))      # (T, 12352)
     else:
         # The output gate, recomputed
