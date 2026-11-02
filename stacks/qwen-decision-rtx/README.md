@@ -96,7 +96,12 @@ development), Phase 1 holdout (Recast NLP's held-out families), JevBench's 231 p
 
 ## Speed and memory
 
-_To be filled from agent-ops-stacks `qwen-decision-rtx/2026-11-01_0823pm_compiled-rewrite` (T1, R1)._
+16,384-token packs on the RTX PRO 6000 (agent-ops-stacks `qwen-decision-rtx/2026-11-01_0823pm_compiled-rewrite`, T1):
 
-The eager predecessor (agent-ops-stacks `qwen-decision-rtx/2026-11-01_0507pm_lora-fwd-bwd`, T1) ran 16,384-token packs
-at 3.4-4.2 s a step, ~4.0k tokens/s, 85.9 GiB peak, two thirds of the step in element-wise glue.
+| | step | tokens/s | peak memory | compile |
+|---|---|---|---|---|
+| this trainer, compiled | 1.94 s | 8.5k | 68.0 GiB | 11 s, 7 graphs |
+| the eager predecessor (`2026-11-01_0507pm_lora-fwd-bwd`, T1) | 3.4-4.2 s | 4.0k | 85.9 GiB | |
+
+Every graph compiles in step 0 (one per layer kind and direction, the embedding, the readout, AdamW), and nothing
+recompiles after: the packs' shapes never change.
