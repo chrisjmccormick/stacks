@@ -54,7 +54,7 @@ SEED = knob("SEED", "42", int)
 USE_WANDB = knob("USE_WANDB", "1") == "1"
 SAVE_CHECKPOINT = knob("SAVE_CHECKPOINT", "1") == "1"
 
-MODEL_REPO, MODEL_REV = "Qwen/Qwen3.5-9B", None   # pinned once the box has resolved it
+MODEL_REPO, MODEL_REV = "Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a"   # the post-trained 9B; d3-flash's base too
 CACHE = Path.home() / ".cache" / "qwen-decision-rtx"
 DATA_DIR = CACHE / "decision"
 RUN_DIR = CACHE / "runs" / RUN_NAME

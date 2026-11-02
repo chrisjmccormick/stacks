@@ -51,7 +51,7 @@ RAW_DIR = Path.home() / ".cache" / "encoder-rtx" / "kev-suites"   # shared with 
 OUT_DIR = CACHE / "decision"
 
 # Qwen3.5-9B's tokenizer, pinned with the weights train_decision.py loads.
-QWEN_REPO, QWEN_REV = "Qwen/Qwen3.5-9B", None   # pinned once the box has resolved it
+QWEN_REPO, QWEN_REV = "Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a"   # d3-flash's base too
 D_EMBED = 248320     # Qwen3.5's embedding rows: the tokenizer's ids, then spare rows
 
 # Kev's suites, pinned. The large train files are on the Hub; the rest are in the GitHub
