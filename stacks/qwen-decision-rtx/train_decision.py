@@ -443,7 +443,9 @@ def _(q, k, v, g, beta, cu, cu_cpu):
 def gated_delta_rule_bwd(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor, outb: Tensor, cu: Tensor, cu_cpu: Tensor) -> list[Tensor]:
     """-> [qb, kb, vb, gb, betab]: FLA's backward, called below its autograd function (a custom
     op's body runs with autograd excluded). The cheap forward pieces it reads, the L2 norms of
-    q and k, the chunked cumsum of g and the intra-chunk solve A, are recomputed here, not kept."""
+    q and k, the chunked cumsum of g and the intra-chunk solve A, are recomputed here, not kept.
+    Inductor may hand a custom op strided views; FLA's kernels read contiguous tensors."""
+    q, k, v, g, beta, outb = (x.contiguous() for x in (q, k, v, g, beta, outb))
     cu = cu.long()
     chunk_indices = prepare_chunk_indices(cu, 64, cu_seqlens_cpu=cu_cpu)
     q_n, q_rstd = l2norm_fwd(q[None])
