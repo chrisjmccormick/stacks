@@ -94,6 +94,22 @@ development), Phase 1 holdout (Recast NLP's held-out families), JevBench's 231 p
 (TypeSafe's cookbooks as records; read by source). For reference, d3-flash (accuracy): 0.845 / 0.840 / 0.775 /
 0.823 / 0.900; encoder-rtx's default decision stage: 0.741 / 0.509 / 0.569 / 0.468.
 
+## Results
+
+One pass of Kev's 30,540 records (the records Kev-9B trained on), LoRA rank 16, 16,384-token packs, 1,329 steps,
+42.6 minutes of training (agent-ops-stacks `qwen-decision-rtx/2026-11-01_0823pm_compiled-rewrite`, R1). Accuracy on
+each split's clean rows:
+
+| | decision-dev | transfer-dev | Phase 1 holdout | JevBench | Cookbook-dev |
+|---|---|---|---|---|---|
+| Qwen3.5-9B in d3's format, no training (step 0) | 0.798 | 0.781 | 0.729 | 0.823 | 0.884 |
+| **after Kev's records** | **0.866** | **0.838** | **0.754** | **0.766** | **0.910** |
+| the eager predecessor, same data (our special-token format) | 0.870 | 0.825 | 0.739 | 0.749 | 0.916 |
+| d3-flash | 0.845 | 0.840 | 0.775 | 0.823 | 0.900 |
+
+Above d3-flash on decision-dev and Cookbook-dev, level on transfer-dev, below on Phase 1 holdout and JevBench, where
+Kev's records alone move the base model little or backwards.
+
 ## Speed and memory
 
 16,384-token packs on the RTX PRO 6000 (agent-ops-stacks `qwen-decision-rtx/2026-11-01_0823pm_compiled-rewrite`, T1):
