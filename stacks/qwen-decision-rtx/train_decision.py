@@ -39,7 +39,7 @@ def knob(name, default, cast=str):
 CHECK = knob("CHECK", "0") == "1"
 RUN_NAME = knob("RUN_NAME", time.strftime("run-%m%d-%H%M"))
 TRAIN_SPLITS = knob("TRAIN_SPLITS", "train,phase1_train").split(",")
-VAL_SPLITS = knob("VAL_SPLITS", "decision_dev,transfer_dev,phase1_holdout,phase1_jevbench,cookbook_dev").split(",")
+VAL_SPLITS = [s for s in knob("VAL_SPLITS", "decision_dev,transfer_dev,phase1_holdout,phase1_jevbench,cookbook_dev").split(",") if s]   # empty: no evaluation
 EPOCHS = knob("EPOCHS", "1", float)
 TOKENS = knob("TOKENS", "16384", int)            # tokens per training pack (= per step)
 EVAL_TOKENS = knob("EVAL_TOKENS", "32768", int)  # tokens per evaluation pack
@@ -780,6 +780,8 @@ def main():
                 wandb.log({f"{s}/{k}": v for s, r in res.items() for k, v in r.items() if isinstance(v, float)}, step=step + 1)
     if seen:
         print(f"mean step {step_time / seen:.2f}s over steps 4-{num_steps}; peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+    if not VAL_SPLITS:
+        return
     t_eval = time.time()
     res = evaluate(VAL_SPLITS, val_rows, final=True)
     print(f"eval {time.time() - t_eval:.0f}s", flush=True)
