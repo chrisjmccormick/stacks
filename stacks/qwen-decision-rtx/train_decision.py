@@ -1020,28 +1020,35 @@ if CHECK_GRADS:
     pack = pack_on_device(train_staged, 0)
     for p in trained:
         if "_B_" in p.name:
-            p.w.normal_(0, 0.05)
-    forward_backward(pack)
-    mine = {p.name: p.grad.clone() for p in trained}
-    with torch.compiler.set_stance("force_eager"), torch.enable_grad():
-        for p in trained:
-            p.w.requires_grad_(True)
-        m.layers = build_layers()                # views of the leaves, so autograd sees them
-        x, cos, sin, tap_keep = embed_forward(pack.tokens, pack.pos)
-        for L in m.layers:
-            x, _ = layer_forward(x, L, cos, sin, tap_keep, pack.cu, pack.cu_cpu, False)
-        probs = readout_forward_backward(x, pack.last_pos, pack.n_options, pack.target, pack.n_rows, False)
-        loss = -(pack.target * probs.clamp_min(1e-30).log()).sum() / pack.n_rows
-        ref = torch.autograd.grad(loss, [p.w for p in trained])
-        for p in trained:
-            p.w.requires_grad_(False)
+            p.w.normal_(0, 0.01)
+    # The hand-written backward, compiled and then eager (the same code, so the gap between the
+    # two is inductor's numerics: it keeps fused intermediates in fp32 rather than rounding them)
+    loss_compiled = forward_backward(pack).item()
+    grads_compiled = {p.name: p.grad.clone() for p in trained}
+    with torch.compiler.set_stance("force_eager"):
+        loss_eager = forward_backward(pack).item()
+        grads_eager = {p.name: p.grad.clone() for p in trained}
+        # Autograd through the same forward, run eagerly
+        with torch.enable_grad():
+            for p in trained:
+                p.w.requires_grad_(True)
+            m.layers = build_layers()                # views of the leaves, so autograd sees them
+            x, cos, sin, tap_keep = embed_forward(pack.tokens, pack.pos)
+            for L in m.layers:
+                x, _ = layer_forward(x, L, cos, sin, tap_keep, pack.cu, pack.cu_cpu, False)
+            probs = readout_forward_backward(x, pack.last_pos, pack.n_options, pack.target, pack.n_rows, False)
+            loss = -(pack.target * probs.clamp_min(1e-30).log()).sum() / pack.n_rows
+            ref = torch.autograd.grad(loss, [p.w for p in trained])
+            for p in trained:
+                p.w.requires_grad_(False)
+    print(f"loss: compiled {loss_compiled:.6f} | eager {loss_eager:.6f} | autograd's forward {loss.item():.6f}")
+    rel = lambda a, b: ((a - b).norm() / b.norm()).item()
     worst = 0.0
     for p, g in zip(trained, ref):
-        rel = ((mine[p.name] - g).norm() / g.norm()).item()
-        cos_sim = F.cosine_similarity(mine[p.name].flatten(), g.flatten(), dim=0).item()
-        worst = max(worst, rel)
-        print(f"  {p.name:24s} |ref| {g.norm().item():.3e}  rel err {rel:.3e}  cos {cos_sim:.6f}")
-    print(f"check: hand-written gradients vs autograd, {len(trained)} tensors, worst relative error {worst:.3e}")
+        worst = max(worst, rel(grads_eager[p.name], g))
+        print(f"  {p.name:24s} |autograd| {g.norm().item():.3e}  rel err: eager {rel(grads_eager[p.name], g):.3e}  "
+              f"compiled {rel(grads_compiled[p.name], g):.3e}  compiled vs eager {rel(grads_compiled[p.name], grads_eager[p.name]):.3e}")
+    print(f"check: hand-written gradients (eager) vs autograd, {len(trained)} tensors, worst relative error {worst:.3e}")
     assert worst < 0.05
     sys.exit(0)
 
