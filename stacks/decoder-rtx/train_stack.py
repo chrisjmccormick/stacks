@@ -300,7 +300,7 @@ class Model:
 class LayerStash(NamedTuple):
     """One layer's forward activations, held for the backward pass.
     Commented-out rows are what we recompute rather than hold.
-    For T=192K  -->  Held: 27GB,  Recomputed:  10.1GB
+    For T=192K  -->  Held: 27GB,  Recomputed:  14.4GB
     """
     #                                                            Stash (Tiny) Recompute
     x_in:               Tensor    # (L,  T,    D)             2.25GB
@@ -312,9 +312,13 @@ class LayerStash(NamedTuple):
     k_inv_rms:          Tensor    # (L,  T, n_kv,    1)   fp32         (36MB)
     #ve:                Tensor    # (Lv, T, n_kv, d_vo)                        1.13GB
     #ve_gate_a:         Tensor    # (Lv, T, n_kv)                                (9MB)
+    #ngram_v:           Tensor    # (Ln, T, n_kv, d_vo)                        1.97GB
+    #ngram_gate_a:      Tensor    # (Ln, T, n_kv)                               (16MB)
     v:                  Tensor    # (L,  T, n_kv, d_vo)       2.25GB
     y:                  Tensor    # (L,  T, n_qo, d_vo)       2.25GB
     y_inv_rms:          Tensor    # (L,  T, n_qo,    1)   fp32         (36MB)
+    #head_gate_a:       Tensor    # (L,  T, n_qo)                               (18MB)
+    #y_gated:           Tensor    # (L,  T, n_qo, d_vo)                        2.25GB
     lse:                Tensor    # (L,  n_qo,  T)        fp32         (36MB)
     x_attn_out_hat:     Tensor    # (L,  T,     D)            2.25GB
     x_attn_out_inv_rms: Tensor    # (L,  T,     1)        fp32          (6MB)
@@ -323,7 +327,7 @@ class LayerStash(NamedTuple):
     mlp_out_hat:        Tensor    # (L,  T,     D)            2.25GB
     mlp_out_inv_rms:    Tensor    # (L,  T,     1)        fp32          (6MB)
     #                                                         ------           ------
-    #                                                 TOTAL:    27GB           10.1GB
+    #                                                 TOTAL:    27GB           14.4GB
 
 # Model-level activations held as locals:
 #   x0                 (T, D)          288MB    layer-blend backward
